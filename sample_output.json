@@ -1,0 +1,53 @@
+[
+  {
+    "source": "farfetch.com",
+    "scraped_at": "2026-08-27T22:21:37.448852+00:00",
+    "url": "https://www.farfetch.com/de/shopping/kids/boss-kidswear-jacke-mit-kontrastdetails-item-30083116.aspx",
+    "sku": "30083116",
+    "title": "Jacke mit Kontrastdetails",
+    "brand": "BOSS Kidswear",
+    "price": 48.0,
+    "currency": "EUR",
+    "original_price": 109.0,
+    "discount_pct": 56.0,
+    "rating": null,
+    "review_count": null,
+    "in_stock": true,
+    "image_url": "https://cdn-images.farfetch-contents.com/30/08/31/16/30083116_59452471_480.jpg",
+    "category": "sale"
+  },
+  {
+    "source": "farfetch.com",
+    "scraped_at": "2026-08-27T22:21:37.449327+00:00",
+    "url": "https://www.farfetch.com/de/shopping/kids/diesel-kids-jogginganzug-mit-logo-detail-item-33139701.aspx",
+    "sku": "33139701",
+    "title": "Jogginganzug mit Logo-Detail",
+    "brand": "Diesel Kids",
+    "price": 52.0,
+    "currency": "EUR",
+    "original_price": 130.0,
+    "discount_pct": 60.0,
+    "rating": null,
+    "review_count": null,
+    "in_stock": true,
+    "image_url": "https://cdn-images.farfetch-contents.com/33/13/97/01/33139701_64411000_480.jpg",
+    "category": "sale"
+  },
+  {
+    "source": "farfetch.com",
+    "scraped_at": "2026-08-27T22:21:37.449348+00:00",
+    "url": "https://www.farfetch.com/de/shopping/kids/lanvin-enfant-cropped-cardigan-mit-kapuze-item-30081580.aspx",
+    "sku": "30081580",
+    "title": "Cropped-Cardigan mit Kapuze",
+    "brand": "Lanvin Enfant",
+    "price": 108.0,
+    "currency": "EUR",
+    "original_price": 245.0,
+    "discount_pct": 55.9,
+    "rating": null,
+    "review_count": null,
+    "in_stock": true,
+    "image_url": "https://cdn-images.farfetch-contents.com/30/08/15/80/30081580_59551523_480.jpg",
+    "category": "sale"
+  }
+]
