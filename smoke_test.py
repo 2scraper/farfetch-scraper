@@ -218,6 +218,12 @@ def check(label, condition):
 def main() -> int:
     ok = True
 
+    # Checks that could not run because an optional engine library is absent.
+    # Reported at the end: a suite that silently skips part of itself and still
+    # says "all passed" is the same defect as code that reports success without
+    # checking that what it wanted actually happened.
+    _skips = []
+
     products = parse_products(SAMPLE_LISTING_HTML, "https://www.farfetch.com/shopping/kids/items.aspx", category="Kids")
     ok &= check("parser extracts exactly 2 real products (junk link excluded)", len(products) == 2)
     ok &= check("first product has correct title/price",
@@ -832,68 +838,80 @@ def main() -> int:
     # --- page.content() mid-navigation --------------------------------------
     # Playwright raises when the document swaps under the snapshot, which
     # farfetch.com's client-side geo-redirect makes routine.
-    import playwright_scraper as _ps
-
-    class _NavPage:
-        """Raises the navigation error N times, then succeeds."""
-        def __init__(self, fail_times): self.left = fail_times; self.waits = 0
-        def content(self):
-            if self.left > 0:
-                self.left -= 1
-                raise _ps.PWError("Page.content: Unable to retrieve content because "
-                                  "the page is navigating and changing the content.")
-            return "<html>settled</html>"
-        def wait_for_timeout(self, ms): self.waits += 1
-
-    p_ok = _NavPage(2)
-    ok &= check("content() retries through a client-side redirect and succeeds",
-                _ps._content_when_settled(p_ok, attempts=4, pause_ms=0) == "<html>settled</html>"
-                and p_ok.waits == 2)
-
-    p_bad = _NavPage(99)
-    ok &= check("content() gives up with None instead of raising, so the run continues",
-                _ps._content_when_settled(p_bad, attempts=3, pause_ms=0) is None)
-
-    class _OtherError:
-        def content(self): raise _ps.PWError("Page.content: some unrelated failure")
-        def wait_for_timeout(self, ms): pass
-    raised = False
+    #
+    # Guarded like the Selenium blocks below: importing playwright_scraper pulls
+    # in playwright itself, and the suite is meant to run with NO engine
+    # installed — that is the whole point of calling it the offline suite. This
+    # import was unguarded and passed locally for exactly the reason it should
+    # not have: the engine happened to be installed on the machine running it.
     try:
-        _ps._content_when_settled(_OtherError(), attempts=2, pause_ms=0)
-    except _ps.PWError:
-        raised = True
-    ok &= check("an unrelated Playwright error is NOT swallowed by the retry", raised)
+        import playwright_scraper as _ps
+    except ImportError as exc:
+        _ps = None
+        _skips.append(f"page.content() navigation-race checks "
+                      f"(playwright not installed: {exc.name})")
+    if _ps is not None:
 
-    # --- fingerprint glue (2captcha Fingerprint API) ------------------------
-    from fingerprint_client import playwright_context_kwargs, playwright_init_script
+        class _NavPage:
+            """Raises the navigation error N times, then succeeds."""
+            def __init__(self, fail_times): self.left = fail_times; self.waits = 0
+            def content(self):
+                if self.left > 0:
+                    self.left -= 1
+                    raise _ps.PWError("Page.content: Unable to retrieve content because "
+                                      "the page is navigating and changing the content.")
+                return "<html>settled</html>"
+            def wait_for_timeout(self, ms): self.waits += 1
 
-    FP = {"id": "fp_test", "country": "us",
-          "screen": {"width": 1920, "height": 1080},
-          "userAgent": {"value": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/145.0.0.0"},
-          "navigator": {"platform": "Win32", "hardwareConcurrency": 8, "deviceMemory": 8},
-          "webgl": {"vendor": 'Google Inc. "quoted"', "renderer": "ANGLE (RTX 3060)"}}
+        p_ok = _NavPage(2)
+        ok &= check("content() retries through a client-side redirect and succeeds",
+                    _ps._content_when_settled(p_ok, attempts=4, pause_ms=0) == "<html>settled</html>"
+                    and p_ok.waits == 2)
 
-    kw = playwright_context_kwargs(FP)
-    ok &= check("fingerprint: user_agent and locale mapped onto the Playwright context",
-                kw["user_agent"].startswith("Mozilla/5.0 (Windows") and kw["locale"] == "en-US")
-    ok &= check("fingerprint: viewport is smaller than the screen "
-                "(a viewport equal to screen size is itself a signal)",
-                kw["viewport"]["height"] < kw["screen"]["height"]
-                and kw["screen"]["width"] == 1920)
+        p_bad = _NavPage(99)
+        ok &= check("content() gives up with None instead of raising, so the run continues",
+                    _ps._content_when_settled(p_bad, attempts=3, pause_ms=0) is None)
 
-    js = playwright_init_script(FP)
-    ok &= check("fingerprint: values are JSON-encoded, so a quote in an API string "
-                "cannot break out of the script",
-                '\\"quoted\\"' in js and "Google Inc. \"quoted\"" not in js)
-    ok &= check("fingerprint: patches navigator.platform / hardwareConcurrency / deviceMemory",
-                "'platform'" in js and "'hardwareConcurrency'" in js and "'deviceMemory'" in js)
-    ok &= check("fingerprint: patches BOTH WebGL1 and WebGL2 getParameter",
-                "WebGLRenderingContext" in js and "WebGL2RenderingContext" in js
-                and "37445" in js and "37446" in js)
+        class _OtherError:
+            def content(self): raise _ps.PWError("Page.content: some unrelated failure")
+            def wait_for_timeout(self, ms): pass
+        raised = False
+        try:
+            _ps._content_when_settled(_OtherError(), attempts=2, pause_ms=0)
+        except _ps.PWError:
+            raised = True
+        ok &= check("an unrelated Playwright error is NOT swallowed by the retry", raised)
 
-    empty = playwright_init_script({})
-    ok &= check("fingerprint: an empty fingerprint yields a script that patches nothing",
-                "null" in empty and "getParameter" in empty)
+        # --- fingerprint glue (2captcha Fingerprint API) ------------------------
+        from fingerprint_client import playwright_context_kwargs, playwright_init_script
+
+        FP = {"id": "fp_test", "country": "us",
+              "screen": {"width": 1920, "height": 1080},
+              "userAgent": {"value": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/145.0.0.0"},
+              "navigator": {"platform": "Win32", "hardwareConcurrency": 8, "deviceMemory": 8},
+              "webgl": {"vendor": 'Google Inc. "quoted"', "renderer": "ANGLE (RTX 3060)"}}
+
+        kw = playwright_context_kwargs(FP)
+        ok &= check("fingerprint: user_agent and locale mapped onto the Playwright context",
+                    kw["user_agent"].startswith("Mozilla/5.0 (Windows") and kw["locale"] == "en-US")
+        ok &= check("fingerprint: viewport is smaller than the screen "
+                    "(a viewport equal to screen size is itself a signal)",
+                    kw["viewport"]["height"] < kw["screen"]["height"]
+                    and kw["screen"]["width"] == 1920)
+
+        js = playwright_init_script(FP)
+        ok &= check("fingerprint: values are JSON-encoded, so a quote in an API string "
+                    "cannot break out of the script",
+                    '\\"quoted\\"' in js and "Google Inc. \"quoted\"" not in js)
+        ok &= check("fingerprint: patches navigator.platform / hardwareConcurrency / deviceMemory",
+                    "'platform'" in js and "'hardwareConcurrency'" in js and "'deviceMemory'" in js)
+        ok &= check("fingerprint: patches BOTH WebGL1 and WebGL2 getParameter",
+                    "WebGLRenderingContext" in js and "WebGL2RenderingContext" in js
+                    and "37445" in js and "37446" in js)
+
+        empty = playwright_init_script({})
+        ok &= check("fingerprint: an empty fingerprint yields a script that patches nothing",
+                    "null" in empty and "getParameter" in empty)
 
     # ---- Selenium: --chromedriver on the LOCAL path -----------------------
     # This was remote-only, which broke exactly the machine that already had a
@@ -952,7 +970,8 @@ def main() -> int:
                     "imported (so it works behind an egress allowlist)",
                     blocked["hit"] is False)
     except ImportError:
-        print("[skip] selenium not installed — --chromedriver local-path checks skipped")
+        _skips.append("selenium --chromedriver local-path checks "
+                      "(selenium not installed)")
 
     # ---- Selenium: two live local failures, turned into tests -------------
     # A local run spent 60 seconds and then printed a message about `debuggerAddress`
@@ -1078,7 +1097,7 @@ def main() -> int:
         ok &= check("selenium: the remote-path message still explains debuggerAddress",
                     "debuggerAddress" in remote_msg)
     except ImportError:
-        print("[skip] selenium not installed — version-guard checks skipped")
+        _skips.append("selenium version-guard checks (selenium not installed)")
 
     # ---- naming and dead-feature guards ----------------------------------
     # Not testing behaviour — testing claims. Three separate rounds of work went
@@ -1133,6 +1152,15 @@ def main() -> int:
                 not hasattr(_cs, "ANTIDETECT_LOCAL_API"))
 
     print()
+    if _skips:
+        print(f"{len(_skips)} group(s) of checks SKIPPED — an optional engine "
+              f"library is not installed here:")
+        for line in _skips:
+            print(f"  - {line}")
+        print("Expected in CI, which installs no engine on purpose. Install one "
+              "to exercise them.")
+        print()
+
     if ok:
         print("All smoke tests passed. Core logic is sound — safe to move on to a real browser run.")
         return 0

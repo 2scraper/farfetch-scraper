@@ -13,8 +13,17 @@ pip install -r requirements.txt
 python3 smoke_test.py
 ```
 
-It prints its own check count. If it fails on a clean clone, that is itself the
-bug — say so.
+It prints its own check count, and lists any group it had to skip because an
+engine library is absent.
+
+**The suite must pass with no engine installed at all.** CI installs only
+`beautifulsoup4` and `requests`, so any import of `playwright_scraper`,
+`puppeteer_scraper` or `selenium_scraper` in a test has to sit inside
+`try/except ImportError` with the skip recorded. This is easy to get wrong
+locally, where you almost certainly have an engine installed and an unguarded
+import passes.
+
+If the suite fails on a clean clone, that is itself the bug — say so.
 
 ## Never commit a credential
 
