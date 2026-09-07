@@ -30,6 +30,20 @@ class Product:
     in_stock: Optional[bool] = None
     image_url: Optional[str] = None
     category: Optional[str] = None
+    # Where `price` came from, because the same column can hold two figures
+    # with different confidence and nothing used to say which:
+    #   "jsonld+dom" — the rendered tile was found and reconciled with the
+    #                  JSON-LD figure: either it corrected the price to the
+    #                  one a customer pays, or the tile showed a single price
+    #                  confirming there is no discount. Trustworthy.
+    #   "jsonld"     — structured data only; the tile was missing (this site
+    #                  renders a variable fraction of them) or disagreed, so
+    #                  on a discounted item this may be the PRE-PROMO price.
+    #   "dom"        — the CSS/URL fallback path: read from the tile's own
+    #                  text, with no JSON-LD to cross-check.
+    # Without this, two runs that differed only in how much had rendered
+    # produced a false "price changed" in diff_runs.py.
+    price_source: Optional[str] = None
 
 
 def dedupe_by_sku(products: List[Product], seen: Set[str]) -> List[Product]:

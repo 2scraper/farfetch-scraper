@@ -306,13 +306,27 @@ are `complete` — see [Diffing two runs](#diffing-two-runs).
   "review_count": null,
   "in_stock": true,
   "image_url": "https://cdn-images.farfetch-contents.com/35/13/23/21/35132321_69402936_480.jpg",
-  "category": "girls-clothing-4"
+  "category": "girls-clothing-4",
+  "price_source": "jsonld+dom"
 }
 ```
 
-Fifteen columns, in that order, in both formats. Real rows are in [`sample_output.json`](sample_output.json) and
+Sixteen columns, in that order, in both formats. Real rows are in [`sample_output.json`](sample_output.json) and
 [`sample_output.csv`](sample_output.csv) — three products cut from an actual
 run, not hand-written, so the field names there are the field names you get.
+
+**`price_source` says how much to trust `price`**, because the same column can
+hold two figures with different confidence:
+
+| Value | Meaning |
+|---|---|
+| `jsonld+dom` | The rendered tile was found and reconciled with the JSON-LD figure — either it corrected the price to what a customer pays, or a single-price tile confirmed there is no discount. Trustworthy. |
+| `jsonld` | Structured data only: the tile was missing (this site paints a variable fraction of them) or disagreed. On a discounted item this may be the **pre-promo** price. |
+| `dom` | The CSS/URL fallback path — read from the tile's own text, with no JSON-LD to cross-check. |
+
+Without it, two runs that differed only in how much had rendered produced a
+false "price changed" in [`diff_runs.py`](#diffing-two-runs), which now reports
+that case separately instead.
 
 Three things about that row, because each looks like a bug and is not:
 
@@ -363,13 +377,18 @@ python3 playwright_scraper.py --url "$URL" --out "girls_$(date +%F)"
 python3 diff_runs.py --old girls_2026-08-31.json --new girls_2026-09-07.json --out diff.json
 ```
 
-Three buckets, all keyed on `sku`: **added** (new since the last run),
+Four buckets, all keyed on `sku`: **added** (new since the last run),
 **removed** (delisted, or just off this run's page/category), **changed**
 (`price`, `original_price`, `discount_pct`, `currency` or `in_stock` differs,
-reported as old value → new value). A row with no `sku` — or a second row
-sharing one already seen in the same file — can't be matched across runs at
-all, so it's counted separately as `unmatchable_old`/`unmatchable_new` rather
-than silently folded into "added" or "removed".
+reported as old value → new value), and **source_changed** — a price that
+differs while [`price_source`](#output) also differs, meaning one run got the
+DOM-corrected figure and the other the raw JSON-LD one. That says something
+about our own two snapshots, not about the site, so it is reported separately
+and `--fail-on-change` deliberately ignores it. A row with no `sku` — or a
+second row sharing one already seen in the same file — can't be matched across
+runs at all, so it's counted separately as
+`unmatchable_old`/`unmatchable_new` rather than silently folded into "added"
+or "removed".
 
 **It refuses to run if either side was a partial run**, reading the
 [`.meta.json` sidecar](#run-metadata) beside each file. A run cut short on page

@@ -517,6 +517,7 @@ def main() -> int:
     ok &= check("Product()'s own currency default is None, not a guessed 'USD'",
                 Product().currency is None)
 
+
     # A tile with ONE price means no discount. JSON-LD is structured data and is
     # the better source there, so the overlay must leave it alone rather than
     # setting original_price equal to price.
@@ -568,6 +569,31 @@ def main() -> int:
     ok &= check("overlay is a no-op when the page has JSON-LD but no rendered "
                 "tiles (how much of this site paints at load varies)",
                 len(_ldo) == 1 and _ldo[0].price == 70.0)
+
+    # ---- price_source ------------------------------------------------------
+    # The same column used to hold two figures with different confidence —
+    # the DOM-corrected price a customer pays, or the raw JSON-LD one
+    # (pre-promo on a discounted item) when that tile had not rendered — with
+    # nothing saying which. Two runs differing only in how much had painted
+    # then produced a false "price changed" in diff_runs.py.
+    ok &= check("price_source='jsonld+dom' when the tile corrected the price",
+                all(p.price_source == "jsonld+dom" for p in _fixed.values()))
+    ok &= check("price_source='jsonld+dom' on an undiscounted product too — a "
+                "single-price tile CONFIRMS there is no discount, which is "
+                "corroboration rather than a correction",
+                _nd[0].price_source == "jsonld+dom")
+    ok &= check("price_source stays 'jsonld' when the page has JSON-LD but no "
+                "rendered tile for the product — that price may be pre-promo",
+                _ldo[0].price_source == "jsonld")
+    ok &= check("price_source stays 'jsonld' when the scoping guard refuses "
+                "the overlay (JSON-LD price not among the tile's prices)",
+                _dis[0].price_source == "jsonld")
+    ok &= check("price_source='dom' on the CSS/URL fallback path, where there "
+                "is no JSON-LD to cross-check against",
+                all(p.price_source == "dom" for p in products))
+    ok &= check("tile_prices_overlay=False leaves every row 'jsonld', since "
+                "the DOM pass never ran",
+                all(p.price_source == "jsonld" for p in _raw.values()))
 
     # The tile-scoping rule is what stops a product inheriting its neighbour's
     # prices. Two products in one grid wrapper, each with its own tile.
@@ -1341,6 +1367,39 @@ def main() -> int:
     ok &= check("diff_runs: the second row of a duplicate sku within one file "
                 "is counted as unmatchable rather than silently overwriting the first",
                 diff_products(dup_old, [])["unmatchable_old"] == 1)
+
+    # A price that differs while price_source ALSO differs is not a site-side
+    # price change: one run read the DOM-corrected figure, the other the raw
+    # JSON-LD one because that tile had not painted. Reporting it as `changed`
+    # is a false alarm about the site.
+    _src_old = [{"sku": "40", "title": "same product, different render",
+                 "price": 130.0, "original_price": None, "discount_pct": None,
+                 "currency": "EUR", "in_stock": True, "price_source": "jsonld"}]
+    _src_new = [{"sku": "40", "title": "same product, different render",
+                 "price": 52.0, "original_price": 130.0, "discount_pct": 60.0,
+                 "currency": "EUR", "in_stock": True, "price_source": "jsonld+dom"}]
+    _sc = diff_products(_src_old, _src_new)
+    ok &= check("diff_runs: a price difference across a price_source change is "
+                "reported as source_changed, NOT as a real price change",
+                not _sc["changed"]
+                and [c["sku"] for c in _sc["source_changed"]] == ["40"]
+                and _sc["source_changed"][0]["price_source"]
+                    == {"old": "jsonld", "new": "jsonld+dom"})
+    # ...but a genuine change alongside it must still be reported.
+    _src_new2 = [dict(_src_new[0], in_stock=False)]
+    _sc2 = diff_products(_src_old, _src_new2)
+    ok &= check("diff_runs: a non-price change (in_stock) is still reported as "
+                "'changed' even when the price columns moved to source_changed",
+                [c["sku"] for c in _sc2["changed"]] == ["40"]
+                and list(_sc2["changed"][0]["changes"]) == ["in_stock"]
+                and len(_sc2["source_changed"]) == 1)
+    # Same source on both sides = a real price change, reported as such.
+    _same_src = [dict(_src_new[0], price_source="jsonld")]
+    _sc3 = diff_products(_src_old, _same_src)
+    ok &= check("diff_runs: a price difference with the SAME price_source on "
+                "both sides is a real change",
+                [c["sku"] for c in _sc3["changed"]] == ["40"]
+                and not _sc3["source_changed"])
 
     # ---- run metadata: partial runs must not read as delistings -----------
     # A run cut short on page 3 of 10 is missing every product on pages

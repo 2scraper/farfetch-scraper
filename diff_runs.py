@@ -18,13 +18,19 @@ under a dated filename, diffed against the previous one:
     python3 diff_runs.py --old "girls_$(ls -t girls_*.json | sed -n 2p)" \\
                           --new "girls_$(date +%F).json" --out diff.json
 
-Three buckets, each keyed on sku:
+Four buckets, each keyed on sku:
 
-  added     — sku present in --new, absent from --old
-  removed   — sku present in --old, absent from --new (delisted, or just off
-              this particular page/category run)
-  changed   — sku present in both, with a different price, original_price,
-              discount_pct, currency or in_stock
+  added          — sku present in --new, absent from --old
+  removed        — sku present in --old, absent from --new (delisted, or just
+                   off this particular page/category run)
+  changed        — sku present in both, with a different price,
+                   original_price, discount_pct, currency or in_stock
+  source_changed — sku present in both with a different price, but also a
+                   different price_source: one run got the DOM-corrected
+                   figure and the other the raw JSON-LD one, so the two are
+                   not comparable on price. Reported separately because this
+                   says something about our own two snapshots, not about the
+                   site — and --fail-on-change deliberately ignores it.
 
 A product this project's parser could not recover a sku for (None) cannot be
 matched across runs at all, so it is counted and reported separately rather
@@ -38,6 +44,10 @@ import sys
 from typing import Dict, List, Optional, Tuple
 
 TRACKED_FIELDS = ("price", "original_price", "discount_pct", "currency", "in_stock")
+
+# The subset of TRACKED_FIELDS whose comparability depends on price_source
+# matching between the two runs — see diff_products.
+PRICE_FIELDS = ("price", "original_price", "discount_pct")
 
 
 def _load(path: str) -> List[dict]:
@@ -71,7 +81,7 @@ def diff_products(old: List[dict], new: List[dict]) -> dict:
     added = [new_by_sku[sku] for sku in new_by_sku.keys() - old_by_sku.keys()]
     removed = [old_by_sku[sku] for sku in old_by_sku.keys() - new_by_sku.keys()]
 
-    changed = []
+    changed, source_changed = [], []
     for sku in old_by_sku.keys() & new_by_sku.keys():
         before, after = old_by_sku[sku], new_by_sku[sku]
         field_changes = {
@@ -79,14 +89,36 @@ def diff_products(old: List[dict], new: List[dict]) -> dict:
             for field in TRACKED_FIELDS
             if before.get(field) != after.get(field)
         }
-        if field_changes:
-            changed.append({"sku": sku, "title": after.get("title"),
-                            "changes": field_changes})
+        if not field_changes:
+            continue
+
+        # A row whose price_source differs between runs is not comparable on
+        # price: one run read the DOM-corrected figure a customer pays, the
+        # other fell back to the raw JSON-LD one (pre-promo on a discounted
+        # item) because that tile had not rendered. Reporting that as a price
+        # change would be a false alarm about the SITE when the difference is
+        # in our own two snapshots. Non-price fields still compare fine.
+        sources = (before.get("price_source"), after.get("price_source"))
+        if sources[0] != sources[1] and any(f in field_changes for f in PRICE_FIELDS):
+            price_part = {f: v for f, v in field_changes.items() if f in PRICE_FIELDS}
+            other_part = {f: v for f, v in field_changes.items() if f not in PRICE_FIELDS}
+            source_changed.append({
+                "sku": sku, "title": after.get("title"),
+                "price_source": {"old": sources[0], "new": sources[1]},
+                "changes": price_part,
+            })
+            field_changes = other_part
+            if not field_changes:
+                continue
+
+        changed.append({"sku": sku, "title": after.get("title"),
+                        "changes": field_changes})
 
     return {
         "added": added,
         "removed": removed,
         "changed": changed,
+        "source_changed": source_changed,
         "unmatchable_old": old_unmatchable,
         "unmatchable_new": new_unmatchable,
     }
@@ -94,7 +126,8 @@ def diff_products(old: List[dict], new: List[dict]) -> dict:
 
 def _print_summary(result: dict) -> None:
     print(f"[+] {len(result['added'])} added, {len(result['removed'])} removed, "
-          f"{len(result['changed'])} changed.")
+          f"{len(result['changed'])} changed, "
+          f"{len(result['source_changed'])} not comparable on price.")
     for p in result["added"]:
         print(f"  + {p.get('sku')}  {p.get('title')}  {p.get('price')} {p.get('currency')}")
     for p in result["removed"]:
@@ -102,6 +135,12 @@ def _print_summary(result: dict) -> None:
     for c in result["changed"]:
         deltas = ", ".join(f"{f}: {v['old']!r} -> {v['new']!r}" for f, v in c["changes"].items())
         print(f"  ~ {c['sku']}  {c['title']}  {deltas}")
+    for c in result["source_changed"]:
+        src = c["price_source"]
+        deltas = ", ".join(f"{f}: {v['old']!r} -> {v['new']!r}" for f, v in c["changes"].items())
+        print(f"  ? {c['sku']}  {c['title']}  {deltas}  "
+              f"[price_source {src['old']!r} -> {src['new']!r}: the two runs "
+              f"rendered differently, so this is not a site-side price change]")
     unmatchable = result["unmatchable_old"] + result["unmatchable_new"]
     if unmatchable:
         print(f"[!] {unmatchable} row(s) across both files had no sku or a "
@@ -195,6 +234,9 @@ def main() -> int:
             json.dump(result, f, ensure_ascii=False, indent=2)
         print(f"[+] Full diff written to {args.out}")
 
+    # `source_changed` is deliberately NOT a reason to fail: it means our own
+    # two snapshots rendered differently, not that the site changed anything.
+    # Alerting on it would train whoever reads the alert to ignore it.
     if args.fail_on_change and (result["added"] or result["removed"] or result["changed"]):
         return 1
     return 0
