@@ -6,6 +6,28 @@ All notable changes to this project are documented here. Format follows
 library with a stable API) reasonably can — a patch bump means "fixes", not
 a promise that every flag and exit code is contractually frozen.
 
+## [Unreleased]
+
+### Added
+- **Run metadata sidecar** — every run that writes output also writes
+  `<out>.meta.json` recording `status` (`complete`/`partial`/`failed`),
+  `stop_reason`, pages requested vs. completed, and the start/final URL.
+  A failed run writes no sidecar, so it cannot contradict the previous
+  run's still-intact output.
+- **Exit code 6 for a partial run** — a timeout or challenge partway
+  through pagination still saves what it gathered, but no longer looks
+  identical to a complete run. The site's own pagination running out still
+  exits 0: there was nothing more to fetch.
+- `diff_runs.py` **refuses an assortment diff** when either side's sidecar
+  says the run was partial, since products on pages that were never fetched
+  would otherwise be reported as `removed` (i.e. delisted). `--force` opts
+  out.
+- The CSS-fallback parser now recognises **3-letter ISO currency codes**
+  (`AED 100`, `100 CHF`) in either position, matched against an allowlist of
+  real ISO 4217 codes so a size chart (`XXL 100`) can't become a phantom
+  price. Such tiles previously matched nothing and were dropped as "not a
+  product", losing every product on those locales.
+
 ## [0.1.1] — 2026-09-07
 
 ### Fixed
