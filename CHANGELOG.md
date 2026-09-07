@@ -6,6 +6,39 @@ All notable changes to this project are documented here. Format follows
 library with a stable API) reasonably can — a patch bump means "fixes", not
 a promise that every flag and exit code is contractually frozen.
 
+## [Unreleased]
+
+### Fixed
+- **Multi-page runs silently returned page 1.** Measured live on
+  2026-09-07: farfetch.com serves no anchor matching any of the three
+  `NEXT_PAGE_SELECTOR` entries this project shipped with, so `--pages 3`
+  fetched one page and exited 0 — a complete-looking run holding a third of
+  the data. Three changes, layered:
+  `<link rel="next">` (which the site *does* serve, and a standards-based
+  signal rather than a build artefact) leads the selector list;
+  `product_parser.page_url()` reconstructs `?page=N` when no selector
+  matches at all; and the loop now terminates on a page that contributes no
+  new `sku` — a property of the data — instead of on a missing link, a
+  property of a selector. Verified: 263 unique products across 3 pages.
+- A navigation timeout no longer ends the run on the first failure.
+  `--retries` (default 3) with a doubling `--retry-delay` on every engine;
+  `scraper_api_client.py` had retries all along, and the same transient
+  deserved the same treatment in the browser engines.
+- An empty CSV now carries its header row instead of being zero bytes, so
+  `--allow-empty` output parses as a table with no rows rather than failing
+  on read.
+- A stale test mock hid a crash in the Selenium UA code: `engine-smoke` CI
+  installed playwright and pyppeteer but **not** selenium, so every
+  selenium-guarded check skipped in CI and the failure only surfaced when
+  someone installed selenium locally. The job now installs all three engines
+  and fails if *any* check group reports skipped.
+
+### Changed
+- The daily canary requests **3 pages, not 1** — with one page, pagination
+  is never exercised, which is exactly how the bug above stayed invisible.
+  It also now asserts `pages_completed`, `status == "complete"` and DOM
+  price-confirmation coverage, not just a product count.
+
 ## [0.2.0] — 2026-09-07
 
 First release verified against the live site: a real run of

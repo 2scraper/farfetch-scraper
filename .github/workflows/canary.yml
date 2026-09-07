@@ -46,6 +46,13 @@ jobs:
         # means either the site changed or the category itself is gone, not
         # "this URL never had products" (see README: a bare hub URL always
         # returns 0 and that is not a bug).
+        #
+        # --pages 3, not 1: with one page, pagination is never exercised at
+        # all, so a renamed next-page attribute (or the ?page= fallback
+        # breaking) would stay invisible here — which is precisely the kind
+        # of silent decay this workflow exists to catch. Three pages is
+        # enough to cross the page boundary twice while keeping the daily
+        # request count trivial.
         # continue-on-error: this step's exit code is read explicitly below
         # so the interpretation (parser break vs. probable IP block) can be
         # printed before the job is failed, rather than just going red with
@@ -63,7 +70,7 @@ jobs:
           set +e
           python3 playwright_scraper.py \
             --url "https://www.farfetch.com/shopping/kids/girls-clothing-4/items.aspx" \
-            --pages 1 --out canary_run --dump-html canary_run.html
+            --pages 3 --out canary_run --dump-html canary_run.html
             # --proxy "${{ secrets.FARFETCH_PROXY }}"   # uncomment once the secret is set
           echo "exit_code=$?" >> "$GITHUB_OUTPUT"
 
@@ -90,18 +97,41 @@ jobs:
           import json, sys
           from pathlib import Path
 
-          MIN_PRODUCTS = 10  # well under the ~96 this URL has returned historically;
-                              # a floor against a near-empty render, not a moving target
+          PAGES_REQUESTED = 3
+          # A single page of this category has returned ~96 products on every
+          # measured run, so three pages should comfortably clear this. The
+          # floor guards against a near-empty render, and is deliberately far
+          # below the real figure rather than tracking it.
+          MIN_PRODUCTS = 120
           rows = json.loads(Path("canary_run.json").read_text())
+          meta = json.loads(Path("canary_run.meta.json").read_text())
 
           fail = []
           if len(rows) < MIN_PRODUCTS:
-              fail.append(f"only {len(rows)} products, expected at least {MIN_PRODUCTS}")
+              fail.append(f"only {len(rows)} products, expected at least {MIN_PRODUCTS} "
+                          f"across {PAGES_REQUESTED} pages")
 
           priced = sum(1 for r in rows if r.get("price") is not None)
           if rows and priced / len(rows) < 0.9:
               fail.append(f"only {priced}/{len(rows)} rows have a non-null price — "
                           f"looks like a snapshot taken before prices rendered")
+
+          # The point of running more than one page: catch pagination dying.
+          # `no_new_products` after a single page means the next-page link AND
+          # the ?page= fallback both failed to reach new content.
+          if meta.get("pages_completed", 0) < PAGES_REQUESTED:
+              fail.append(f"pagination stopped after {meta.get('pages_completed')} of "
+                          f"{PAGES_REQUESTED} pages (stop_reason="
+                          f"{meta.get('stop_reason')!r}) — the next-page selector or "
+                          f"the ?page= fallback has probably broken")
+          if meta.get("status") != "complete":
+              fail.append(f"run status is {meta.get('status')!r}, not 'complete'")
+
+          dom_confirmed = sum(1 for r in rows if r.get("price_source") == "jsonld+dom")
+          if rows and dom_confirmed / len(rows) < 0.5:
+              fail.append(f"only {dom_confirmed}/{len(rows)} rows had their price "
+                          f"confirmed against a rendered tile — discounted rows may "
+                          f"carry pre-promo prices")
 
           for line in fail:
               print(f"::error::{line}")
@@ -119,7 +149,8 @@ jobs:
           path: |
             canary_run.json
             canary_run.csv
-            canary_run.html
+            canary_run.meta.json
+            canary_run.html*
             canary_run_page*_debug.*
           if-no-files-found: ignore
           retention-days: 14

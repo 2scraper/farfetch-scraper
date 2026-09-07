@@ -85,7 +85,7 @@ import json
 import logging
 import re
 from typing import List, Optional
-from urllib.parse import urljoin, urlparse
+from urllib.parse import urljoin, urlparse, urlunparse, parse_qsl, urlencode
 
 from bs4 import BeautifulSoup
 
@@ -396,6 +396,31 @@ def _parse_css_fallback(html: str, base_url: str, category: Optional[str]) -> Li
 # `all` is skipped too: on a sale URL like /shopping/women/sale/all/items.aspx
 # the informative segment is `sale`, not the generic bucket after it.
 _NOT_A_CATEGORY = {"shopping", "sets", "items.aspx", "all"}
+
+
+def page_url(url: str, page_num: int) -> str:
+    """Return `url` with Farfetch's own `?page=` parameter set to `page_num`.
+
+    The fallback for when NEXT_PAGE_SELECTOR finds nothing. Following the
+    site's own next-page link is still preferred — it is whatever the site
+    itself considers correct — but a scraper whose pagination depends
+    ENTIRELY on three `data-testid`-style selectors has a silent-success
+    failure mode: rename one attribute and every run stops after page 1 and
+    reports a complete, successful result with 1/50th of the data. Neither
+    the offline suite nor a one-page canary would notice.
+
+    Site-specific URL knowledge, hence living here beside category_from_url
+    rather than in an engine: `?page=N` is Farfetch's convention, confirmed
+    on the paginated category URLs this project targets.
+
+    Existing query parameters (filters, sort order) are preserved, and an
+    existing `page` is replaced rather than appended twice.
+    """
+    parts = urlparse(url)
+    query = [(k, v) for k, v in parse_qsl(parts.query, keep_blank_values=True)
+             if k.lower() != "page"]
+    query.append(("page", str(page_num)))
+    return urlunparse(parts._replace(query=urlencode(query)))
 
 
 def category_from_url(url: str):

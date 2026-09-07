@@ -71,9 +71,13 @@ def write_json(products: List[Product], path: str) -> None:
 
 
 def write_csv(products: List[Product], path: str) -> None:
+    # An empty result still gets the header row. A zero-byte file makes a
+    # consumer fail on read (no columns to parse) instead of reading a valid
+    # table with zero rows — and "an empty result is still a well-formed
+    # result" is the same principle as `save` refusing to overwrite good data.
     if not products:
         with open(path, "w", encoding="utf-8", newline="") as f:
-            f.write("")
+            csv.DictWriter(f, fieldnames=list(asdict(Product()).keys())).writeheader()
         return
     fieldnames = list(asdict(products[0]).keys())
     with open(path, "w", encoding="utf-8", newline="") as f:
@@ -180,7 +184,15 @@ def save(products: List[Product], out_prefix: str, fmt: str,
 
 # Stop reasons that mean the run saw everything there was to see. Anything
 # else ended the page loop early, so the result is only a partial view.
-COMPLETE_STOP_REASONS = ("completed", "pagination_exhausted")
+#
+# "no_new_products" belongs here and "pagination_exhausted" is kept for the
+# engines that still stop on a missing next-link: the first is a property of
+# the DATA (a page contributed nothing not already seen, so the listing is
+# over), while the second is a property of a CSS SELECTOR and is therefore
+# the weaker signal — a renamed attribute looks identical to a short
+# catalogue. See playwright_scraper.py, which now falls back to the ?page=
+# convention rather than trusting the selector to decide.
+COMPLETE_STOP_REASONS = ("completed", "pagination_exhausted", "no_new_products")
 
 
 def finish_run(products: List[Product], out_prefix: str, fmt: str,

@@ -42,7 +42,8 @@ from selenium import webdriver
 from selenium.webdriver.chrome.options import Options
 from selenium.webdriver.chrome.service import Service
 from selenium.webdriver.common.by import By
-from selenium.common.exceptions import TimeoutException, NoSuchElementException
+from selenium.common.exceptions import (TimeoutException, NoSuchElementException,
+                                        WebDriverException)
 from selenium.webdriver.support.ui import WebDriverWait
 
 # webdriver_manager is imported LAZILY, inside the local-launch branch of
@@ -59,7 +60,8 @@ from selenium.webdriver.support.ui import WebDriverWait
 from captcha_solver import (detect_recaptcha_v3, detect_recaptcha_in_page,
                             reconcile_detections, solve_recaptcha,
                             INJECT_TOKEN_JS, RECAPTCHA_DISCOVERY_JS)
-from product_parser import parse_products, SELECTORS, detect_bot_challenge
+from product_parser import (parse_products, SELECTORS, detect_bot_challenge,
+                            page_url)
 from output_writer import dedupe_by_sku, finish_run
 import env_config
 
@@ -72,7 +74,15 @@ BUILD = "2026-08-25.9"
 
 
 ITEM_LINK_SELECTOR = SELECTORS["item_link"]
-NEXT_PAGE_SELECTOR = "a[data-testid='pagination-next'], a[rel='next'], li.pagination-next a"
+# Ordered most-durable first. `<link rel="next">` in <head> is a W3C/SEO
+# convention rather than a build artefact, and on 2026-09-07 it was the ONLY
+# one of these that farfetch.com actually served: the three anchor selectors
+# below (which this project shipped with) matched nothing at all, so a
+# multi-page run silently returned page 1 and reported success. Kept anyway —
+# they cost nothing and the visible UI may come back — but the standards-based
+# one leads, and product_parser.page_url() backs all of them up.
+NEXT_PAGE_SELECTOR = ("link[rel='next'], a[data-testid='pagination-next'], "
+                      "a[rel='next'], li.pagination-next a")
 MIN_CARD_MATCHES = 5  # see playwright_scraper.py for why this must be >1, not just present
 
 
@@ -657,11 +667,24 @@ def scrape(args) -> None:
         url = args.url
         for page_num in range(1, args.pages + 1):
             logger.info("Fetching page %d/%d: %s", page_num, args.pages, url)
-            driver.get(url)
-            try:
-                wait.until(lambda d: d.execute_script("return document.readyState") == "complete")
-            except TimeoutException:
-                logger.error("Timeout loading %s — skipping.", url)
+            # Retry a navigation failure rather than ending the run on it —
+            # see playwright_scraper.py for why.
+            for attempt in range(1, args.retries + 1):
+                load_failed = False
+                try:
+                    driver.get(url)
+                    wait.until(lambda d: d.execute_script("return document.readyState") == "complete")
+                    break
+                except (TimeoutException, WebDriverException):
+                    load_failed = True
+                    if attempt < args.retries:
+                        pause = args.retry_delay * (2 ** (attempt - 1))
+                        logger.warning("Timeout/error loading %s (attempt %d/%d) — "
+                                       "retrying in %.1fs.", url, attempt,
+                                       args.retries, pause)
+                        time.sleep(pause)
+            if load_failed:
+                logger.error("Gave up loading %s after %d attempt(s).", url, args.retries)
                 stop_reason = "page_load_timeout"
                 break
 
@@ -717,18 +740,28 @@ def scrape(args) -> None:
             pages_completed = page_num
             final_url = driver.current_url
 
+            # See playwright_scraper.py: a data-based terminating condition,
+            # not a selector-based one.
+            if page_num > 1 and not fresh:
+                logger.info("Page %d added no products not already seen — "
+                            "treating that as the end of the listing.", page_num)
+                stop_reason = "no_new_products"
+                break
+
             if page_num < args.pages:
                 try:
                     next_link = driver.find_element(By.CSS_SELECTOR, NEXT_PAGE_SELECTOR)
                     href = next_link.get_attribute("href")
                 except NoSuchElementException:
-                    logger.info("No further pagination link found — stopping early.")
-                    stop_reason = "pagination_exhausted"
-                    break
-                if not href:
-                    stop_reason = "pagination_exhausted"
-                    break
-                url = href
+                    href = None
+                if href:
+                    url = href
+                else:
+                    url = page_url(driver.current_url, page_num + 1)
+                    logger.warning(
+                        "No pagination link matched — falling back to the "
+                        "?page= URL convention (%s). If this repeats, the "
+                        "site's markup has probably changed.", url)
                 time.sleep(args.delay)
     finally:
         if args.cdp_endpoint:
@@ -750,6 +783,11 @@ def parse_args():
     p.add_argument("--category", default=None, help="Label to tag output rows with. Defaults to the category segment of the URL, so the column is never empty just because the flag was omitted.")
     p.add_argument("--pages", type=int, default=1, help="Number of listing pages to crawl")
     p.add_argument("--delay", type=float, default=2.0, help="Delay between pages, seconds")
+    p.add_argument("--retries", type=int, default=3,
+                   help="Attempts per page load before giving up (default 3)")
+    p.add_argument("--retry-delay", type=float, default=2.0,
+                   help="Seconds before the first page-load retry, doubling "
+                        "thereafter (default 2.0)")
     p.add_argument("--format", choices=["json", "csv", "both"], default="both")
     p.add_argument("--out", default="farfetch_products", help="Output file prefix")
     p.add_argument("--proxy", default=None, help="Proxy URL, e.g. http://HOST:9999 (2captcha.com/proxy)")
