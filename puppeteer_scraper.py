@@ -30,7 +30,7 @@ from captcha_solver import (detect_recaptcha_v3, detect_recaptcha_in_page,
                             reconcile_detections, solve_recaptcha,
                             INJECT_TOKEN_JS, RECAPTCHA_DISCOVERY_JS)
 from product_parser import parse_products, SELECTORS
-from output_writer import save
+from output_writer import save, dedupe_by_sku
 import env_config
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
@@ -107,6 +107,7 @@ async def handle_captcha_if_present(page, args) -> None:
 
 async def scrape(args) -> None:
     all_products = []
+    seen_skus = set()
 
     if args.cdp_endpoint:
         logger.info("Connecting to existing browser over CDP: %s", _mask_credentials(args.cdp_endpoint))
@@ -181,7 +182,11 @@ async def scrape(args) -> None:
                 logger.warning("0 products parsed — saved what the browser actually saw to "
                                 "%s and %s.", debug_html, debug_png)
 
-            all_products.extend(products)
+            fresh = dedupe_by_sku(products, seen_skus)
+            if len(fresh) < len(products):
+                logger.info("Dropped %d duplicate product(s) already seen on an earlier page.",
+                            len(products) - len(fresh))
+            all_products.extend(fresh)
 
             if page_num < args.pages:
                 next_href = await page.evaluate(

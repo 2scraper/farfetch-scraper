@@ -21,9 +21,10 @@ import sys
 import tempfile
 
 from product_parser import parse_products, category_from_url
-from output_writer import save
+from output_writer import save, dedupe_by_sku, Product
 from captcha_solver import (detect_recaptcha_v3, detect_recaptcha_in_page,
                             reconcile_detections)
+from diff_runs import diff_products
 
 SAMPLE_LISTING_HTML = """
 <html><body>
@@ -1098,6 +1099,66 @@ def main() -> int:
                     "debuggerAddress" in remote_msg)
     except ImportError:
         _skips.append("selenium version-guard checks (selenium not installed)")
+
+    # ---- cross-page dedup + cross-run diff --------------------------------
+    # Pins the pagination bug the three browser engines all shared until this
+    # was added: all_products.extend(products) with no seen-set, so a stale or
+    # repeating NEXT_PAGE_SELECTOR link duplicated a row into the output.
+    seen = set()
+    page1 = [Product(sku="1", title="A"), Product(sku="2", title="B")]
+    page2 = [Product(sku="2", title="B"), Product(sku="3", title="C")]
+    fresh1 = dedupe_by_sku(page1, seen)
+    fresh2 = dedupe_by_sku(page2, seen)
+    ok &= check("dedupe_by_sku: first page passes through untouched",
+                [p.sku for p in fresh1] == ["1", "2"])
+    ok &= check("dedupe_by_sku: a sku repeated on a later page is dropped, "
+                "a genuinely new one is kept",
+                [p.sku for p in fresh2] == ["3"])
+    no_sku = [Product(sku=None, title="fallback-parse miss")]
+    ok &= check("dedupe_by_sku: a product with no sku is always kept — there is "
+                "nothing to key a duplicate check on, so dropping it would be "
+                "silent data loss rather than dedup",
+                len(dedupe_by_sku(no_sku, seen)) == 1)
+
+    # README sells "re-run on a schedule and diff on sku" for price monitoring
+    # and assortment tracking; this pins the tool that actually does it.
+    old_run = [
+        {"sku": "10", "title": "Still listed, same price", "price": 50.0,
+         "original_price": None, "discount_pct": None, "currency": "USD", "in_stock": True},
+        {"sku": "11", "title": "Delisted since", "price": 30.0,
+         "original_price": None, "discount_pct": None, "currency": "USD", "in_stock": True},
+        {"sku": "12", "title": "Price dropped", "price": 100.0,
+         "original_price": None, "discount_pct": None, "currency": "USD", "in_stock": True},
+    ]
+    new_run = [
+        {"sku": "10", "title": "Still listed, same price", "price": 50.0,
+         "original_price": None, "discount_pct": None, "currency": "USD", "in_stock": True},
+        {"sku": "12", "title": "Price dropped", "price": 80.0,
+         "original_price": 100.0, "discount_pct": 20.0, "currency": "USD", "in_stock": True},
+        {"sku": "13", "title": "Newly listed", "price": 40.0,
+         "original_price": None, "discount_pct": None, "currency": "USD", "in_stock": True},
+    ]
+    result = diff_products(old_run, new_run)
+    ok &= check("diff_runs: a sku only in the new run is 'added'",
+                [p["sku"] for p in result["added"]] == ["13"])
+    ok &= check("diff_runs: a sku only in the old run is 'removed'",
+                [p["sku"] for p in result["removed"]] == ["11"])
+    ok &= check("diff_runs: an unchanged sku produces no 'changed' entry",
+                "10" not in [c["sku"] for c in result["changed"]])
+    ok &= check("diff_runs: price/original_price/discount_pct changing on a "
+                "matched sku is reported with old and new values",
+                result["changed"] == [{
+                    "sku": "12", "title": "Price dropped",
+                    "changes": {
+                        "price": {"old": 100.0, "new": 80.0},
+                        "original_price": {"old": None, "new": 100.0},
+                        "discount_pct": {"old": None, "new": 20.0},
+                    },
+                }])
+    dup_old = [{"sku": "20", "title": "dup"}, {"sku": "20", "title": "dup again"}]
+    ok &= check("diff_runs: the second row of a duplicate sku within one file "
+                "is counted as unmatchable rather than silently overwriting the first",
+                diff_products(dup_old, [])["unmatchable_old"] == 1)
 
     # ---- naming and dead-feature guards ----------------------------------
     # Not testing behaviour — testing claims. Three separate rounds of work went

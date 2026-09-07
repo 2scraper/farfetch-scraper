@@ -1,0 +1,87 @@
+name: canary
+
+# tests.yml (deliberately) never touches farfetch.com — see its own header
+# comment for why. That leaves a real gap: a selector or JSON-LD shape change
+# on the site itself only shows up when a user hits it and files an issue, and
+# the offline badge stays green throughout. This workflow is the other half —
+# a real run, on a real category URL, on a schedule — so a site-side break is
+# caught here first.
+#
+# Uses no 2Captcha product and no secret by default: the README's own claim is
+# that an ordinary browser on a clean IP clears Akamai without one, and this
+# workflow is exactly the place that claim gets exercised continuously. GitHub
+# Actions runners are datacenter IPs, though, not the "clean residential IP"
+# the README measured against — so a red run here can mean either the site
+# changed (a real break) or this run's IP got a challenge Akamai didn't give a
+# residential one (see the exit-code breakdown in the run summary below). If
+# this proves too noisy in practice, set the FARFETCH_PROXY repo secret and
+# uncomment the --proxy line to run it from a residential exit instead.
+on:
+  schedule:
+    # Once a day, off the hour, so it isn't competing with everyone else's
+    # on-the-hour cron jobs for runner availability.
+    - cron: "17 6 * * *"
+  workflow_dispatch:
+
+jobs:
+  live-run:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install Playwright engine
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt -r requirements-playwright.txt
+          playwright install --with-deps chromium
+
+      - name: Scrape a real, known-good category page
+        id: run
+        # Same filtered category URL the README and TROUBLESHOOTING.md use as
+        # the known-good example throughout — chosen so a 0-result run here
+        # means either the site changed or the category itself is gone, not
+        # "this URL never had products" (see README: a bare hub URL always
+        # returns 0 and that is not a bug).
+        # continue-on-error: this step's exit code is read explicitly below
+        # so the interpretation (parser break vs. probable IP block) can be
+        # printed before the job is failed, rather than just going red with
+        # no context in the log.
+        continue-on-error: true
+        run: |
+          python3 playwright_scraper.py \
+            --url "https://www.farfetch.com/shopping/kids/girls-clothing-4/items.aspx" \
+            --pages 1 --out canary_run --dump-html canary_run.html
+            # --proxy "${{ secrets.FARFETCH_PROXY }}"   # uncomment once the secret is set
+          echo "exit_code=$?" >> "$GITHUB_OUTPUT"
+
+      - name: Interpret the exit code
+        run: |
+          code="${{ steps.run.outputs.exit_code }}"
+          case "$code" in
+            0)   echo "OK — products parsed from a live run." ;;
+            3)   echo "::error::Blocked before parsing (exit 3), a bot-check/challenge page. Possibly this runner's IP rather than a site change — see FARFETCH_PROXY in this workflow's header comment." ;;
+            4)   echo "::error::Ran fine but parsed 0 products (exit 4) on a URL known to have some — this is the shape a real site-side break takes." ;;
+            124) echo "::error::Self-imposed timeout (exit 124) — the page never became ready." ;;
+            *)   echo "::error::Unexpected exit code $code (see the step above for the traceback)." ;;
+          esac
+          test "$code" = "0"
+
+      - name: Upload run artifacts (output, HTML snapshot, debug dumps)
+        # Always, not just on failure: a run that returns the WRONG number of
+        # products with no error is exactly the kind of regression that needs
+        # the actual bytes the parser saw, not just a pass/fail badge.
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: canary-run-${{ github.run_id }}
+          path: |
+            canary_run.json
+            canary_run.csv
+            canary_run.html
+            canary_run_page*_debug.*
+          if-no-files-found: ignore
+          retention-days: 14

@@ -8,7 +8,7 @@ import csv
 import json
 from dataclasses import dataclass, asdict, field
 from datetime import datetime, timezone
-from typing import Optional, List
+from typing import Optional, List, Set
 
 
 @dataclass
@@ -28,6 +28,25 @@ class Product:
     in_stock: Optional[bool] = None
     image_url: Optional[str] = None
     category: Optional[str] = None
+
+
+def dedupe_by_sku(products: List[Product], seen: Set[str]) -> List[Product]:
+    """Drop products whose sku already appeared earlier in this same run.
+
+    `seen` is mutated in place, so callers thread the same set across pages —
+    a stale or repeating NEXT_PAGE_SELECTOR link then re-parses a page without
+    duplicating its rows into the final output. A product with no sku (the
+    fallback parser failing to recover one) is always kept: there is nothing
+    to key a duplicate check on, and dropping it would be a silent data loss
+    rather than a duplicate removal.
+    """
+    fresh = []
+    for p in products:
+        if p.sku is None or p.sku not in seen:
+            if p.sku is not None:
+                seen.add(p.sku)
+            fresh.append(p)
+    return fresh
 
 
 def write_json(products: List[Product], path: str) -> None:
