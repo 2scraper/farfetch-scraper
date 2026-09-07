@@ -6,7 +6,30 @@ All notable changes to this project are documented here. Format follows
 library with a stable API) reasonably can — a patch bump means "fixes", not
 a promise that every flag and exit code is contractually frozen.
 
-## [Unreleased]
+## [0.2.0] — 2026-09-07
+
+First release verified against the live site: a real run of
+`playwright_scraper.py` on the README's own known-good category URL from a
+residential IP returned **96 products**, cleared Akamai with no proxy, no key
+and no paid product, and confirmed the documented geo-redirect
+(`.com/shopping` → `.com/de/shopping`, EUR, localised titles). Every earlier
+release was fixture-verified only.
+
+### Changed
+- `Product` gained a `price_source` column (see below), so output is now
+  **sixteen** columns rather than fifteen. Anything parsing the CSV header or
+  asserting a column count needs updating.
+- A JSON-LD offer with no `priceCurrency` now yields `currency: null` instead
+  of a guessed `"USD"`, and the DOM discount-overlay no longer overwrites a
+  currency the structured data stated explicitly.
+
+### Fixed
+- `.github/workflows/canary.yml` never recorded the scraper's exit code:
+  GitHub Actions runs `run:` steps under `bash -e`, so a non-zero exit
+  aborted the script before the line that captured it, leaving the whole
+  exit-3-vs-4-vs-124 interpretation dead in exactly the cases it existed
+  for. The canary also now sanity-checks the data it fetched (≥10 products,
+  ≥90% with a non-null price) rather than treating "exit 0" as success.
 
 ### Added
 - **`price_source` column** — says whether `price` is the DOM-confirmed
