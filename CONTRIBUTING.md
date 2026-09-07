@@ -52,8 +52,8 @@ output when a run finds nothing.
 file of plain functions with inline HTML/JSON fixtures — no pytest, no
 conftest, no fixtures directory. Copy the nearest existing check and edit it.
 
-Three properties in this repo exist because they were once absent and cost real
-time. Tests pin all three, so a PR that breaks one will fail rather than
+Four properties in this repo exist because they were once absent and cost real
+time. Tests pin all four, so a PR that breaks one will fail rather than
 silently regress:
 
 - **The product URL comes from `offers.url`, not `node.url`.** No product on
@@ -64,6 +64,11 @@ silently regress:
 - **Exit codes are a contract**, not decoration: `0` ok, `1` crash, `2` bad
   usage, `3` blocked by a challenge, `4` zero products, `5` remote API error,
   `124` self-imposed timeout. A pipeline branches on these.
+- **A sku already written by an earlier page of the same run is dropped, not
+  duplicated.** All three browser engines paginate by following
+  `NEXT_PAGE_SELECTOR`; a stale or repeating link must not double a row in the
+  output. See `dedupe_by_sku` in `output_writer.py` and `diff_runs.py`, which
+  diffs two runs by the same key.
 
 There is also a naming check: certain phrases are banned repo-wide and the suite
 fails naming them. If it trips, read the message — the phrase is wrong for a

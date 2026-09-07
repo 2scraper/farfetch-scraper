@@ -40,6 +40,15 @@ jobs:
         # Prints its own count. No network, no key, ~1s.
         run: python smoke_test.py
 
+      - name: Offline test suite, via pytest
+        # tests/test_smoke.py wraps the same run above for the pytest entry
+        # point pyproject.toml declares — this step exists so THAT wrapper
+        # can't silently rot even though the line above already covers the
+        # actual checks.
+        run: |
+          pip install pytest
+          pytest -q
+
       - name: Every CLI answers --help
         # A crash in argparse setup or a bad local import is invisible to the
         # test suite but breaks the first thing any user types. The engine
@@ -54,7 +63,8 @@ jobs:
 
           for script in ["playwright_scraper.py", "puppeteer_scraper.py",
                          "selenium_scraper.py", "scraper_api_client.py",
-                         "fingerprint_client.py", "env_config.py"]:
+                         "fingerprint_client.py", "env_config.py",
+                         "diff_runs.py"]:
               r = subprocess.run([sys.executable, script, "--help"],
                                  capture_output=True, text=True)
               if r.returncode == 0:

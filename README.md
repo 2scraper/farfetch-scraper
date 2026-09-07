@@ -1,6 +1,7 @@
 # farfetch-scraper
 
 [![tests](https://github.com/2scraper/farfetch-scraper/actions/workflows/tests.yml/badge.svg)](https://github.com/2scraper/farfetch-scraper/actions/workflows/tests.yml)
+[![canary](https://github.com/2scraper/farfetch-scraper/actions/workflows/canary.yml/badge.svg)](https://github.com/2scraper/farfetch-scraper/actions/workflows/canary.yml)
 [![Python 3.9+](https://img.shields.io/badge/python-3.9%2B-blue?style=flat-square)](https://python.org)
 [![License: MIT](https://img.shields.io/badge/license-MIT-green?style=flat-square)](LICENSE)
 [![Playwright · Selenium · Puppeteer](https://img.shields.io/badge/engines-Playwright%20%C2%B7%20Selenium%20%C2%B7%20Puppeteer-orange?style=flat-square)](#engines)
@@ -47,6 +48,7 @@ category URL — see [Troubleshooting](TROUBLESHOOTING.md).
 - [Configuration](#configuration)
 - [Flags](#flags) · [Exit codes](#exit-codes)
 - [Output](#output)
+- [Diffing two runs](#diffing-two-runs)
 - [Using 2Captcha](#using-2captcha)
 - [How the parser works](#how-the-parser-works)
 - [Site-specific behaviour](#site-specific-behaviour)
@@ -57,9 +59,10 @@ category URL — see [Troubleshooting](TROUBLESHOOTING.md).
 ## What people use it for
 
 - **Price and discount monitoring** — `price`, `original_price` and
-  `discount_pct` per SKU. Re-run on a schedule and diff on `sku`.
+  `discount_pct` per SKU. Re-run on a schedule and diff on `sku` — see
+  [`diff_runs.py`](#diffing-two-runs).
 - **Assortment tracking** for a brand or category — what is listed, and what
-  disappeared since the last run.
+  disappeared since the last run, via the same diff.
 - **Availability** — `in_stock` per product.
 - **Resale premium checks** — Farfetch retail price against a marketplace price
   for the same item.
@@ -148,6 +151,18 @@ python3 playwright_scraper.py --url "$URL" --pages 1 --out girls
 # a remote browser over CDP
 python3 playwright_scraper.py --url "$URL" --pages 1 --out girls \
   --cdp-endpoint "ws://USER:PASS@HOST:9222"
+```
+
+`pip install .[playwright]` (or `.[puppeteer]` / `.[selenium]`) is equivalent to
+`pip install -r requirements.txt -r requirements-<engine>.txt`, if you'd rather
+install this as a package than clone-and-run. A `Dockerfile` builds the
+Playwright engine with Chromium already installed, for a container-based
+schedule or CI job:
+
+```bash
+docker build -t farfetch-scraper .
+docker run --rm -v "$PWD/out:/out" farfetch-scraper \
+  --url "$URL" --pages 1 --out /out/girls_clothing
 ```
 
 ---
@@ -289,6 +304,44 @@ Three things about that row, because each looks like a bug and is not:
 
 `rating` and `review_count` are `null` on every row: the listing JSON-LD carries
 no `aggregateRating` at all.
+
+**A run that finds a sku already written by an earlier page of the same run
+drops it**, rather than duplicating the row. Pagination advances by following
+`NEXT_PAGE_SELECTOR` on the page just fetched, and a stale or repeating link
+would otherwise re-parse a page you already have; this is automatic, on every
+engine, not a flag.
+
+---
+
+## Diffing two runs
+
+`diff_runs.py` compares two JSON outputs by `sku` — the tool the price- and
+assortment-monitoring use cases above actually depend on:
+
+```bash
+python3 playwright_scraper.py --url "$URL" --out "girls_$(date +%F)"
+python3 diff_runs.py --old girls_2026-08-31.json --new girls_2026-09-07.json --out diff.json
+```
+
+Three buckets, all keyed on `sku`: **added** (new since the last run),
+**removed** (delisted, or just off this run's page/category), **changed**
+(`price`, `original_price`, `discount_pct`, `currency` or `in_stock` differs,
+reported as old value → new value). A row with no `sku` — or a second row
+sharing one already seen in the same file — can't be matched across runs at
+all, so it's counted separately as `unmatchable_old`/`unmatchable_new` rather
+than silently folded into "added" or "removed".
+
+`--fail-on-change` exits `1` when anything changed, for a cron job that should
+only alert on a real diff:
+
+```bash
+0 * * * * cd /path/to/farfetch-scraper && \
+  python3 playwright_scraper.py --url "$FARFETCH_URL" --out "run_$(date +\%F_\%H)" && \
+  python3 diff_runs.py --old "$(ls -t run_*.json | sed -n 2p)" \
+                        --new "run_$(date +%F_%H).json" \
+                        --out diff.json --fail-on-change || \
+  echo "products changed — see diff.json" # replace with a real notification
+```
 
 ---
 
