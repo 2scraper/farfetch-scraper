@@ -257,7 +257,11 @@ def _parse_jsonld(html: str, base_url: str) -> List[Product]:
                     title=node.get("name"),
                     brand=(node.get("brand") or {}).get("name") if isinstance(node.get("brand"), dict) else node.get("brand"),
                     price=_to_float(str(offers.get("price"))) if offers.get("price") is not None else None,
-                    currency=offers.get("priceCurrency", "USD"),
+                    # No fallback to "USD" here: if Farfetch's own JSON-LD
+                    # genuinely omits priceCurrency, presenting a guess as a
+                    # fact is worse for a cross-country price comparison than
+                    # admitting the currency is unknown.
+                    currency=offers.get("priceCurrency"),
                     rating=_to_float(str(agg_rating.get("ratingValue"))) if agg_rating.get("ratingValue") else None,
                     review_count=int(agg_rating["reviewCount"]) if str(agg_rating.get("reviewCount", "")).isdigit() else None,
                     in_stock=("InStock" in str(offers.get("availability", ""))) if offers.get("availability") else None,

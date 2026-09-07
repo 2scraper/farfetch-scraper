@@ -50,8 +50,17 @@ jobs:
         # so the interpretation (parser break vs. probable IP block) can be
         # printed before the job is failed, rather than just going red with
         # no context in the log.
+        #
+        # set +e: GitHub Actions runs `run:` steps as `bash -e ...` by
+        # default, so without this the scraper exiting non-zero would abort
+        # the script on THAT line and `echo "exit_code=$?"` below would never
+        # run at all — continue-on-error only stops the STEP from failing
+        # the job, it does not touch the shell's own errexit behaviour.
+        # Confirmed live: under `bash -e`, a script that exits 4 mid-run never
+        # reaches a later `echo` line.
         continue-on-error: true
         run: |
+          set +e
           python3 playwright_scraper.py \
             --url "https://www.farfetch.com/shopping/kids/girls-clothing-4/items.aspx" \
             --pages 1 --out canary_run --dump-html canary_run.html
@@ -69,6 +78,35 @@ jobs:
             *)   echo "::error::Unexpected exit code $code (see the step above for the traceback)." ;;
           esac
           test "$code" = "0"
+
+      - name: Sanity-check the scraped data
+        # Exit 0 only means "some products were written" — it says nothing
+        # about whether the run actually rendered, e.g. a snapshot taken
+        # before prices load would still write rows, just with every price
+        # null. Runs only when the step above passed (code 0), since there is
+        # nothing to check on a blocked/empty run.
+        run: |
+          python3 - <<'EOF'
+          import json, sys
+          from pathlib import Path
+
+          MIN_PRODUCTS = 10  # well under the ~96 this URL has returned historically;
+                              # a floor against a near-empty render, not a moving target
+          rows = json.loads(Path("canary_run.json").read_text())
+
+          fail = []
+          if len(rows) < MIN_PRODUCTS:
+              fail.append(f"only {len(rows)} products, expected at least {MIN_PRODUCTS}")
+
+          priced = sum(1 for r in rows if r.get("price") is not None)
+          if rows and priced / len(rows) < 0.9:
+              fail.append(f"only {priced}/{len(rows)} rows have a non-null price — "
+                          f"looks like a snapshot taken before prices rendered")
+
+          for line in fail:
+              print(f"::error::{line}")
+          sys.exit(1 if fail else 0)
+          EOF
 
       - name: Upload run artifacts (output, HTML snapshot, debug dumps)
         # Always, not just on failure: a run that returns the WRONG number of
