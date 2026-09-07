@@ -1,5 +1,6 @@
 # farfetch-scraper
 
+[![release](https://img.shields.io/github/v/release/2scraper/farfetch-scraper?style=flat-square)](https://github.com/2scraper/farfetch-scraper/releases)
 [![tests](https://github.com/2scraper/farfetch-scraper/actions/workflows/tests.yml/badge.svg)](https://github.com/2scraper/farfetch-scraper/actions/workflows/tests.yml)
 [![canary](https://github.com/2scraper/farfetch-scraper/actions/workflows/canary.yml/badge.svg)](https://github.com/2scraper/farfetch-scraper/actions/workflows/canary.yml)
 [![Python 3.9+](https://img.shields.io/badge/python-3.9%2B-blue?style=flat-square)](https://python.org)
@@ -52,7 +53,7 @@ category URL — see [Troubleshooting](TROUBLESHOOTING.md).
 - [Using 2Captcha](#using-2captcha)
 - [How the parser works](#how-the-parser-works)
 - [Site-specific behaviour](#site-specific-behaviour)
-- [Contributing](CONTRIBUTING.md) · [Troubleshooting](TROUBLESHOOTING.md) · [Legal](#legal)
+- [Contributing](CONTRIBUTING.md) · [Troubleshooting](TROUBLESHOOTING.md) · [Changelog](CHANGELOG.md) · [Legal](#legal)
 
 ---
 
