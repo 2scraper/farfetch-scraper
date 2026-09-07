@@ -270,6 +270,7 @@ Every run that writes output also writes `<out>.meta.json` beside it:
   "stop_reason": "page_load_timeout",
   "pages_requested": 10,
   "pages_completed": 2,
+  "pages_failed": [3],
   "products": 192,
   "start_url": "https://www.farfetch.com/shopping/kids/girls-clothing-4/items.aspx",
   "final_url": "https://www.farfetch.com/de/shopping/kids/girls-clothing-4/items.aspx?page=2",
@@ -280,7 +281,12 @@ Every run that writes output also writes `<out>.meta.json` beside it:
 `status` is the field to branch on: `complete` (everything requested was
 fetched, or the site's pagination ran out), `partial` (stopped early), `failed`
 (nothing gathered). It describes the **run**, not the products, which is why it
-is a sidecar rather than fifteen more identical columns on every row.
+is a sidecar rather than sixteen more identical columns on every row.
+
+`pages_failed` names the pages that produced nothing, by number.
+`pages_completed` alone was a sufficient description only while pages were
+fetched strictly in order, where "3 of 10" could only mean 1-2-3 — a count
+stops describing anything once a page can fail while later ones succeed.
 
 A failed run writes **no** sidecar, deliberately: `save` leaves the previous
 run's good output in place, and a `"status": "failed"` file sitting next to

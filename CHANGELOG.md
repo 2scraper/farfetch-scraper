@@ -6,6 +6,29 @@ All notable changes to this project are documented here. Format follows
 library with a stable API) reasonably can — a patch bump means "fixes", not
 a promise that every flag and exit code is contractually frozen.
 
+## [Unreleased]
+
+### Changed
+- **Page fetching restructured so pages no longer depend on each other**
+  (groundwork for `--concurrency`; no behaviour change on its own, and no
+  new flags). Three parts:
+  - Page URLs are **planned up front** from page 1 instead of chaining each
+    page's address off the previous page's next-link. Only done when the
+    site's own link agrees with the `?page=N` convention — verified, not
+    assumed, so a listing paginated with a cursor or token still chains
+    link-to-link and says why.
+  - Results are collected per page and **merged afterwards in page order**,
+    rather than folded into a running dedupe set inside the loop. Dedupe
+    that mutates shared state as it goes makes the output depend on the
+    order pages arrive in — harmless while that order is fixed, wrong the
+    moment pages are fetched concurrently.
+  - `pages_failed` added to the run-metadata sidecar. `pages_completed`
+    alone described the run only while pages were strictly ordered: "3 of
+    10" could only mean 1-2-3. A count stops being a description once page 3
+    can fail while 4 and 5 succeed.
+- Verified byte-identical: a live 2-page run before and after produced 174
+  products with an identical SKU order and zero differences in any field.
+
 ## [0.3.0] — 2026-09-07
 
 ### Added

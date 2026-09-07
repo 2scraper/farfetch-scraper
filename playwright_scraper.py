@@ -44,7 +44,9 @@ import argparse
 import logging
 import sys
 import time
-from urllib.parse import urlparse, urljoin
+from dataclasses import dataclass, field
+from typing import List, Optional
+from urllib.parse import urlparse, urljoin, parse_qsl
 
 from playwright.sync_api import (sync_playwright, Error as PWError,
                                  TimeoutError as PWTimeout)
@@ -72,6 +74,84 @@ def _chrome_ua(chromium_version: str) -> str:
     """
     return (f"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
             f"(KHTML, like Gecko) Chrome/{chromium_version} Safari/537.36")
+
+
+@dataclass
+class PageOutcome:
+    """What one page of a listing produced.
+
+    Collected per page and merged afterwards rather than folded into shared
+    state as the loop goes. Two reasons, and the second is the point:
+    dedupe that mutates a running set inside the loop makes the OUTPUT depend
+    on the order pages happen to arrive in — fine while that order is fixed,
+    wrong the moment pages are fetched concurrently, because which page
+    "claims" a duplicate sku (and so which `scraped_at` the row carries)
+    would vary between runs of the same command. Merging afterwards in page
+    order is deterministic regardless of arrival order.
+    """
+    page_num: int
+    url: str
+    final_url: Optional[str] = None
+    products: List = field(default_factory=list)
+    blocked_by: Optional[str] = None
+    load_failed: bool = False
+
+    @property
+    def ok(self) -> bool:
+        return not self.load_failed and self.blocked_by is None
+
+
+def _plan_page_urls(page, args, page_one_url: str) -> Optional[List[str]]:
+    """URLs for pages 2..N, decided once from page 1, or None to chain.
+
+    Following the site's own next-link one page at a time is correct but
+    strictly sequential: the address of page 5 is not knowable until page 4
+    has been fetched. Constructing `?page=N` up front removes that chain —
+    which is what makes fetching pages independently (and later,
+    concurrently) possible at all.
+
+    It is only safe when the site's own link AGREES with the convention, so
+    that is checked rather than assumed: if page 1's next-link is not what
+    `page_url()` would build for page 2, pagination is carrying something the
+    convention cannot reproduce (a cursor, a token, a filter id) and the
+    caller must keep chaining link to link. Returns None in that case.
+    """
+    if args.pages < 2:
+        return None
+
+    constructed = page_url(page_one_url, 2)
+    next_link = page.query_selector(NEXT_PAGE_SELECTOR)
+    href = next_link.get_attribute("href") if next_link else None
+
+    if href:
+        advertised = _resolve_pagination_url(page_one_url, href)
+        if _same_url(advertised, constructed):
+            logger.info("Pagination follows the ?page=N convention (page 2 "
+                        "link matches the constructed URL) — planning pages "
+                        "2-%d up front.", args.pages)
+        else:
+            logger.info("The site's own next-page link (%s) is not what the "
+                        "?page= convention would build (%s) — following its "
+                        "links one page at a time instead. Pages cannot be "
+                        "fetched independently for this listing.",
+                        advertised, constructed)
+            return None
+    else:
+        logger.warning(
+            "No pagination link matched %s on page 1 — falling back to the "
+            "?page= URL convention. If this repeats, the site's markup has "
+            "probably changed and NEXT_PAGE_SELECTOR needs updating.",
+            NEXT_PAGE_SELECTOR)
+
+    return [page_url(page_one_url, n) for n in range(2, args.pages + 1)]
+
+
+def _same_url(a: str, b: str) -> bool:
+    """URL equality that ignores query-parameter ORDER, which carries no meaning."""
+    pa, pb = urlparse(a), urlparse(b)
+    return (pa.scheme, pa.netloc, pa.path.rstrip("/")) == \
+           (pb.scheme, pb.netloc, pb.path.rstrip("/")) and \
+           sorted(parse_qsl(pa.query)) == sorted(parse_qsl(pb.query))
 
 
 # Chromium's own names for "the proxy is the problem, not the site". Matched
@@ -265,7 +345,10 @@ def handle_captcha_if_present(page, args) -> None:
 
 
 def scrape(args) -> None:
-    all_products = []
+    # One entry per page attempted, merged after the loop rather than folded
+    # into shared state during it — see PageOutcome for why that ordering
+    # matters more than it looks.
+    outcomes: List[PageOutcome] = []
     seen_skus = set()
     blocked = False
     # Why the loop ended. "completed" means every requested page was
@@ -273,8 +356,9 @@ def scrape(args) -> None:
     # (also a complete result — there was nothing more to get). Anything else
     # is an early stop, and the run is only a partial view of the category.
     stop_reason = "completed"
-    pages_completed = 0
-    final_url = args.url
+    # URLs for pages 2..N, planned from page 1 when the site's pagination
+    # follows the ?page=N convention; None means chain link to link instead.
+    planned: Optional[List[str]] = None
 
     pool = proxy_pool_from_args(args)
     if pool and args.cdp_endpoint:
@@ -329,6 +413,8 @@ def scrape(args) -> None:
 
         url = args.url
         for page_num in range(1, args.pages + 1):
+            outcome = PageOutcome(page_num=page_num, url=url)
+
             # A new exit per page is what actually spreads a run's volume,
             # and it costs a browser relaunch: see _launch_local for why
             # carrying the session across exits would defeat the point.
@@ -419,6 +505,8 @@ def scrape(args) -> None:
             if load_failed:
                 logger.error("Gave up loading %s after %d attempt(s).",
                              url, args.retries)
+                outcome.load_failed = True
+                outcomes.append(outcome)
                 stop_reason = "page_load_timeout"
                 break
 
@@ -446,6 +534,8 @@ def scrape(args) -> None:
                              "saved to %s%s. This is exit 3, distinct from a genuinely "
                              "empty category (exit 4).", vendor, len(html), debug_html,
                              f" (tried {block_retries + 1} exit(s))" if block_retries else "")
+                outcome.blocked_by = vendor
+                outcomes.append(outcome)
                 blocked = True
                 stop_reason = f"blocked_{vendor}"
                 break
@@ -474,44 +564,45 @@ def scrape(args) -> None:
                 logger.warning("0 products parsed — saved what the browser actually saw to "
                                 "%s and %s. Open the .png to see it.", debug_html, debug_png)
 
-            fresh = dedupe_by_sku(products, seen_skus)
-            if len(fresh) < len(products):
-                logger.info("Dropped %d duplicate product(s) already seen on an earlier page.",
-                            len(products) - len(fresh))
-            all_products.extend(fresh)
-            pages_completed = page_num
-            final_url = page.url
+            outcome.products = products
+            outcome.final_url = page.url
+            outcomes.append(outcome)
+
+            # Whether this page contributed anything not already seen. Kept as
+            # a running check because the condition is inherently sequential —
+            # "new" only means anything relative to the pages before it. The
+            # authoritative dedupe happens once, after the loop, in page order.
+            fresh_count = sum(1 for p in products
+                              if p.sku is None or p.sku not in seen_skus)
+            seen_skus.update(p.sku for p in products if p.sku is not None)
 
             # A page past the first that contributes nothing new means the end
             # of the catalogue — or that pagination is looping back on itself.
             # Either way there is nothing further to fetch, and this is the
             # honest terminating condition: it is a property of the DATA, not
             # of a CSS selector that may have been renamed.
-            if page_num > 1 and not fresh:
+            if page_num > 1 and not fresh_count:
                 logger.info("Page %d added no products not already seen — "
                             "treating that as the end of the listing.", page_num)
                 stop_reason = "no_new_products"
                 break
 
+            if page_num == 1:
+                planned = _plan_page_urls(page, args, page.url)
+
             if page_num < args.pages:
-                next_link = page.query_selector(NEXT_PAGE_SELECTOR)
-                href = next_link.get_attribute("href") if next_link else None
-                if href:
-                    url = _resolve_pagination_url(page.url, href)
+                if planned is not None:
+                    url = planned[page_num - 1]
                 else:
-                    # Do NOT stop here. Pagination resting entirely on three
-                    # DOM selectors is a silent-success failure waiting to
-                    # happen: rename one attribute and every run ends after
-                    # page 1 while reporting a complete, successful result.
-                    # Fall back to the site's own ?page=N convention and let
-                    # the data decide when to stop (see no_new_products above).
-                    url = page_url(page.url, page_num + 1)
-                    logger.warning(
-                        "No pagination link matched %s — falling back to the "
-                        "?page= URL convention (%s). If this repeats, the "
-                        "site's markup has probably changed and "
-                        "NEXT_PAGE_SELECTOR needs updating.",
-                        NEXT_PAGE_SELECTOR, url)
+                    # No usable plan: follow the site's own link, one page at a
+                    # time. Pagination resting entirely on DOM selectors is a
+                    # silent-success failure waiting to happen, so a missing
+                    # link still falls back to the convention rather than
+                    # ending the run (see no_new_products above).
+                    next_link = page.query_selector(NEXT_PAGE_SELECTOR)
+                    href = next_link.get_attribute("href") if next_link else None
+                    url = (_resolve_pagination_url(page.url, href) if href
+                           else page_url(page.url, page_num + 1))
                 time.sleep(args.delay)
 
         if args.cdp_endpoint:
@@ -519,9 +610,27 @@ def scrape(args) -> None:
         else:
             browser.close()
 
+    # Merge once, in PAGE order — not in the order pages happened to finish.
+    # At one page at a time the two are identical, which is the point: this
+    # is what keeps the output byte-for-byte the same while removing the
+    # dependency on arrival order that concurrency would otherwise introduce.
+    all_products = []
+    merged_seen = set()
+    for oc in sorted(outcomes, key=lambda o: o.page_num):
+        fresh = dedupe_by_sku(oc.products, merged_seen)
+        if len(fresh) < len(oc.products):
+            logger.info("Page %d: dropped %d product(s) already seen on an "
+                        "earlier page.", oc.page_num, len(oc.products) - len(fresh))
+        all_products.extend(fresh)
+
+    ok_pages = [o for o in outcomes if o.ok]
+    failed_pages = [o.page_num for o in outcomes if not o.ok]
+    final_url = ok_pages[-1].final_url if ok_pages else args.url
+
     return finish_run(all_products, args.out, args.format, args.allow_empty,
                       blocked=blocked, stop_reason=stop_reason,
-                      pages_requested=args.pages, pages_completed=pages_completed,
+                      pages_requested=args.pages, pages_completed=len(ok_pages),
+                      pages_failed=failed_pages,
                       start_url=args.url, final_url=final_url)
 
 
