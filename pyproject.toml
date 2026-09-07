@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "farfetch-scraper"
-version = "0.1.1"
+version = "0.2.0"
 description = "A working scraper for farfetch.com listing pages — category, hub, search and brand."
 readme = "README.md"
 license = "MIT"
