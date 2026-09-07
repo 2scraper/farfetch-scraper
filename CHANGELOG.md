@@ -9,6 +9,20 @@ a promise that every flag and exit code is contractually frozen.
 ## [Unreleased]
 
 ### Added
+- **`price_source` column** — says whether `price` is the DOM-confirmed
+  figure a customer pays (`jsonld+dom`), structured data only and therefore
+  possibly the pre-promo price (`jsonld`), or read off the tile with nothing
+  to cross-check (`dom`). The same column previously held all three with no
+  way to tell them apart.
+- `diff_runs.py` reports a **`source_changed`** bucket: a price that differs
+  while `price_source` also differs is not a site-side price change, just two
+  snapshots that rendered differently. `--fail-on-change` ignores it.
+- The parser logs **DOM price-confirmation coverage** per run, warning below
+  90% — a low figure on a sale page means the snapshot predates the tiles.
+- `sample_output.{json,csv}` regenerated from a live run (2026-09-07, 96
+  products from a European exit IP), now including `price_source`. One of the
+  three rows is a €1,020 product, which exercises the thousands-separator
+  handling fixed in 0.1.1.
 - **Run metadata sidecar** — every run that writes output also writes
   `<out>.meta.json` recording `status` (`complete`/`partial`/`failed`),
   `stop_reason`, pages requested vs. completed, and the start/final URL.

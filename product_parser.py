@@ -307,6 +307,9 @@ def _parse_jsonld(html: str, base_url: str) -> List[Product]:
                     review_count=int(agg_rating["reviewCount"]) if str(agg_rating.get("reviewCount", "")).isdigit() else None,
                     in_stock=("InStock" in str(offers.get("availability", ""))) if offers.get("availability") else None,
                     image_url=node.get("image") if isinstance(node.get("image"), str) else (node.get("image") or [None])[0],
+                    # Upgraded to "jsonld+dom" by _overlay_tile_prices when
+                    # the rendered tile corroborates or corrects this figure.
+                    price_source="jsonld",
                 ))
     return products
 
@@ -382,6 +385,8 @@ def _parse_css_fallback(html: str, base_url: str, category: Optional[str]) -> Li
             review_count=review_count,
             image_url=(img.get("src") or img.get("data-src")) if img else None,
             category=category,
+            # Read straight off the tile, with no JSON-LD to cross-check.
+            price_source="dom",
         ))
     return products
 
@@ -549,12 +554,23 @@ def _overlay_tile_prices(products, html: str, base_url: str):
         return 0
 
     corrected = 0
+    confirmed = 0
     for product in products:
         entry = tiles.get(product.sku)
         if entry is None:
+            # No rendered tile for this product — this site paints a variable
+            # fraction of them — so `price` stays the raw JSON-LD figure and
+            # price_source stays "jsonld": on a discounted item that may be
+            # the pre-promo price, and the row says so rather than implying
+            # a confidence it does not have.
             continue
         amounts, _tile_currency, text = entry  # tile currency deliberately unused, see below
         if len(set(amounts)) < 2:
+            # One price on the tile means there is no discount to correct, so
+            # the JSON-LD figure IS what a customer pays — and the DOM just
+            # said so. That is corroboration, not a correction.
+            product.price_source = "jsonld+dom"
+            confirmed += 1
             continue
 
         low, high = min(amounts), max(amounts)
@@ -573,6 +589,8 @@ def _overlay_tile_prices(products, html: str, base_url: str):
         product.price = low
         product.original_price = high
         product.discount_pct = _discount_from(low, high, text)
+        product.price_source = "jsonld+dom"
+        confirmed += 1
         # Deliberately NOT overwriting product.currency from the tile here.
         # JSON-LD's priceCurrency is structured data straight from the site;
         # the tile's currency is guessed from a bare symbol, and $ alone maps
@@ -587,6 +605,22 @@ def _overlay_tile_prices(products, html: str, base_url: str):
         logger.info("Corrected prices on %d of %d products from the DOM "
                     "(JSON-LD publishes the pre-promo price).",
                     corrected, len(products))
+    # Coverage, not just corrections: the interesting number for judging a
+    # run is how many rows the DOM could vouch for at all. A low figure on a
+    # sale page means the snapshot was taken before the tiles painted, and
+    # the uncorrected rows may carry pre-promo prices.
+    if products:
+        share = confirmed / len(products)
+        unconfirmed = len(products) - confirmed
+        if unconfirmed:
+            log = logger.info if share >= 0.9 else logger.warning
+            log("DOM-confirmed prices on %d of %d products (%.0f%%). The "
+                "other %d carry the raw JSON-LD figure "
+                "(price_source=\"jsonld\"), which on a discounted item may be "
+                "the pre-promo price.",
+                confirmed, len(products), share * 100, unconfirmed)
+        else:
+            logger.info("DOM-confirmed prices on all %d products.", confirmed)
     return corrected
 
 
