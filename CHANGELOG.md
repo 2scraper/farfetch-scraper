@@ -8,6 +8,26 @@ a promise that every flag and exit code is contractually frozen.
 
 ## [Unreleased]
 
+### Added
+- **`--concurrency N`** (Playwright): fetch pages through N parallel workers.
+  Defaults to 1, so the default run is exactly the sequential one. Measured
+  on a live 4-page run: 57s at `--concurrency 3` against 98s sequential,
+  with byte-identical output — same 333 products, same order, no field
+  differing.
+  - Each worker owns its own browser **and one proxy exit for its
+    lifetime**. Not a shared browser (with Playwright's sync API a browser
+    belongs to its creating thread) and not an exit that changes per page
+    (the invariant from 0.3.0: a session must not change address
+    mid-flight). Workers start on different exits and can walk the rest of
+    the pool if one gets blocked; each holds its own pool object, so no
+    locking is needed.
+  - Warns when raised without `--proxy-file`, since N workers then send N
+    times the traffic from one address.
+  - Refused with `--cdp-endpoint`, where the Scraping Browser API allows one
+    live connection per profile.
+  - A listing whose pagination cannot be addressed independently (a cursor
+    or token rather than `?page=N`) falls back to one page at a time.
+
 ### Changed
 - **Page fetching restructured so pages no longer depend on each other**
   (groundwork for `--concurrency`; no behaviour change on its own, and no
