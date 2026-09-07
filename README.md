@@ -213,6 +213,7 @@ The three browser engines share these:
 | `--delay` | `2.0` | Seconds between pages |
 | `--cdp-endpoint` | – | Attach to a running browser instead of launching one |
 | `--proxy` | – | Proxy for a self-launched browser; ignored with `--cdp-endpoint` |
+| `--retries` | `3` | Attempts per page load, pause doubling each time |
 | `--twocaptcha-key` | – | 2Captcha API key (or set `TWOCAPTCHA_KEY`) |
 | `--captcha-api` | `v2` | `v2` (current JSON API) or `v1` (legacy `in.php`) |
 | `--min-score` | `0.7` | reCAPTCHA v3 score to request — `0.3`, `0.7` or `0.9` only |
@@ -221,7 +222,9 @@ The three browser engines share these:
 | `--headless` / `--headful` | headless | Local browser only |
 
 Playwright also takes `--fingerprint`, `--fp-tags`, `--fp-country`
-([fingerprints](#4-fingerprints)). Selenium also takes `--chrome-binary`,
+([fingerprints](#4-fingerprints)) and the proxy-pool flags `--proxy-file`,
+`--proxy-rotate`, `--proxy-shuffle`, `--proxy-block-retries`
+([proxies](#3-proxies)). Selenium also takes `--chrome-binary`,
 `--chromedriver`, `--disable-build-check` and `--driver-timeout` — see
 [Troubleshooting](TROUBLESHOOTING.md) if a local Selenium run will not start.
 
@@ -485,21 +488,65 @@ remote browser already presents, which is worse than not setting one.
 
 ### 3. Proxies
 
-[Product](https://2captcha.com/proxy) · `--proxy`
+[Product](https://2captcha.com/proxy) · `--proxy` · `--proxy-file`
 
 Residential, premium, datacenter, ISP, mobile and SOCKS5, with country/state/city
 targeting and configurable IP lifetime. Also sold as **2prx.com** — the same
 product, not a second service.
+
+One exit for the whole run:
 
 ```bash
 python3 playwright_scraper.py --url "$URL" \
   --proxy "http://ACCOUNT:PASSWORD@HOST:9999"
 ```
 
-Playwright receives server/username/password separately, so credentials never
-reach a child process's command line. Two caveats: Selenium's `--proxy-server`
-flag cannot carry credentials (use Selenium-Wire or an extension), and `--proxy`
-is ignored with `--cdp-endpoint`, where the remote browser has its own.
+A pool to spread the run across, which is the reason to hold more than one:
+
+```bash
+cat > exits.txt <<'EOF'
+# one proxy URL per line; blanks and # comments ignored
+http://ACCOUNT:PASSWORD@HOST:9999
+http://ACCOUNT:PASSWORD@HOST:10000
+http://ACCOUNT:PASSWORD@HOST:10001
+EOF
+
+python3 playwright_scraper.py --url "$URL" --pages 20 \
+  --proxy-file exits.txt --proxy-rotate per-page --proxy-shuffle
+```
+
+| Flag | Default | Description |
+|---|---|---|
+| `--proxy-file` | – | One proxy URL per line. Wins over `--proxy`, and says so rather than silently picking one. |
+| `--proxy-rotate` | `per-run` | `per-run`: one exit for the whole run. `per-page`: a new exit for every page. |
+| `--proxy-shuffle` | off | Shuffle the pool at startup, so two runs started at once don't both begin on the first line. |
+| `--proxy-block-retries` | `2` | When a page comes back as a bot-challenge, retry it from this many **other** exits before giving up. |
+
+**A rotation relaunches the browser, and that is deliberate rather than
+incidental.** Swapping the proxy under a live session would be cheaper and
+wrong: cookies a bot manager issued against one exit, replayed from another,
+are a stronger signal than either address on its own. So each exit gets a
+genuinely fresh browser — new cookie jar, new storage — which is what an
+ordinary user on a different network looks like. `per-page` therefore costs a
+browser start per page; `per-run` is the default because a session that
+changes address mid-flight is more suspicious than one that does not.
+
+**An unusable exit rotates instead of burning retries.** Chromium reports a
+dead or misconfigured proxy as `ERR_PROXY_CONNECTION_FAILED` /
+`ERR_TUNNEL_CONNECTION_FAILED`, distinct from a timeout — the first wants a
+different exit, the second wants another try at the same one. Retrying a proxy
+that will not answer just spends the budget.
+
+Credentials go into Playwright's own `username`/`password` fields, never into
+`server`: that string becomes a Chromium command-line switch, so a `user:pass`
+left in it would land in the browser's argv for anything on the machine that
+can run `ps`. Log lines mask credentials but keep host and port — which exit a
+run used is the point of the log, and is not the secret.
+
+Three caveats. Rotation is **Playwright-only** for now (`--proxy` still works
+on every engine); Selenium's `--proxy-server` flag cannot carry credentials at
+all (use Selenium-Wire or an extension); and both flags are ignored with
+`--cdp-endpoint`, where the remote browser brings its own exit.
 
 **Match the proxy's country to your fingerprint's.** A US fingerprint arriving on
 a German IP is a contradiction that is cheap to detect.

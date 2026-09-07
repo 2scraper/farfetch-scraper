@@ -1553,6 +1553,139 @@ def main() -> int:
                     _dr._check_comparable(_A(os.path.join(tmp, "nope.json"),
                                              os.path.join(tmp, "nope2.json"))) is True)
 
+    # ---- proxy pool and rotation -------------------------------------------
+    # `--proxy` was one static string applied once at launch: the shape of a
+    # demo, not of the thing proxies are bought for. These pin the rules that
+    # replaced it, offline — no browser, no network.
+    import proxy_pool as _pp
+
+    for _bad, _why in (("host:9999", "a bare host:port has no scheme"),
+                       ("ftp://h:1", "ftp is not a proxy scheme"),
+                       ("http://", "no host at all"),
+                       ("socks5://u:p@h:1", "Chromium cannot authenticate SOCKS5, "
+                                            "so credentials would be dropped")):
+        try:
+            _pp.parse_proxy_line(_bad)
+            _raised = False
+        except _pp.ProxyError:
+            _raised = True
+        ok &= check(f"proxy list rejects {_bad!r} — {_why}", _raised)
+
+    ok &= check("proxy list skips blank lines and # comments rather than "
+                "treating them as entries",
+                _pp.parse_proxy_line("  ") is None
+                and _pp.parse_proxy_line("# a comment") is None
+                and _pp.parse_proxy_line("http://a:1") == "http://a:1")
+
+    ok &= check("a proxy URL is logged with credentials masked but host and "
+                "port intact — which exit was used is the point of the log, "
+                "and is not the secret",
+                _pp.mask("http://user:secret@gate.example.com:9999")
+                == "http://***:***@gate.example.com:9999"
+                and "secret" not in _pp.mask("http://user:secret@gate.example.com:9999"))
+
+    # Credentials must go in Playwright's own fields, never in `server`:
+    # `server` becomes a Chromium command-line switch, so a user:pass left
+    # there lands in the browser process's argv for anything running `ps`.
+    _pwx = _pp.to_playwright("http://user:secret@gate.example.com:9999")
+    ok &= check("Playwright proxy dict keeps credentials out of `server`, "
+                "which becomes a browser command-line argument",
+                _pwx["server"] == "http://gate.example.com:9999"
+                and "secret" not in _pwx["server"]
+                and _pwx["username"] == "user" and _pwx["password"] == "secret")
+
+    _pool = _pp.ProxyPool(["http://a:1", "http://b:2", "http://c:3"],
+                          rotate="per-page")
+    _seq = [_pool.current]
+    for _i in range(4):
+        _seq.append(_pool.advance(f"test {_i}"))
+    ok &= check("rotation walks the pool in order and wraps around rather than "
+                "exhausting — a 3-exit pool across 50 pages is legitimate",
+                _seq == ["http://a:1", "http://b:2", "http://c:3",
+                         "http://a:1", "http://b:2"]
+                and _pool.rotations == 4)
+
+    _single = _pp.ProxyPool(["http://only:1"])
+    ok &= check("rotating a single-exit pool stays put and warns instead of "
+                "pretending it moved",
+                _single.advance("blocked") == "http://only:1"
+                and _single.rotations == 0)
+
+    ok &= check("per-run is the default rotation mode — a session that changes "
+                "address mid-flight is more suspicious than one that does not",
+                _pp.ProxyPool(["http://a:1"]).rotate == "per-run"
+                and not _pp.ProxyPool(["http://a:1"]).rotates_per_page()
+                and _pp.ProxyPool(["http://a:1"], rotate="per-page").rotates_per_page())
+
+    with tempfile.TemporaryDirectory() as tmp:
+        _pf = os.path.join(tmp, "proxies.txt")
+        with open(_pf, "w", encoding="utf-8") as f:
+            f.write("# exits\nhttp://a:1\n\n  http://b:2  \n")
+        ok &= check("a proxy file loads its entries, ignoring comments, blanks "
+                    "and surrounding whitespace",
+                    _pp.load_proxy_file(_pf) == ["http://a:1", "http://b:2"])
+
+        class _PArgs:
+            proxy = "http://single:1"
+            proxy_file = _pf
+            proxy_rotate = "per-page"
+            proxy_shuffle = False
+        _from = _pp.from_args(_PArgs())
+        ok &= check("--proxy-file wins over --proxy when both are given, rather "
+                    "than silently picking one",
+                    len(_from) == 2 and _from.current == "http://a:1")
+
+        _bad = os.path.join(tmp, "empty.txt")
+        with open(_bad, "w", encoding="utf-8") as f:
+            f.write("# only a comment\n\n")
+        try:
+            _pp.load_proxy_file(_bad)
+            _raised = False
+        except _pp.ProxyError:
+            _raised = True
+        ok &= check("a proxy file with no usable entries is an error, not an "
+                    "empty pool that fails later at connect time", _raised)
+
+    class _NoProxyArgs:
+        proxy = None
+        proxy_file = None
+        proxy_rotate = "per-run"
+    ok &= check("no --proxy and no --proxy-file means no pool at all (the "
+                "unchanged default path)",
+                _pp.from_args(_NoProxyArgs()) is None)
+
+    # The engine must relaunch the browser on rotation rather than swapping the
+    # proxy under a live session: cookies issued against one exit, replayed
+    # from another, are a stronger signal than either address alone.
+    _psrc = open("playwright_scraper.py", encoding="utf-8").read()
+    ok &= check("playwright relaunches the browser when rotating exits, so the "
+                "session does not follow the IP around",
+                "browser.close()" in _psrc
+                and _psrc.count("_launch_local(pw, args, pool)") >= 3)
+    ok &= check("a blocked page is retried from a DIFFERENT exit — retrying the "
+                "same address only confirms the block",
+                'pool.advance(f"blocked by {vendor} on page {page_num}")' in _psrc)
+
+    # A dead proxy raises PWError (net::ERR_PROXY_CONNECTION_FAILED), NOT
+    # PWTimeout. Catching only the latter let it escape as a traceback —
+    # observed live against an unreachable exit, which is the likeliest
+    # failure the first time anyone points --proxy-file at a real list. And a
+    # proxy-level failure wants a DIFFERENT exit, not a retry of the same one.
+    if _ps is not None:
+        ok &= check("a Chromium proxy failure is recognised as such, so it "
+                    "rotates to another exit instead of spending the retry "
+                    "budget on a proxy that will not answer",
+                    _ps._proxy_failure(Exception(
+                        "Page.goto: net::ERR_PROXY_CONNECTION_FAILED at https://x/"))
+                    == "ERR_PROXY_CONNECTION_FAILED"
+                    and _ps._proxy_failure(Exception(
+                        "Page.goto: net::ERR_TUNNEL_CONNECTION_FAILED at https://x/"))
+                    == "ERR_TUNNEL_CONNECTION_FAILED")
+        ok &= check("an ordinary timeout is NOT mistaken for a proxy failure — "
+                    "it deserves a retry from the same exit",
+                    _ps._proxy_failure(Exception("Timeout 60000ms exceeded")) == ""
+                    and _ps._proxy_failure(Exception("net::ERR_NAME_NOT_RESOLVED")) == "")
+
     # ---- naming and dead-feature guards ----------------------------------
     # Not testing behaviour — testing claims. Three separate rounds of work went
     # into naming the products correctly and removing a flag that could not
