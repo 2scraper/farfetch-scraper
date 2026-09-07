@@ -1094,6 +1094,70 @@ def main() -> int:
         ok &= check("playwright: a page adding no new skus stops the loop with "
                     "the data-based reason, not a selector-based one",
                     'stop_reason = "no_new_products"' in _src)
+
+        # Phase 1 of concurrency work: page URLs are planned up front so a
+        # page's address no longer depends on having fetched the one before
+        # it. Only safe when the site's own link AGREES with the ?page=N
+        # convention, so that is verified rather than assumed.
+        _base = "https://www.farfetch.com/de/shopping/kids/x/items.aspx"
+        ok &= check("_same_url ignores query-parameter ORDER, which carries no "
+                    "meaning, but not a different param or path",
+                    _ps._same_url(_base + "?a=1&page=2", _base + "?page=2&a=1")
+                    and _ps._same_url(_base + "/", _base)
+                    and not _ps._same_url(_base + "?page=2", _base + "?page=3")
+                    and not _ps._same_url(_base + "?page=2",
+                                          _base + "?page=2&cursor=abc"))
+
+        class _FakePage:
+            """Stands in for a Playwright page carrying one next-link."""
+            def __init__(self, href): self._href = href
+            def query_selector(self, _sel):
+                if self._href is None:
+                    return None
+                href = self._href
+                class _El:
+                    def get_attribute(self, _n): return href
+                return _El()
+
+        class _PlanArgs:
+            pages = 4
+
+        ok &= check("page URLs are planned up front when the site's own next "
+                    "link matches the ?page= convention",
+                    _ps._plan_page_urls(_FakePage(_base + "?page=2"), _PlanArgs(), _base)
+                    == [_base + "?page=2", _base + "?page=3", _base + "?page=4"])
+        ok &= check("page URLs are still planned when NO next link is served "
+                    "at all — which is what farfetch.com actually does",
+                    _ps._plan_page_urls(_FakePage(None), _PlanArgs(), _base)
+                    == [_base + "?page=2", _base + "?page=3", _base + "?page=4"])
+        ok &= check("planning is REFUSED when the site's link carries something "
+                    "the convention cannot reproduce (a cursor, a token) — the "
+                    "run then chains link to link and cannot be parallelised",
+                    _ps._plan_page_urls(
+                        _FakePage(_base + "?page=2&cursor=opaque"),
+                        _PlanArgs(), _base) is None)
+
+        class _OnePage:
+            pages = 1
+        ok &= check("a single-page run plans nothing, since there is no page 2",
+                    _ps._plan_page_urls(_FakePage(None), _OnePage(), _base) is None)
+
+        # Merging in PAGE order rather than arrival order is what makes the
+        # output independent of the order pages happen to finish — the
+        # property concurrency needs and today's sequential run already has.
+        _o1 = _ps.PageOutcome(page_num=1, url="u1")
+        _o2 = _ps.PageOutcome(page_num=2, url="u2", load_failed=True)
+        _o3 = _ps.PageOutcome(page_num=3, url="u3", blocked_by="akamai")
+        ok &= check("a PageOutcome is 'ok' only when it neither failed to load "
+                    "nor came back as a challenge page",
+                    _o1.ok and not _o2.ok and not _o3.ok)
+        ok &= check("playwright merges outcomes sorted by page number, not by "
+                    "the order they finished",
+                    "sorted(outcomes, key=lambda o: o.page_num)" in _src)
+        ok &= check("playwright reports WHICH pages failed, not just how many "
+                    "completed — a count stops being a description once pages "
+                    "can fail out of order",
+                    "pages_failed=failed_pages" in _src)
         # Measured 2026-09-07: farfetch.com served NO anchor matching any of
         # the three selectors this project shipped with, but did serve
         # <link rel="next"> in <head>. A standards-based selector outlives a

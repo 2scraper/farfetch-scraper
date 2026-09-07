@@ -127,7 +127,7 @@ def write_run_meta(out_prefix: str, meta: dict) -> str:
 
 def run_meta(status: str, stop_reason: str, pages_requested: int,
              pages_completed: int, start_url: str, final_url: str,
-             products: int) -> dict:
+             products: int, pages_failed: Optional[List[int]] = None) -> dict:
     """Build the metadata dict for a finished run.
 
     `status` is the field a consumer branches on:
@@ -135,6 +135,13 @@ def run_meta(status: str, stop_reason: str, pages_requested: int,
                  pagination genuinely ran out (nothing more existed to get)
       partial  — products were gathered, then the run stopped early
       failed   — nothing was gathered at all
+
+    `pages_failed` lists the pages that did not yield data, by number.
+    `pages_completed` alone was enough only while pages were fetched strictly
+    in order, where "3 of 10 completed" could only mean 1-2-3: a count is not
+    a description once pages can be fetched independently and page 3 can fail
+    while 4 and 5 succeed. Recording the numbers keeps the sidecar honest
+    about WHICH part of the catalogue is missing, not just how much.
     """
     return {
         "source": "farfetch.com",
@@ -142,6 +149,7 @@ def run_meta(status: str, stop_reason: str, pages_requested: int,
         "stop_reason": stop_reason,
         "pages_requested": pages_requested,
         "pages_completed": pages_completed,
+        "pages_failed": pages_failed or [],
         "products": products,
         "start_url": start_url,
         "final_url": final_url,
@@ -198,7 +206,8 @@ COMPLETE_STOP_REASONS = ("completed", "pagination_exhausted", "no_new_products")
 def finish_run(products: List[Product], out_prefix: str, fmt: str,
                allow_empty: bool, *, blocked: bool, stop_reason: str,
                pages_requested: int, pages_completed: int,
-               start_url: str, final_url: str) -> int:
+               start_url: str, final_url: str,
+               pages_failed: Optional[List[int]] = None) -> int:
     """Write output + the run-metadata sidecar; return the exit code.
 
     Shared by all three browser engines so the status/exit-code mapping
@@ -220,6 +229,7 @@ def finish_run(products: List[Product], out_prefix: str, fmt: str,
         write_run_meta(out_prefix, run_meta(
             status=status, stop_reason=stop_reason,
             pages_requested=pages_requested, pages_completed=pages_completed,
+            pages_failed=pages_failed,
             start_url=start_url, final_url=final_url, products=len(products)))
 
     if not products:
