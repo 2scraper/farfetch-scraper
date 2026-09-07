@@ -47,7 +47,7 @@ category URL — see [Troubleshooting](TROUBLESHOOTING.md).
 - [Do you need a paid service for this](#do-you-need-a-paid-service-for-this)
 - [Engines](#engines)
 - [Configuration](#configuration)
-- [Flags](#flags) · [Exit codes](#exit-codes)
+- [Flags](#flags) · [Exit codes](#exit-codes) · [Run metadata](#run-metadata)
 - [Output](#output)
 - [Diffing two runs](#diffing-two-runs)
 - [Using 2Captcha](#using-2captcha)
@@ -240,12 +240,51 @@ A contract, not decoration — the harness and any pipeline can branch on these.
 | `3` | Blocked before parsing — a bot-check or challenge page |
 | `4` | Ran fine, parsed **0 products** |
 | `5` | Remote API returned an error |
+| `6` | **Partial run** — products written, but the page loop stopped early |
 | `124` | Self-imposed timeout expired |
 
 **Exit 4 writes nothing.** A run that finds nothing leaves the previous output
 file intact rather than replacing it with `[]`, because a consumer cannot tell an
 empty category from a failed run. Pass `--allow-empty` when empty is the expected
 answer; it writes the file and still exits 4.
+
+**Exit 6 writes what it got.** A timeout or a challenge on page 3 of 10 still
+saves the first two pages — discarding good data would be worse — but the result
+is not a complete view of the category, and a consumer that cannot tell the
+difference will read the pages that were never fetched as products that
+disappeared from the catalogue. That is what the [run metadata
+sidecar](#run-metadata) is for. The site's own pagination simply running out is
+**not** a partial run: there was nothing more to fetch, so that still exits 0.
+
+### Run metadata
+
+Every run that writes output also writes `<out>.meta.json` beside it:
+
+```json
+{
+  "source": "farfetch.com",
+  "status": "partial",
+  "stop_reason": "page_load_timeout",
+  "pages_requested": 10,
+  "pages_completed": 2,
+  "products": 192,
+  "start_url": "https://www.farfetch.com/shopping/kids/girls-clothing-4/items.aspx",
+  "final_url": "https://www.farfetch.com/de/shopping/kids/girls-clothing-4/items.aspx?page=2",
+  "finished_at": "2026-09-07T12:45:31.199634+00:00"
+}
+```
+
+`status` is the field to branch on: `complete` (everything requested was
+fetched, or the site's pagination ran out), `partial` (stopped early), `failed`
+(nothing gathered). It describes the **run**, not the products, which is why it
+is a sidecar rather than fifteen more identical columns on every row.
+
+A failed run writes **no** sidecar, deliberately: `save` leaves the previous
+run's good output in place, and a `"status": "failed"` file sitting next to
+perfectly good data would contradict it.
+
+`diff_runs.py` reads it and refuses an assortment comparison unless both runs
+are `complete` — see [Diffing two runs](#diffing-two-runs).
 
 ---
 
@@ -331,6 +370,15 @@ reported as old value → new value). A row with no `sku` — or a second row
 sharing one already seen in the same file — can't be matched across runs at
 all, so it's counted separately as `unmatchable_old`/`unmatchable_new` rather
 than silently folded into "added" or "removed".
+
+**It refuses to run if either side was a partial run**, reading the
+[`.meta.json` sidecar](#run-metadata) beside each file. A run cut short on page
+3 of 10 never saw the products on pages 4–10, and diffing it against a full run
+reports every one of them as `removed` — which reads as "delisted" when they
+were simply never fetched. Re-run the short side, or pass `--force` to compare
+anyway. Output written before run metadata existed (or by
+`scraper_api_client.py`, which fetches one page and has no pagination to cut
+short) has no sidecar and is compared without complaint.
 
 `--fail-on-change` exits `1` when anything changed, for a cron job that should
 only alert on a real diff:
@@ -487,9 +535,17 @@ Three details that are easy to get wrong on this site:
   means the search escaped into a shared grid wrapper, where a product can
   inherit its neighbour's data.
 
-Prices parse `$ € £ ¥` in either position and both decimal conventions
-(`1,234.56` and `1.234,56`, disambiguated by whichever separator comes last),
-with `currency` set from the symbol found.
+Prices parse `$ € £ ¥` **and** 3-letter ISO codes (`AED 100`, `100 CHF`) in
+either position, in both decimal conventions (`1,234.56` and `1.234,56`). When
+both separators appear, whichever comes last is the decimal point; when only one
+does, three trailing digits means a thousands grouping (`$1,234` is 1234, not
+1.234 — none of the currencies here have a 3-digit subunit).
+
+Codes are matched against an allowlist of real ISO 4217 codes rather than a bare
+`[A-Z]{3}`, so a size chart (`XXL 100`) doesn't become a phantom price. A written
+code sets `currency` outright; a bare symbol can only ever be mapped to its most
+likely code, which is why `$` alone yields `USD` and the DOM overlay never
+overwrites a currency that JSON-LD stated explicitly.
 
 ---
 

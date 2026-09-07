@@ -111,9 +111,32 @@ SELECTORS = {
 # reads offers.price/priceCurrency as structured numbers and was never
 # currency-sensitive.
 _CURRENCY_SYMBOLS = {"$": "USD", "€": "EUR", "£": "GBP", "¥": "JPY"}
+
+# Markets where Farfetch prints a 3-letter ISO code instead of a symbol —
+# "AED 100", "SAR 250", "100 CHF". A tile priced that way used to match
+# nothing in _PRICE_RE and was therefore dropped as "not a product tile",
+# silently losing every product on such a locale rather than reporting one
+# with an unknown currency.
+#
+# An explicit allowlist, not a bare [A-Z]{3}: the latter matches any three
+# capitals next to a number, so a size chart ("XXL 100") or a spec line
+# would start producing phantom prices. Every entry here is a real ISO 4217
+# code, so a match names the currency as a fact rather than a guess.
+_CURRENCY_CODES = frozenset("""
+    USD EUR GBP JPY CHF AUD CAD NZD SGD HKD TWD KRW CNY MOP
+    AED SAR QAR KWD BHD OMR JOD ILS TRY EGP MAD ZAR NGN KES
+    SEK NOK DKK ISK PLN CZK HUF RON BGN HRK RSD UAH RUB
+    INR IDR MYR THB PHP VND PKR LKR BDT KZT
+    BRL MXN ARS CLP COP PEN UYU
+""".split())
+
+# Amount, in either decimal convention: 1,234.56 / 1.234,56 / 125 / 125.00
+_AMOUNT = r"[\d.,]+(?:[.,]\d{1,2})?"
 _PRICE_RE = re.compile(
-    r"(?:([$€£¥])\s?([\d.,]+(?:[.,]\d{1,2})?)"      # symbol first: $125.00 / €125,00
-    r"|([\d.,]+(?:[.,]\d{1,2})?)\s?([$€£¥]))"       # symbol last:  125,00 €
+    r"(?:([$€£¥])\s?(" + _AMOUNT + r")"                  # symbol first: $125.00 / €125,00
+    r"|(" + _AMOUNT + r")\s?([$€£¥])"                    # symbol last:  125,00 €
+    r"|\b([A-Z]{3})\s(" + _AMOUNT + r")\b"               # code first:   AED 100
+    r"|\b(" + _AMOUNT + r")\s([A-Z]{3})\b)"              # code last:    100 CHF
 )
 _DISCOUNT_RE = re.compile(r"-(\d{1,2})%")
 
@@ -154,44 +177,62 @@ def _sku_from_url(url: Optional[str]) -> Optional[str]:
     return m.group(1) if m else None
 
 
-def _prices_in(text: str):
-    """Return ([amounts], currency_code_or_None) for all prices in `text`.
-
-    Handles both symbol-first and symbol-last forms, and both decimal
-    conventions: "1,234.56" (US) and "1.234,56" (EU).
+def _normalize_amount(raw: str) -> Optional[float]:
+    """Parse a price amount written in either decimal convention.
 
     When BOTH separators appear, 'whichever comes last is the decimal point'
     disambiguates correctly on its own. When only one kind appears, that is
-    ambiguous between a thousands grouping and a decimal point — "$1,234"
-    could be 1234 or (misread) 1.234 — and this project supports exactly
-    four currencies (_CURRENCY_SYMBOLS), none of which uses a 3-digit decimal
-    subunit. So a single separator followed by exactly 3 digits is a
-    thousands grouping, not a decimal point; anything else (1 or 2 digits, or
-    no separator at all) is read as a decimal amount instead.
+    ambiguous between a thousands grouping and a decimal point — "1,234"
+    could be 1234 or (misread) 1.234 — and no currency this parser recognises
+    uses a 3-digit decimal subunit. So a single separator followed by exactly
+    3 digits is a thousands grouping, not a decimal point; anything else (1 or
+    2 digits, or no separator at all) is read as a decimal amount instead.
+    """
+    last_dot, last_comma = raw.rfind("."), raw.rfind(",")
+    if last_dot != -1 and last_comma != -1:
+        if last_dot > last_comma:
+            norm = raw.replace(",", "")
+        else:
+            norm = raw.replace(".", "").replace(",", ".")
+    else:
+        sep_pos = max(last_dot, last_comma)
+        trailing = raw[sep_pos + 1:] if sep_pos != -1 else ""
+        if len(trailing) == 3 and trailing.isdigit():
+            norm = raw.replace(".", "").replace(",", "")
+        else:
+            norm = raw.replace(",", ".")
+    try:
+        return float(norm)
+    except ValueError:
+        return None
+
+
+def _prices_in(text: str):
+    """Return ([amounts], currency_code_or_None) for all prices in `text`.
+
+    Recognises four shapes, because Farfetch prints all of them depending on
+    the locale the exit IP lands on: symbol-first ("$125.00"), symbol-last
+    ("125,00 €"), ISO-code-first ("AED 100") and ISO-code-last ("100 CHF").
+    See _CURRENCY_CODES for why the code forms are matched against an
+    allowlist rather than a bare [A-Z]{3}.
     """
     amounts, currency = [], None
     for m in _PRICE_RE.finditer(text):
         sym = m.group(1) or m.group(4)
-        raw = m.group(2) or m.group(3)
-        if currency is None:
-            currency = _CURRENCY_SYMBOLS.get(sym)
-        last_dot, last_comma = raw.rfind("."), raw.rfind(",")
-        if last_dot != -1 and last_comma != -1:
-            if last_dot > last_comma:
-                norm = raw.replace(",", "")
-            else:
-                norm = raw.replace(".", "").replace(",", ".")
-        else:
-            sep_pos = max(last_dot, last_comma)
-            trailing = raw[sep_pos + 1:] if sep_pos != -1 else ""
-            if len(trailing) == 3 and trailing.isdigit():
-                norm = raw.replace(".", "").replace(",", "")
-            else:
-                norm = raw.replace(",", ".")
-        try:
-            amounts.append(float(norm))
-        except ValueError:
+        code = m.group(5) or m.group(8)
+        if code and code not in _CURRENCY_CODES:
+            # Three capitals next to a number that are not a real currency —
+            # a size ("XXL 100"), a spec, a model name. Not a price.
             continue
+        raw = m.group(2) or m.group(3) or m.group(6) or m.group(7)
+        if currency is None:
+            # A written-out ISO code names the currency outright; a bare
+            # symbol can only ever be mapped to the most likely code for it
+            # (see _CURRENCY_SYMBOLS — "$" is not necessarily USD).
+            currency = code or _CURRENCY_SYMBOLS.get(sym)
+        amount = _normalize_amount(raw)
+        if amount is not None:
+            amounts.append(amount)
     return amounts, currency
 _RATING_RE_COUNT_FIRST = re.compile(r"([\d,]+)\s*(?:user )?reviews?.*?([\d.]+)\s*out of 5", re.IGNORECASE)
 _RATING_RE_RATING_FIRST = re.compile(r"([\d.]+)\s*out of 5.*?([\d,]+)\s*reviews?", re.IGNORECASE)

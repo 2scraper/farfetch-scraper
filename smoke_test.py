@@ -13,6 +13,7 @@ your Python environment and the parsing/output logic are working:
 Exits non-zero on any failure so it's CI-friendly.
 """
 
+import json
 import os
 import re
 import builtins
@@ -293,6 +294,29 @@ def main() -> int:
                 _prices_in("$1,23")[0] == [1.23])
     ok &= check("thousands separator: repeated thousands groups, '$1,234,567' -> 1234567",
                 _prices_in("$1,234,567")[0] == [1234567.0])
+
+    # Some Farfetch markets print a 3-letter ISO code instead of a symbol.
+    # A tile priced that way matched nothing before and was dropped as "not a
+    # product tile" — losing every product on that locale rather than
+    # reporting one with an unfamiliar currency.
+    ok &= check("ISO currency code, code first: 'AED 100' -> 100 AED",
+                _prices_in("AED 100") == ([100.0], "AED"))
+    ok &= check("ISO currency code, code last: '100 CHF' -> 100 CHF",
+                _prices_in("100 CHF") == ([100.0], "CHF"))
+    ok &= check("ISO currency code carries the thousands/decimal handling too: "
+                "'SAR 1,250.50' -> 1250.50 SAR",
+                _prices_in("SAR 1,250.50") == ([1250.5], "SAR"))
+    ok &= check("ISO currency code: a discounted tile's three prices all parse",
+                _prices_in("AED 245 AED 135 AED 108")
+                == ([245.0, 135.0, 108.0], "AED"))
+    # The allowlist is the whole point: a bare [A-Z]{3} would turn a size
+    # chart or a spec line into phantom prices.
+    ok &= check("three capitals that are NOT a currency code are not a price: "
+                "'XXL 100' yields nothing",
+                _prices_in("XXL 100") == ([], None))
+    ok &= check("a longer word starting with a real code is not matched: "
+                "'SARAH 100' yields nothing",
+                _prices_in("SARAH 100") == ([], None))
 
     with tempfile.TemporaryDirectory() as tmp:
         prefix = os.path.join(tmp, "smoke_out")
@@ -1317,6 +1341,73 @@ def main() -> int:
     ok &= check("diff_runs: the second row of a duplicate sku within one file "
                 "is counted as unmatchable rather than silently overwriting the first",
                 diff_products(dup_old, [])["unmatchable_old"] == 1)
+
+    # ---- run metadata: partial runs must not read as delistings -----------
+    # A run cut short on page 3 of 10 is missing every product on pages
+    # 4-10. Diffed against yesterday's full run, all of them came back as
+    # `removed` — indistinguishable from "these products were delisted".
+    # finish_run writes a sidecar recording that, and diff_runs refuses.
+    from output_writer import (finish_run, run_meta, EXIT_PARTIAL,
+                               COMPLETE_STOP_REASONS)
+    import diff_runs as _dr
+
+    ok &= check("EXIT_PARTIAL (6) is distinct from 0, EXIT_BLOCKED and "
+                "EXIT_NO_PRODUCTS",
+                EXIT_PARTIAL == 6
+                and EXIT_PARTIAL not in (0, EXIT_BLOCKED, EXIT_NO_PRODUCTS))
+    ok &= check("pagination running out counts as a COMPLETE run — the site "
+                "had nothing more to give, which is not an early stop",
+                "pagination_exhausted" in COMPLETE_STOP_REASONS
+                and "page_load_timeout" not in COMPLETE_STOP_REASONS)
+
+    _two = [Product(sku="1", price=10.0), Product(sku="2", price=20.0)]
+    with tempfile.TemporaryDirectory() as tmp:
+        _c = os.path.join(tmp, "complete")
+        rc_c = finish_run(_two, _c, "json", False, blocked=False,
+                          stop_reason="completed", pages_requested=1,
+                          pages_completed=1, start_url="u", final_url="u")
+        meta_c = json.load(open(_c + ".meta.json", encoding="utf-8"))
+        ok &= check("finish_run: a complete run exits 0 and its sidecar says "
+                    "status=complete",
+                    rc_c == 0 and meta_c["status"] == "complete")
+
+        _p = os.path.join(tmp, "partial")
+        rc_p = finish_run(_two, _p, "json", False, blocked=False,
+                          stop_reason="page_load_timeout", pages_requested=10,
+                          pages_completed=2, start_url="u", final_url="v")
+        meta_p = json.load(open(_p + ".meta.json", encoding="utf-8"))
+        ok &= check("finish_run: a partial run still WRITES its products "
+                    "(discarding good pages would be worse) but exits "
+                    "EXIT_PARTIAL and records why",
+                    rc_p == EXIT_PARTIAL
+                    and os.path.exists(_p + ".json")
+                    and meta_p["status"] == "partial"
+                    and meta_p["stop_reason"] == "page_load_timeout"
+                    and meta_p["pages_completed"] == 2
+                    and meta_p["pages_requested"] == 10)
+
+        _b = os.path.join(tmp, "blocked")
+        rc_b = finish_run([], _b, "json", False, blocked=True,
+                          stop_reason="blocked_akamai", pages_requested=1,
+                          pages_completed=0, start_url="u", final_url="u")
+        ok &= check("finish_run: a run that gathered nothing writes NO sidecar "
+                    "— it would otherwise contradict the previous run's "
+                    "still-intact output, which save() deliberately keeps",
+                    rc_b == EXIT_BLOCKED and not os.path.exists(_b + ".meta.json"))
+
+        # diff_runs must refuse a comparison involving the partial run.
+        class _A:
+            def __init__(self, old, new, force=False):
+                self.old, self.new, self.force = old, new, force
+        ok &= check("diff_runs refuses to compare when a run's sidecar says "
+                    "'partial' — missing pages would be reported as delistings",
+                    _dr._check_comparable(_A(_c + ".json", _p + ".json")) is False)
+        ok &= check("diff_runs compares happily when both sidecars say 'complete'",
+                    _dr._check_comparable(_A(_c + ".json", _c + ".json")) is True)
+        ok &= check("diff_runs still works on output with NO sidecar at all "
+                    "(files written before run metadata existed)",
+                    _dr._check_comparable(_A(os.path.join(tmp, "nope.json"),
+                                             os.path.join(tmp, "nope2.json"))) is True)
 
     # ---- naming and dead-feature guards ----------------------------------
     # Not testing behaviour — testing claims. Three separate rounds of work went

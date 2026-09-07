@@ -79,6 +79,57 @@ EXIT_NO_PRODUCTS = 4
 # content". See product_parser.detect_bot_challenge.
 EXIT_BLOCKED = 3
 
+# Exit code for a run that gathered SOME products and then stopped early —
+# a page-load timeout, or a challenge, on page 3 of 10. The output file is
+# still written (throwing away three good pages would be worse), but it is
+# not a complete picture of the category, and a consumer that cannot tell
+# the difference will read the pages that were never fetched as products
+# that disappeared from the catalogue. See write_run_meta.
+EXIT_PARTIAL = 6
+
+
+def write_run_meta(out_prefix: str, meta: dict) -> str:
+    """Write a run-metadata sidecar next to the output, return its path.
+
+    Deliberately a separate `<out>.meta.json` rather than columns on every
+    product row: this describes the RUN, not the product, and repeating it
+    across 96 identical rows would both bloat the output and change the
+    schema every consumer of this project already parses.
+
+    diff_runs.py reads it to refuse an assortment comparison between runs
+    that are not both complete — the failure mode it exists to prevent is a
+    partial run's un-fetched pages being reported as delisted products.
+    """
+    path = f"{out_prefix}.meta.json"
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(meta, f, ensure_ascii=False, indent=2)
+    print(f"[+] Wrote run metadata -> {path} (status={meta.get('status')})")
+    return path
+
+
+def run_meta(status: str, stop_reason: str, pages_requested: int,
+             pages_completed: int, start_url: str, final_url: str,
+             products: int) -> dict:
+    """Build the metadata dict for a finished run.
+
+    `status` is the field a consumer branches on:
+      complete — every requested page was fetched, or the site's own
+                 pagination genuinely ran out (nothing more existed to get)
+      partial  — products were gathered, then the run stopped early
+      failed   — nothing was gathered at all
+    """
+    return {
+        "source": "farfetch.com",
+        "status": status,
+        "stop_reason": stop_reason,
+        "pages_requested": pages_requested,
+        "pages_completed": pages_completed,
+        "products": products,
+        "start_url": start_url,
+        "final_url": final_url,
+        "finished_at": datetime.now(timezone.utc).isoformat(),
+    }
+
 
 def save(products: List[Product], out_prefix: str, fmt: str,
          allow_empty: bool = False) -> int:
@@ -111,3 +162,48 @@ def save(products: List[Product], out_prefix: str, fmt: str,
         write_csv(products, f"{out_prefix}.csv")
         print(f"[+] Saved {len(products)} products -> {out_prefix}.csv")
     return 0 if products else EXIT_NO_PRODUCTS
+
+
+# Stop reasons that mean the run saw everything there was to see. Anything
+# else ended the page loop early, so the result is only a partial view.
+COMPLETE_STOP_REASONS = ("completed", "pagination_exhausted")
+
+
+def finish_run(products: List[Product], out_prefix: str, fmt: str,
+               allow_empty: bool, *, blocked: bool, stop_reason: str,
+               pages_requested: int, pages_completed: int,
+               start_url: str, final_url: str) -> int:
+    """Write output + the run-metadata sidecar; return the exit code.
+
+    Shared by all three browser engines so the status/exit-code mapping
+    cannot drift between them.
+
+    The metadata sidecar is written ONLY when the product file was written.
+    Otherwise a failed run would leave a "status": "failed" sidecar next to
+    the previous run's still-intact good output (which `save` deliberately
+    does not overwrite) — the two files would contradict each other, and
+    diff_runs.py would refuse to compare data that is in fact fine.
+    """
+    complete = stop_reason in COMPLETE_STOP_REASONS
+    rc = save(products, out_prefix, fmt, allow_empty=allow_empty)
+    wrote_output = bool(products) or allow_empty
+
+    if wrote_output:
+        status = "complete" if (products and complete) else (
+            "partial" if products else "failed")
+        write_run_meta(out_prefix, run_meta(
+            status=status, stop_reason=stop_reason,
+            pages_requested=pages_requested, pages_completed=pages_completed,
+            start_url=start_url, final_url=final_url, products=len(products)))
+
+    if not products:
+        # Nothing gathered at all: a challenge outranks "empty category",
+        # because it says something stood between the run and the content.
+        return EXIT_BLOCKED if blocked else rc
+    if not complete:
+        print(f"[!] Partial run: stopped after {pages_completed} of "
+              f"{pages_requested} page(s) ({stop_reason}). The output holds "
+              f"what was gathered, but it is NOT a complete view of the "
+              f"category — see {out_prefix}.meta.json.")
+        return EXIT_PARTIAL
+    return rc

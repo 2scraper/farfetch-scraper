@@ -30,7 +30,7 @@ from captcha_solver import (detect_recaptcha_v3, detect_recaptcha_in_page,
                             reconcile_detections, solve_recaptcha,
                             INJECT_TOKEN_JS, RECAPTCHA_DISCOVERY_JS)
 from product_parser import parse_products, SELECTORS, detect_bot_challenge
-from output_writer import save, dedupe_by_sku, EXIT_BLOCKED
+from output_writer import dedupe_by_sku, finish_run
 import env_config
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
@@ -118,6 +118,12 @@ async def scrape(args) -> None:
     all_products = []
     seen_skus = set()
     blocked = False
+    # See playwright_scraper.py for what these mean; kept identical across
+    # the three engines on purpose so the status/exit code cannot differ by
+    # which engine you happened to run.
+    stop_reason = "completed"
+    pages_completed = 0
+    final_url = args.url
 
     if args.cdp_endpoint:
         logger.info("Connecting to existing browser over CDP: %s", _mask_credentials(args.cdp_endpoint))
@@ -167,6 +173,7 @@ async def scrape(args) -> None:
                 await page.goto(url, {"waitUntil": "domcontentloaded", "timeout": 60000})
             except Exception:
                 logger.error("Timeout/error loading %s — skipping.", url)
+                stop_reason = "page_load_timeout"
                 break
 
             await handle_captcha_if_present(page, args)
@@ -196,6 +203,7 @@ async def scrape(args) -> None:
                              "saved to %s. This is exit 3, distinct from a genuinely "
                              "empty category (exit 4).", vendor, len(html), debug_html)
                 blocked = True
+                stop_reason = f"blocked_{vendor}"
                 break
 
             products = parse_products(html, page.url, category=args.category)
@@ -218,6 +226,8 @@ async def scrape(args) -> None:
                 logger.info("Dropped %d duplicate product(s) already seen on an earlier page.",
                             len(products) - len(fresh))
             all_products.extend(fresh)
+            pages_completed = page_num
+            final_url = page.url
 
             if page_num < args.pages:
                 next_href = await page.evaluate(
@@ -228,6 +238,7 @@ async def scrape(args) -> None:
                 )
                 if not next_href:
                     logger.info("No further pagination link found — stopping early.")
+                    stop_reason = "pagination_exhausted"
                     break
                 url = next_href
                 await asyncio.sleep(args.delay)
@@ -238,12 +249,10 @@ async def scrape(args) -> None:
         else:
             await browser.close()
 
-    # Only overrides the exit code when the run ended up with nothing at all —
-    # a challenge on a later page after earlier pages already yielded products
-    # still saves what was gathered, same as a mid-run timeout does.
-    if blocked and not all_products:
-        return EXIT_BLOCKED
-    return save(all_products, args.out, args.format, allow_empty=args.allow_empty)
+    return finish_run(all_products, args.out, args.format, args.allow_empty,
+                      blocked=blocked, stop_reason=stop_reason,
+                      pages_requested=args.pages, pages_completed=pages_completed,
+                      start_url=args.url, final_url=final_url)
 
 
 def parse_args():

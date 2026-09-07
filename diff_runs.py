@@ -33,8 +33,9 @@ than silently folded into "added"/"removed", which would be wrong on its face.
 
 import argparse
 import json
+import re
 import sys
-from typing import Dict, List, Tuple
+from typing import Dict, List, Optional, Tuple
 
 TRACKED_FIELDS = ("price", "original_price", "discount_pct", "currency", "in_stock")
 
@@ -107,6 +108,56 @@ def _print_summary(result: dict) -> None:
               f"duplicate sku, and could not be matched across runs.")
 
 
+def _run_status(path: str) -> Tuple[Optional[str], Optional[dict]]:
+    """Read the `<out>.meta.json` sidecar beside a run's JSON output.
+
+    Returns (status, meta), or (None, None) when there is no sidecar — which
+    is the normal case for output written before run metadata existed, or by
+    `scraper_api_client.py` (single fetch, no pagination to cut short).
+    """
+    meta_path = re.sub(r"\.json$", "", path) + ".meta.json"
+    try:
+        with open(meta_path, "r", encoding="utf-8") as f:
+            meta = json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return None, None
+    return meta.get("status"), meta
+
+
+def _check_comparable(args) -> bool:
+    """Refuse an assortment diff between runs that are not both complete.
+
+    This is the failure mode the sidecar exists for: a run cut short on page
+    3 of 10 is missing every product on pages 4-10, and diffing it against
+    yesterday's full run reports all of them as `removed` — reading as "these
+    products were delisted" when in fact they were simply never fetched.
+    Prices of the SKUs both runs DID see are still comparable, which is why
+    this is a refusal with a --force escape hatch rather than a hard error.
+    """
+    problems = []
+    for label, path in (("--old", args.old), ("--new", args.new)):
+        status, meta = _run_status(path)
+        if status is None:
+            continue  # no sidecar: nothing to check, see _run_status
+        if status != "complete":
+            problems.append(
+                f"{label} ({path}) was a {status!r} run — stopped after "
+                f"{meta.get('pages_completed')} of {meta.get('pages_requested')} "
+                f"page(s), reason {meta.get('stop_reason')!r}")
+    if not problems:
+        return True
+
+    print("[!] Refusing to diff: at least one run is not a complete view of "
+          "the category, so missing products cannot be told apart from "
+          "delisted ones.")
+    for line in problems:
+        print(f"      {line}")
+    print("    Re-run the incomplete side, or pass --force to compare anyway "
+          "(added/removed will include products that were simply never "
+          "fetched).")
+    return False
+
+
 def parse_args():
     p = argparse.ArgumentParser(
         description="Diff two farfetch-scraper JSON outputs by sku.")
@@ -117,11 +168,18 @@ def parse_args():
     p.add_argument("--fail-on-change", action="store_true",
                    help="Exit 1 if anything was added, removed or changed — "
                         "for a cron job that should only notify on a real diff.")
+    p.add_argument("--force", action="store_true",
+                   help="Diff even when a run's .meta.json says it was partial "
+                        "or failed. Products never fetched by the short run will "
+                        "appear as added/removed.")
     return p.parse_args()
 
 
 def main() -> int:
     args = parse_args()
+    if not args.force and not _check_comparable(args):
+        return 2
+
     try:
         old = _load(args.old)
         new = _load(args.new)
