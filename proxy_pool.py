@@ -148,6 +148,16 @@ class ProxyPool:
         return len(self._proxies)
 
     @property
+    def proxies(self) -> List[str]:
+        """A copy of the exits, for handing a rotated view to each worker.
+
+        A copy rather than the list itself: a worker builds its own pool from
+        this, and two threads sharing one mutable list is the bug that makes
+        concurrency stop being worth it.
+        """
+        return list(self._proxies)
+
+    @property
     def current(self) -> str:
         return self._proxies[self._index % len(self._proxies)]
 

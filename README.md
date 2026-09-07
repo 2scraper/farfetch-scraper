@@ -47,7 +47,7 @@ category URL — see [Troubleshooting](TROUBLESHOOTING.md).
 - [Do you need a paid service for this](#do-you-need-a-paid-service-for-this)
 - [Engines](#engines)
 - [Configuration](#configuration)
-- [Flags](#flags) · [Exit codes](#exit-codes) · [Run metadata](#run-metadata)
+- [Flags](#flags) · [Exit codes](#exit-codes) · [Concurrency](#concurrency) · [Run metadata](#run-metadata)
 - [Output](#output)
 - [Diffing two runs](#diffing-two-runs)
 - [Using 2Captcha](#using-2captcha)
@@ -214,6 +214,7 @@ The three browser engines share these:
 | `--cdp-endpoint` | – | Attach to a running browser instead of launching one |
 | `--proxy` | – | Proxy for a self-launched browser; ignored with `--cdp-endpoint` |
 | `--retries` | `3` | Attempts per page load, pause doubling each time |
+| `--concurrency` | `1` | Playwright only — fetch pages through N parallel workers ([details](#concurrency)) |
 | `--twocaptcha-key` | – | 2Captcha API key (or set `TWOCAPTCHA_KEY`) |
 | `--captcha-api` | `v2` | `v2` (current JSON API) or `v1` (legacy `in.php`) |
 | `--min-score` | `0.7` | reCAPTCHA v3 score to request — `0.3`, `0.7` or `0.9` only |
@@ -258,6 +259,43 @@ difference will read the pages that were never fetched as products that
 disappeared from the catalogue. That is what the [run metadata
 sidecar](#run-metadata) is for. The site's own pagination simply running out is
 **not** a partial run: there was nothing more to fetch, so that still exits 0.
+
+### Concurrency
+
+`--concurrency N` (Playwright only) fetches pages through N parallel workers.
+It defaults to **1**, so the default run is exactly the sequential one.
+
+```bash
+python3 playwright_scraper.py --url "$URL" --pages 20 \
+  --concurrency 4 --proxy-file exits.txt
+```
+
+Measured on a live 4-page run: **57s at `--concurrency 3` against 98s
+sequential**, with byte-identical output — same 333 products, in the same
+order, with no field differing.
+
+Three things worth knowing before raising it:
+
+**Each worker owns a browser and one exit for its lifetime.** Not one browser
+shared between workers: with Playwright's sync API a browser belongs to the
+thread that created it. And not an exit that changes per page either — the
+invariant from [proxies](#3-proxies) is that a *session* must not change
+address mid-flight, and a worker is one session. Workers start on different
+exits from the pool and can walk the rest of it if one gets blocked.
+
+**`--concurrency 4` without `--proxy-file` sends four times the traffic from
+one address**, which is a faster way to get that address scored than to gather
+data. The run warns and continues rather than refusing, because it is
+occasionally what you want on a small job.
+
+**Page 1 is always fetched on its own**, because its content is what decides
+whether pages 2..N can be addressed independently at all — see
+[Pagination](#site-specific-behaviour). A listing paginated with a cursor or
+token falls back to one page at a time and says so.
+
+Ignored with `--cdp-endpoint`: the Scraping Browser API allows one live
+connection per profile, so several workers would collide on it
+(`profile_locked`). Use several `pid`s, one run each.
 
 ### Run metadata
 

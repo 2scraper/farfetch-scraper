@@ -1158,6 +1158,44 @@ def main() -> int:
                     "completed — a count stops being a description once pages "
                     "can fail out of order",
                     "pages_failed=failed_pages" in _src)
+
+        # Phase 2: each worker owns a browser AND an exit for its lifetime.
+        import proxy_pool as _pp_here
+        _shared = _pp_here.ProxyPool(["http://a:1", "http://b:2", "http://c:3"])
+        _w = [_ps._worker_pool(_shared, i) for i in range(3)]
+        ok &= check("each worker starts on a DIFFERENT exit — N workers all "
+                    "leaving from one address is just a faster way to burn it",
+                    [p.current for p in _w]
+                    == ["http://a:1", "http://b:2", "http://c:3"])
+        ok &= check("a worker can still walk the rest of the pool after a block, "
+                    "wrapping through the exits the others started on",
+                    _w[2].advance("blocked") == "http://a:1")
+        ok &= check("worker pools are separate objects sharing no mutable state, "
+                    "so rotation between threads needs no lock",
+                    _w[0].current == "http://a:1" and _w[1].current == "http://b:2"
+                    and _shared.current == "http://a:1"
+                    and _shared.proxies is not _shared.proxies)
+        ok &= check("more workers than exits still works — the pool wraps rather "
+                    "than leaving a worker with nothing",
+                    _ps._worker_pool(_pp_here.ProxyPool(["http://only:1"]), 5).current
+                    == "http://only:1")
+        ok &= check("no proxy pool means no worker pool, not a crash",
+                    _ps._worker_pool(None, 0) is None)
+
+        # The guardrails around raising concurrency, checked at the source
+        # level because they are one-line decisions with no return value.
+        ok &= check("concurrency defaults to 1, so the default run is exactly "
+                    "the sequential one",
+                    '"--concurrency", type=int, default=1' in _src)
+        ok &= check("raising concurrency without a proxy pool warns that every "
+                    "worker leaves from the same address",
+                    "with no proxy pool: every worker" in _src)
+        ok &= check("concurrency is refused with --cdp-endpoint, where the "
+                    "Scraping Browser allows one live connection per profile",
+                    "--concurrency is ignored with --cdp-endpoint" in _src)
+        ok &= check("a listing whose pagination cannot be planned falls back to "
+                    "one page at a time instead of fetching wrong URLs fast",
+                    "cannot be addressed independently" in _src)
         # Measured 2026-09-07: farfetch.com served NO anchor matching any of
         # the three selectors this project shipped with, but did serve
         # <link rel="next"> in <head>. A standards-based selector outlives a
@@ -1724,8 +1762,8 @@ def main() -> int:
     _psrc = open("playwright_scraper.py", encoding="utf-8").read()
     ok &= check("playwright relaunches the browser when rotating exits, so the "
                 "session does not follow the IP around",
-                "browser.close()" in _psrc
-                and _psrc.count("_launch_local(pw, args, pool)") >= 3)
+                "session.relaunch()" in _psrc
+                and "self.browser.close()" in _psrc)
     ok &= check("a blocked page is retried from a DIFFERENT exit — retrying the "
                 "same address only confirms the block",
                 'pool.advance(f"blocked by {vendor} on page {page_num}")' in _psrc)
