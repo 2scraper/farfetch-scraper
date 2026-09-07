@@ -6,7 +6,7 @@ All notable changes to this project are documented here. Format follows
 library with a stable API) reasonably can — a patch bump means "fixes", not
 a promise that every flag and exit code is contractually frozen.
 
-## [Unreleased]
+## [0.3.0] — 2026-09-07
 
 ### Added
 - **Proxy rotation** (`proxy_pool.py`, Playwright engine). `--proxy` was a
