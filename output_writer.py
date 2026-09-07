@@ -20,7 +20,9 @@ class Product:
     title: Optional[str] = None
     brand: Optional[str] = None
     price: Optional[float] = None
-    currency: Optional[str] = "USD"
+    # No guessed default: a caller that doesn't know the currency should say
+    # so (None) rather than silently claiming USD.
+    currency: Optional[str] = None
     original_price: Optional[float] = None
     discount_pct: Optional[float] = None
     rating: Optional[float] = None

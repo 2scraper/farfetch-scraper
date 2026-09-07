@@ -475,6 +475,24 @@ def main() -> int:
                 "priceCurrency (AUD stays AUD, not overwritten to USD)",
                 len(_aud) == 1 and _aud[0].price == 108.0 and _aud[0].currency == "AUD")
 
+    # A JSON-LD offer that genuinely omits priceCurrency must not be reported
+    # as "USD" — that's a guess presented as a structured-data fact, worse
+    # for a cross-country comparison than admitting the currency is unknown.
+    _NO_CURRENCY_HTML = """
+    <html><body><script type="application/ld+json">{"@type":"ItemList",
+      "itemListElement":[{"@type":"Product","name":"no currency field",
+        "offers":{"price":59,
+                  "url":"/shopping/kids/x-item-55555556.aspx",
+                  "availability":"https://schema.org/InStock"}}]}</script>
+    </body></html>
+    """
+    _nc = parse_products(_NO_CURRENCY_HTML, "https://www.farfetch.com/shopping/kids/items.aspx")
+    ok &= check("JSON-LD with no priceCurrency field yields currency=None, "
+                "not a guessed 'USD'",
+                len(_nc) == 1 and _nc[0].currency is None)
+    ok &= check("Product()'s own currency default is None, not a guessed 'USD'",
+                Product().currency is None)
+
     # A tile with ONE price means no discount. JSON-LD is structured data and is
     # the better source there, so the overlay must leave it alone rather than
     # setting original_price equal to price.
