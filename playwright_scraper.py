@@ -52,7 +52,8 @@ from playwright.sync_api import (sync_playwright, Error as PWError,
 from captcha_solver import (detect_recaptcha_v3, detect_recaptcha_in_page,
                             reconcile_detections, solve_recaptcha,
                             INJECT_TOKEN_JS, RECAPTCHA_DISCOVERY_JS)
-from product_parser import parse_products, SELECTORS, detect_bot_challenge
+from product_parser import (parse_products, SELECTORS, detect_bot_challenge,
+                            page_url)
 from output_writer import dedupe_by_sku, finish_run
 import env_config
 
@@ -87,7 +88,15 @@ def _resolve_pagination_url(base_url: str, href: str) -> str:
     return urljoin(base_url, href)
 
 ITEM_LINK_SELECTOR = SELECTORS["item_link"]
-NEXT_PAGE_SELECTOR = "a[data-testid='pagination-next'], a[rel='next'], li.pagination-next a"
+# Ordered most-durable first. `<link rel="next">` in <head> is a W3C/SEO
+# convention rather than a build artefact, and on 2026-09-07 it was the ONLY
+# one of these that farfetch.com actually served: the three anchor selectors
+# below (which this project shipped with) matched nothing at all, so a
+# multi-page run silently returned page 1 and reported success. Kept anyway —
+# they cost nothing and the visible UI may come back — but the standards-based
+# one leads, and product_parser.page_url() backs all of them up.
+NEXT_PAGE_SELECTOR = ("link[rel='next'], a[data-testid='pagination-next'], "
+                      "a[rel='next'], li.pagination-next a")
 
 # How many product-link matches must appear before we treat the page as
 # "actually loaded" rather than a lucky single match on an unrelated link
@@ -275,10 +284,26 @@ def scrape(args) -> None:
         url = args.url
         for page_num in range(1, args.pages + 1):
             logger.info("Fetching page %d/%d: %s", page_num, args.pages, url)
-            try:
-                page.goto(url, wait_until="domcontentloaded", timeout=60000)
-            except PWTimeout:
-                logger.error("Timeout loading %s — skipping.", url)
+            # Retry a navigation timeout rather than ending the run on it.
+            # One network flap on page 12 of 50 used to break the loop, and
+            # scraper_api_client.py has had --retries all along — the same
+            # transient deserved the same treatment here.
+            for attempt in range(1, args.retries + 1):
+                try:
+                    page.goto(url, wait_until="domcontentloaded", timeout=60000)
+                    load_failed = False
+                    break
+                except PWTimeout:
+                    load_failed = True
+                    if attempt < args.retries:
+                        pause = args.retry_delay * (2 ** (attempt - 1))
+                        logger.warning("Timeout loading %s (attempt %d/%d) — "
+                                       "retrying in %.1fs.", url, attempt,
+                                       args.retries, pause)
+                        time.sleep(pause)
+            if load_failed:
+                logger.error("Gave up loading %s after %d attempt(s).",
+                             url, args.retries)
                 stop_reason = "page_load_timeout"
                 break
 
@@ -359,17 +384,36 @@ def scrape(args) -> None:
             pages_completed = page_num
             final_url = page.url
 
+            # A page past the first that contributes nothing new means the end
+            # of the catalogue — or that pagination is looping back on itself.
+            # Either way there is nothing further to fetch, and this is the
+            # honest terminating condition: it is a property of the DATA, not
+            # of a CSS selector that may have been renamed.
+            if page_num > 1 and not fresh:
+                logger.info("Page %d added no products not already seen — "
+                            "treating that as the end of the listing.", page_num)
+                stop_reason = "no_new_products"
+                break
+
             if page_num < args.pages:
                 next_link = page.query_selector(NEXT_PAGE_SELECTOR)
-                if not next_link:
-                    logger.info("No further pagination link found — stopping early.")
-                    stop_reason = "pagination_exhausted"
-                    break
-                href = next_link.get_attribute("href")
-                if not href:
-                    stop_reason = "pagination_exhausted"
-                    break
-                url = _resolve_pagination_url(page.url, href)
+                href = next_link.get_attribute("href") if next_link else None
+                if href:
+                    url = _resolve_pagination_url(page.url, href)
+                else:
+                    # Do NOT stop here. Pagination resting entirely on three
+                    # DOM selectors is a silent-success failure waiting to
+                    # happen: rename one attribute and every run ends after
+                    # page 1 while reporting a complete, successful result.
+                    # Fall back to the site's own ?page=N convention and let
+                    # the data decide when to stop (see no_new_products above).
+                    url = page_url(page.url, page_num + 1)
+                    logger.warning(
+                        "No pagination link matched %s — falling back to the "
+                        "?page= URL convention (%s). If this repeats, the "
+                        "site's markup has probably changed and "
+                        "NEXT_PAGE_SELECTOR needs updating.",
+                        NEXT_PAGE_SELECTOR, url)
                 time.sleep(args.delay)
 
         if args.cdp_endpoint:
@@ -391,6 +435,13 @@ def parse_args():
     p.add_argument("--category", default=None, help="Label to tag output rows with. Defaults to the category segment of the URL, so the column is never empty just because the flag was omitted.")
     p.add_argument("--pages", type=int, default=1, help="Number of listing pages to crawl")
     p.add_argument("--delay", type=float, default=2.0, help="Delay between pages, seconds")
+    p.add_argument("--retries", type=int, default=3,
+                   help="Attempts per page load before giving up (default 3). A "
+                        "single network flap mid-run should not end a 50-page "
+                        "job; the pause between attempts doubles each time.")
+    p.add_argument("--retry-delay", type=float, default=2.0,
+                   help="Seconds before the first page-load retry, doubling "
+                        "thereafter (default 2.0)")
     p.add_argument("--format", choices=["json", "csv", "both"], default="both")
     p.add_argument("--out", default="farfetch_products", help="Output file prefix")
     p.add_argument("--proxy", default=None, help="Proxy URL, e.g. http://ACCOUNT:PASSWORD@HOST:9999 (2captcha.com/proxy)")

@@ -295,6 +295,24 @@ def main() -> int:
     ok &= check("thousands separator: repeated thousands groups, '$1,234,567' -> 1234567",
                 _prices_in("$1,234,567")[0] == [1234567.0])
 
+    # The ?page=N fallback used when NEXT_PAGE_SELECTOR matches nothing.
+    from product_parser import page_url
+    ok &= check("page_url: adds ?page=N to a bare listing URL",
+                page_url("https://www.farfetch.com/shopping/kids/x/items.aspx", 2)
+                == "https://www.farfetch.com/shopping/kids/x/items.aspx?page=2")
+    ok &= check("page_url: REPLACES an existing page param rather than "
+                "appending a second one",
+                page_url("https://www.farfetch.com/shopping/x/items.aspx?page=1", 3)
+                == "https://www.farfetch.com/shopping/x/items.aspx?page=3")
+    ok &= check("page_url: preserves the filters and sort order already in the "
+                "URL — dropping them would silently scrape a different listing",
+                page_url("https://www.farfetch.com/de/shopping/x/items.aspx?view=90&sort=3", 4)
+                == "https://www.farfetch.com/de/shopping/x/items.aspx?view=90&sort=3&page=4")
+    ok &= check("page_url: an existing param differing only in case is still "
+                "replaced, not duplicated",
+                page_url("https://www.farfetch.com/shopping/x/items.aspx?PAGE=7", 8)
+                == "https://www.farfetch.com/shopping/x/items.aspx?page=8")
+
     # Some Farfetch markets print a 3-letter ISO code instead of a symbol.
     # A tile priced that way matched nothing before and was dropped as "not a
     # product tile" — losing every product on that locale rather than
@@ -979,6 +997,23 @@ def main() -> int:
                     and os.path.exists(prefix + "_ae.json"))
         ok &= check("a non-empty save returns 0", save(products, prefix + "_ok", "json") == 0)
 
+        # An empty result is still a well-formed result. A zero-byte CSV makes
+        # a consumer fail on read (no columns at all) instead of reading a
+        # valid table with zero rows — the opposite of what the rest of this
+        # module is careful about.
+        import csv as _csv
+        from dataclasses import asdict
+        from output_writer import write_csv as _wcsv
+        _empty_csv = os.path.join(tmp, "empty_rows.csv")
+        _wcsv([], _empty_csv)
+        with open(_empty_csv, newline="", encoding="utf-8") as f:
+            _rdr = _csv.reader(f)
+            _hdr = next(_rdr, None)
+            _rest = list(_rdr)
+        ok &= check("an empty CSV still carries the full header row, so it "
+                    "parses as a table with zero rows rather than failing",
+                    _hdr == list(asdict(Product()).keys()) and _rest == [])
+
     # --- blocked-vs-empty exit code -----------------------------------------
     # README documents exit 3 (blocked before parsing) as distinct from exit 4
     # (genuinely zero products), but nothing detected a bot-challenge page in
@@ -1044,6 +1079,33 @@ def main() -> int:
                     _ps._resolve_pagination_url("https://www.farfetch.com/de/shopping/kids/items.aspx",
                                                 "sub/items.aspx?page=2")
                     == "https://www.farfetch.com/de/shopping/kids/sub/items.aspx?page=2")
+
+        # Pagination must not depend ENTIRELY on NEXT_PAGE_SELECTOR. Rename one
+        # data-testid upstream and every run would end after page 1 while
+        # reporting a complete, successful result — the worst failure shape
+        # there is, and one neither the offline suite nor a one-page canary
+        # would notice. The engine now falls back to ?page=N and lets the data
+        # decide when to stop, so this pins the fallback's presence.
+        _src = open("playwright_scraper.py", encoding="utf-8").read()
+        ok &= check("playwright: a missing pagination link falls back to the "
+                    "?page= convention instead of ending the run",
+                    "page_url(page.url, page_num + 1)" in _src
+                    and 'stop_reason = "pagination_exhausted"' not in _src)
+        ok &= check("playwright: a page adding no new skus stops the loop with "
+                    "the data-based reason, not a selector-based one",
+                    'stop_reason = "no_new_products"' in _src)
+        # Measured 2026-09-07: farfetch.com served NO anchor matching any of
+        # the three selectors this project shipped with, but did serve
+        # <link rel="next"> in <head>. A standards-based selector outlives a
+        # build-generated attribute, so it has to stay in the list.
+        ok &= check("every engine's NEXT_PAGE_SELECTOR includes the "
+                    "standards-based link[rel=next], which is what this site "
+                    "actually serves",
+                    all("link[rel='next']" in
+                        open(f, encoding="utf-8").read().split(
+                            "NEXT_PAGE_SELECTOR = ")[1][:200]
+                        for f in ("playwright_scraper.py", "puppeteer_scraper.py",
+                                  "selenium_scraper.py")))
 
         class _NavPage:
             """Raises the navigation error N times, then succeeds."""
@@ -1141,15 +1203,32 @@ def main() -> int:
         class _FakeChrome:
             def __init__(self, service=None, options=None, **kw):
                 seen["built"] = True
-            def execute_cdp_cmd(self, *a, **k):
+            def execute_cdp_cmd(self, name, params=None):
+                seen.setdefault("cdp", []).append((name, params))
                 return {}
+            # build_driver reads this to build a UA naming the browser's own
+            # real version instead of a hardcoded one. Absent from this mock,
+            # the whole check crashed — and it went unnoticed because selenium
+            # was not installed anywhere it ran, including the engine-smoke
+            # CI job, which installed only playwright and pyppeteer.
+            capabilities = {"browserVersion": "127.0.6533.17"}
+
+        # build_driver checks the path is a real, executable file, so this
+        # needs to BE one. It used to point at smoke_test.py itself, which
+        # meant running the suite chmod'ed a tracked file to 755 and left a
+        # mode change in `git status` — a test must not mutate the working
+        # tree. A throwaway temp file does the same job with no side effect.
+        _fake_driver = tempfile.NamedTemporaryFile(
+            prefix="fake-chromedriver-", delete=False)
+        _fake_driver.close()
+        os.chmod(_fake_driver.name, 0o755)
 
         class _Args:
             cdp_endpoint = None
             headless = True
             proxy = None
             disable_build_check = False
-            chromedriver = os.path.abspath(__file__)   # a real, readable file
+            chromedriver = _fake_driver.name
 
         real_svc, real_chrome = _sel.Service, _sel.webdriver.Chrome
         _sel.Service, _sel.webdriver.Chrome = _FakeService, _FakeChrome
@@ -1167,17 +1246,23 @@ def main() -> int:
 
         builtins.__import__ = _guard
         try:
-            os.chmod(_Args.chromedriver, 0o755)
             _sel.build_driver(_Args())
         finally:
             builtins.__import__ = real_import
             _sel.Service, _sel.webdriver.Chrome = real_svc, real_chrome
+            os.unlink(_fake_driver.name)
 
         ok &= check("selenium: --chromedriver is honoured on the LOCAL path too",
                     seen.get("path") == _Args.chromedriver and seen.get("built") is True)
         ok &= check("selenium: with --chromedriver given, webdriver_manager is never "
                     "imported (so it works behind an egress allowlist)",
                     blocked["hit"] is False)
+        _ua_cmds = [p for n, p in seen.get("cdp", [])
+                    if n == "Network.setUserAgentOverride"]
+        ok &= check("selenium: the UA override names the version the driver "
+                    "actually reported, not a hardcoded one",
+                    len(_ua_cmds) == 1
+                    and "Chrome/127.0.6533.17 " in _ua_cmds[0]["userAgent"])
     except ImportError:
         _skips.append("selenium --chromedriver local-path checks "
                       "(selenium not installed)")

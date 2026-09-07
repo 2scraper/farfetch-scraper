@@ -598,6 +598,22 @@ Chromium on a clean residential IP. That is worth knowing before reaching for
 anything heavier: what a managed browser and proxies buy you is running at volume
 from many addresses without burning your own, not access to the first page.
 
+**Pagination is not in the markup you would expect.** Measured 2026-09-07: the
+page serves **no anchor** matching `a[data-testid='pagination-next']`,
+`a[rel='next']` or `li.pagination-next a` — the visible pager is built
+client-side without any of them. What it does serve is
+`<link rel="next" href="...?page=2">` in `<head>`, a standards-based signal
+that costs nothing to read and long outlives a build-generated attribute. So
+that selector leads, and `product_parser.page_url()` reconstructs `?page=N`
+behind it if even that disappears.
+
+This mattered more than it sounds. Before the fallback existed, `--pages 3`
+returned page 1 and exited **0** — a complete, successful-looking run holding a
+third of the data. That is why the loop now stops on a page that contributes no
+new `sku` (a property of the data) rather than on a missing link (a property of
+a selector), and why the [canary](#run-metadata) requests three pages: with one
+page, pagination is never exercised at all.
+
 **How much of the page has rendered varies, and it affects the prices.** Two
 measurements, both real: an early capture of a filtered category page had 96
 products in the JSON-LD but only 18 product anchors in the DOM, while two

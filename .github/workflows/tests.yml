@@ -166,17 +166,29 @@ jobs:
           python-version: "3.12"
 
       - name: Install core + engine packages (no browser binaries needed)
+        # ALL THREE engines, including selenium. It was missing here at first,
+        # and the selenium-guarded checks therefore skipped in every CI run —
+        # which hid a crash in one of them (a mock that had gone stale against
+        # the code it stands in for) until someone happened to install selenium
+        # locally. `pip check` will complain about the pins these three
+        # disagree on; that is expected and harmless here, because the offline
+        # suite only ever imports them, never launches a browser.
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
-          pip install playwright pyppeteer
+          pip install playwright pyppeteer selenium
 
       - name: Offline test suite, with engines actually importable
+        # The suite prints "N group(s) of checks SKIPPED" whenever an engine
+        # import fails. In THIS job every engine is installed, so any skip at
+        # all means a real import error rather than an expected absence —
+        # matching on the generic line rather than per-library names so a
+        # newly added engine-guarded group cannot quietly skip either.
         run: |
           python smoke_test.py | tee smoke.log
-          if grep -q "not installed: playwright\|not installed: pyppeteer" smoke.log; then
-            echo "FAILED: playwright/pyppeteer-guarded checks skipped even though "\
-                 "the packages were installed in this job — likely a real import error."
+          if grep -q "group(s) of checks SKIPPED" smoke.log; then
+            echo "FAILED: engine-guarded checks skipped even though every engine"
+            echo "        package is installed in this job — likely a real import error."
             exit 1
           fi
 
@@ -184,3 +196,4 @@ jobs:
         run: |
           python playwright_scraper.py --help >/dev/null
           python puppeteer_scraper.py --help >/dev/null
+          python selenium_scraper.py --help >/dev/null
