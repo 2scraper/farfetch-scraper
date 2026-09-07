@@ -55,6 +55,8 @@ from captcha_solver import (detect_recaptcha_v3, detect_recaptcha_in_page,
 from product_parser import (parse_products, SELECTORS, detect_bot_challenge,
                             page_url)
 from output_writer import dedupe_by_sku, finish_run
+from proxy_pool import (from_args as proxy_pool_from_args, to_playwright, mask,
+                        ROTATE_MODES, ProxyError)
 import env_config
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
@@ -70,6 +72,78 @@ def _chrome_ua(chromium_version: str) -> str:
     """
     return (f"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
             f"(KHTML, like Gecko) Chrome/{chromium_version} Safari/537.36")
+
+
+# Chromium's own names for "the proxy is the problem, not the site". Matched
+# on the error text because Playwright surfaces them as a generic Error.
+_PROXY_ERROR_MARKERS = (
+    "ERR_PROXY_CONNECTION_FAILED",     # nothing listening / refused
+    "ERR_TUNNEL_CONNECTION_FAILED",    # CONNECT rejected by the proxy
+    "ERR_PROXY_AUTH_UNSUPPORTED",      # auth scheme we cannot satisfy
+    "ERR_PROXY_AUTH_REQUESTED",        # credentials missing or wrong
+    "ERR_UNEXPECTED_PROXY_AUTH",
+    "ERR_PROXY_CERTIFICATE_INVALID",
+)
+
+
+def _proxy_failure(exc) -> str:
+    """The Chromium proxy-error name in `exc`, or "" if it is not one.
+
+    Distinguishing this from an ordinary timeout matters because the two want
+    opposite responses: a timeout deserves a retry from the same exit, while
+    an unusable exit deserves a different exit — retrying it unchanged just
+    spends the retry budget on a proxy that is not going to answer.
+    """
+    text = str(exc)
+    for marker in _PROXY_ERROR_MARKERS:
+        if marker in text:
+            return marker
+    return ""
+
+
+def _launch_local(pw, args, pool):
+    """Launch our own Chromium on `pool`'s current exit; return (browser, context, page).
+
+    Factored out of scrape() so a proxy rotation can tear the whole browser
+    down and call this again. Swapping the proxy under a live session would
+    be cheaper and wrong: cookies a bot manager issued against one exit,
+    replayed from another, are a stronger signal than either address alone.
+    A rotation therefore means a genuinely fresh browser — new cookie jar,
+    new storage — which is what an ordinary user on a different network
+    looks like.
+    """
+    launch_kwargs = {"headless": args.headless}
+    proxy = to_playwright(pool.current) if pool else None
+    if proxy:
+        launch_kwargs["proxy"] = proxy
+        logger.info("Using proxy exit %s", mask(pool.current))
+
+    browser = pw.chromium.launch(**launch_kwargs)
+    # Only override the UA when we launched our own bundled Chromium.
+    # Forcing a UA on a page reached via --cdp-endpoint mismatches
+    # the antidetect browser's real TLS/JS fingerprint on purpose-
+    # matched values — a mistake that broke a previous run in this
+    # family with an Akamai "Access Denied."
+    ctx_kwargs = {"user_agent": _chrome_ua(browser.version), "locale": "en-US"}
+    init_script = None
+    if args.fingerprint:
+        # Only meaningful on this branch. Over --cdp-endpoint the Scraping Browser
+        # browser already has its own fingerprint, and layering a second
+        # one on top produces a mismatch rather than better cover.
+        from fingerprint_client import (get_fingerprint,
+                                        playwright_context_kwargs,
+                                        playwright_init_script)
+        fp = get_fingerprint(args.twocaptcha_key,
+                             tags=args.fp_tags, country=args.fp_country)
+        ctx_kwargs.update(playwright_context_kwargs(fp))
+        init_script = playwright_init_script(fp)
+        logger.info("Using 2captcha fingerprint %s (%s)", fp.get("id"), fp.get("country"))
+
+    context = browser.new_context(**ctx_kwargs)
+    if init_script:
+        # Must be installed on the context, before any page script runs.
+        context.add_init_script(init_script)
+    return browser, context, context.new_page()
 
 
 def _resolve_pagination_url(base_url: str, href: str) -> str:
@@ -202,6 +276,13 @@ def scrape(args) -> None:
     pages_completed = 0
     final_url = args.url
 
+    pool = proxy_pool_from_args(args)
+    if pool and args.cdp_endpoint:
+        logger.warning("Ignoring --proxy/--proxy-file: with --cdp-endpoint the "
+                       "remote browser has its own exit, and layering a second "
+                       "proxy on top would contradict it.")
+        pool = None
+
     with sync_playwright() as pw:
         if args.cdp_endpoint:
             # Connect to an already-running browser (antidetect/Scraping
@@ -244,85 +325,102 @@ def scrape(args) -> None:
                 logger.info("Captcha.setAutoSolve not available on this --cdp-endpoint (%s) — "
                             "relying on this script's own detect+solve logic instead.", e)
         else:
-            launch_kwargs = {"headless": args.headless}
-            if args.proxy:
-                parsed = urlparse(args.proxy)
-                launch_kwargs["proxy"] = {
-                    "server": f"{parsed.scheme}://{parsed.hostname}:{parsed.port}",
-                    "username": parsed.username,
-                    "password": parsed.password,
-                }
-                logger.info("Using 2Captcha proxy: %s:%s", parsed.hostname, parsed.port)
-
-            browser = pw.chromium.launch(**launch_kwargs)
-            # Only override the UA when we launched our own bundled Chromium.
-            # Forcing a UA on a page reached via --cdp-endpoint mismatches
-            # the antidetect browser's real TLS/JS fingerprint on purpose-
-            # matched values — a mistake that broke a previous run in this
-            # family with an Akamai "Access Denied."
-            ctx_kwargs = {"user_agent": _chrome_ua(browser.version), "locale": "en-US"}
-            init_script = None
-            if args.fingerprint:
-                # Only meaningful on this branch. Over --cdp-endpoint the Scraping Browser
-                # browser already has its own fingerprint, and layering a second
-                # one on top produces a mismatch rather than better cover.
-                from fingerprint_client import (get_fingerprint,
-                                                playwright_context_kwargs,
-                                                playwright_init_script)
-                fp = get_fingerprint(args.twocaptcha_key,
-                                     tags=args.fp_tags, country=args.fp_country)
-                ctx_kwargs.update(playwright_context_kwargs(fp))
-                init_script = playwright_init_script(fp)
-                logger.info("Using 2captcha fingerprint %s (%s)", fp.get("id"), fp.get("country"))
-
-            context = browser.new_context(**ctx_kwargs)
-            if init_script:
-                # Must be installed on the context, before any page script runs.
-                context.add_init_script(init_script)
-            page = context.new_page()
+            browser, context, page = _launch_local(pw, args, pool)
 
         url = args.url
         for page_num in range(1, args.pages + 1):
-            logger.info("Fetching page %d/%d: %s", page_num, args.pages, url)
-            # Retry a navigation timeout rather than ending the run on it.
-            # One network flap on page 12 of 50 used to break the loop, and
-            # scraper_api_client.py has had --retries all along — the same
-            # transient deserved the same treatment here.
-            for attempt in range(1, args.retries + 1):
-                try:
-                    page.goto(url, wait_until="domcontentloaded", timeout=60000)
-                    load_failed = False
+            # A new exit per page is what actually spreads a run's volume,
+            # and it costs a browser relaunch: see _launch_local for why
+            # carrying the session across exits would defeat the point.
+            if pool and pool.rotates_per_page() and page_num > 1:
+                pool.advance(f"per-page rotation, page {page_num}")
+                browser.close()
+                browser, context, page = _launch_local(pw, args, pool)
+
+            # How many times a blocked page may be retried from a DIFFERENT
+            # exit. Zero without a pool: there is nowhere else to go, and a
+            # bare retry from the same address just burns it further.
+            block_retries = args.proxy_block_retries if (pool and len(pool) > 1) else 0
+            html, vendor, load_failed, exit_failed = None, None, False, None
+
+            for block_attempt in range(block_retries + 1):
+                logger.info("Fetching page %d/%d: %s", page_num, args.pages, url)
+                # Retry a navigation timeout rather than ending the run on it.
+                # One network flap on page 12 of 50 used to break the loop, and
+                # scraper_api_client.py has had --retries all along — the same
+                # transient deserved the same treatment here.
+                load_failed, exit_failed = False, None
+                for attempt in range(1, args.retries + 1):
+                    try:
+                        page.goto(url, wait_until="domcontentloaded", timeout=60000)
+                        load_failed = False
+                        break
+                    except (PWTimeout, PWError) as e:
+                        # A dead or misconfigured proxy raises PWError
+                        # (net::ERR_PROXY_CONNECTION_FAILED), not PWTimeout —
+                        # catching only the latter let it escape as a
+                        # traceback, which is the likeliest failure the first
+                        # time anyone points --proxy-file at a real list.
+                        reason = _proxy_failure(e)
+                        if reason:
+                            exit_failed = reason
+                            load_failed = True
+                            break  # a different exit is the only thing that helps
+                        load_failed = True
+                        if attempt < args.retries:
+                            pause = args.retry_delay * (2 ** (attempt - 1))
+                            logger.warning("Timeout loading %s (attempt %d/%d) — "
+                                           "retrying in %.1fs.", url, attempt,
+                                           args.retries, pause)
+                            time.sleep(pause)
+
+                if exit_failed and block_attempt < block_retries:
+                    logger.warning("Exit %s is unusable (%s) — rotating to another "
+                                   "one (%d/%d).", mask(pool.current), exit_failed,
+                                   block_attempt + 1, block_retries)
+                    pool.advance(f"unusable exit: {exit_failed}")
+                    browser.close()
+                    browser, context, page = _launch_local(pw, args, pool)
+                    continue
+                if load_failed:
                     break
+
+                handle_captcha_if_present(page, args)
+
+                # Don't wait for network idle (retail sites never go fully
+                # quiet) and don't accept a single selector match as "ready"
+                # (see MIN_CARD_MATCHES comment above).
+                try:
+                    page.wait_for_function(
+                        f"document.querySelectorAll({ITEM_LINK_SELECTOR!r}).length > {MIN_CARD_MATCHES}",
+                        timeout=20000,
+                    )
+                    page.wait_for_timeout(1000)
                 except PWTimeout:
-                    load_failed = True
-                    if attempt < args.retries:
-                        pause = args.retry_delay * (2 ** (attempt - 1))
-                        logger.warning("Timeout loading %s (attempt %d/%d) — "
-                                       "retrying in %.1fs.", url, attempt,
-                                       args.retries, pause)
-                        time.sleep(pause)
+                    logger.warning("No product markers appeared within 20s — "
+                                    "parsing whatever loaded (may be a bot-check/consent page).")
+
+                html = page.content()
+                vendor = detect_bot_challenge(html)
+                if not vendor:
+                    break
+
+                # Blocked. A different exit is the one thing that plausibly
+                # changes the outcome — the address is what was scored, so
+                # retrying from it unchanged would only confirm the block.
+                if block_attempt < block_retries:
+                    logger.warning("Blocked by %s on page %d from %s — retrying "
+                                   "from another exit (%d/%d).", vendor, page_num,
+                                   mask(pool.current), block_attempt + 1, block_retries)
+                    pool.advance(f"blocked by {vendor} on page {page_num}")
+                    browser.close()
+                    browser, context, page = _launch_local(pw, args, pool)
+
             if load_failed:
                 logger.error("Gave up loading %s after %d attempt(s).",
                              url, args.retries)
                 stop_reason = "page_load_timeout"
                 break
-
-            handle_captcha_if_present(page, args)
-
-            # Don't wait for network idle (retail sites never go fully
-            # quiet) and don't accept a single selector match as "ready"
-            # (see MIN_CARD_MATCHES comment above).
-            try:
-                page.wait_for_function(
-                    f"document.querySelectorAll({ITEM_LINK_SELECTOR!r}).length > {MIN_CARD_MATCHES}",
-                    timeout=20000,
-                )
-                page.wait_for_timeout(1000)
-            except PWTimeout:
-                logger.warning("No product markers appeared within 20s — "
-                                "parsing whatever loaded (may be a bot-check/consent page).")
-
-            html = page.content()
 
             # Dumping on success, not only on failure: a run can return the
             # right NUMBER of products with a field silently unpopulated, and
@@ -336,7 +434,6 @@ def scrape(args) -> None:
                 logger.info("Saved the snapshot the parser sees to %s "
                             "(%d bytes).", dump_path, len(html))
 
-            vendor = detect_bot_challenge(html)
             if vendor:
                 debug_html = f"{args.out}_page{page_num}_debug.html"
                 with open(debug_html, "w", encoding="utf-8") as f:
@@ -346,8 +443,9 @@ def scrape(args) -> None:
                 except Exception as e:
                     logger.warning("Could not capture screenshot: %s", e)
                 logger.error("Blocked by a %s challenge page before parsing (%d bytes) — "
-                             "saved to %s. This is exit 3, distinct from a genuinely "
-                             "empty category (exit 4).", vendor, len(html), debug_html)
+                             "saved to %s%s. This is exit 3, distinct from a genuinely "
+                             "empty category (exit 4).", vendor, len(html), debug_html,
+                             f" (tried {block_retries + 1} exit(s))" if block_retries else "")
                 blocked = True
                 stop_reason = f"blocked_{vendor}"
                 break
@@ -445,6 +543,21 @@ def parse_args():
     p.add_argument("--format", choices=["json", "csv", "both"], default="both")
     p.add_argument("--out", default="farfetch_products", help="Output file prefix")
     p.add_argument("--proxy", default=None, help="Proxy URL, e.g. http://ACCOUNT:PASSWORD@HOST:9999 (2captcha.com/proxy)")
+    p.add_argument("--proxy-file", default=None,
+                   help="File with one proxy URL per line (# comments and blank "
+                        "lines skipped) to rotate across. Wins over --proxy.")
+    p.add_argument("--proxy-rotate", choices=list(ROTATE_MODES), default="per-run",
+                   help="per-run (default): one exit for the whole run. per-page: "
+                        "a new exit for every page — this is what spreads volume, "
+                        "and it relaunches the browser each time so the session "
+                        "does not follow the IP around.")
+    p.add_argument("--proxy-shuffle", action="store_true",
+                   help="Shuffle the pool at startup, so concurrent runs do not "
+                        "all begin on the first exit in the file.")
+    p.add_argument("--proxy-block-retries", type=int, default=2,
+                   help="When a page comes back as a bot-challenge, retry it from "
+                        "this many OTHER exits before giving up (default 2). "
+                        "Needs a pool of more than one; ignored otherwise.")
     p.add_argument("--twocaptcha-key", default=None, help="2captcha.com API key")
     p.add_argument("--allow-empty", action="store_true",
                    help="Write output files even when 0 products were found. Off by "
@@ -501,5 +614,10 @@ if __name__ == "__main__":
                        "creates a mismatch rather than better cover.")
     try:
         sys.exit(scrape(args))
+    except ProxyError as e:
+        # Bad usage, not a crash: a typo in a proxy list would otherwise
+        # surface as a connection failure on page 1 with nothing naming it.
+        logger.error("%s", e)
+        sys.exit(2)
     except KeyboardInterrupt:
         sys.exit(1)

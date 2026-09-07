@@ -6,6 +6,29 @@ All notable changes to this project are documented here. Format follows
 library with a stable API) reasonably can — a patch bump means "fixes", not
 a promise that every flag and exit code is contractually frozen.
 
+## [Unreleased]
+
+### Added
+- **Proxy rotation** (`proxy_pool.py`, Playwright engine). `--proxy` was a
+  single static string applied once at launch — the shape of a demo, not of
+  the thing proxies are bought for. Now: `--proxy-file` for a pool,
+  `--proxy-rotate per-run|per-page`, `--proxy-shuffle`, and
+  `--proxy-block-retries` to retry a challenged page from *other* exits.
+  - A rotation **relaunches the browser** rather than swapping the proxy
+    under a live session: cookies issued against one exit, replayed from
+    another, are a stronger signal than either address alone.
+  - An unusable exit (`ERR_PROXY_CONNECTION_FAILED`,
+    `ERR_TUNNEL_CONNECTION_FAILED`, the auth variants) **rotates** instead of
+    spending the retry budget on a proxy that will not answer. Found live: a
+    dead proxy raises `PWError`, not `PWTimeout`, so it previously escaped as
+    an unhandled traceback.
+  - Credentials stay out of Chromium's argv (they go in Playwright's own
+    `username`/`password` fields, never in `server`) and are masked in logs
+    while host and port stay visible.
+  - A malformed proxy list is rejected at load with the offending line named,
+    exit 2 — not a connection failure on page 1 with nothing pointing at the
+    cause.
+
 ## [0.2.1] — 2026-09-07
 
 ### Fixed
