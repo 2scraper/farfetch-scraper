@@ -59,8 +59,8 @@ from selenium.webdriver.support.ui import WebDriverWait
 from captcha_solver import (detect_recaptcha_v3, detect_recaptcha_in_page,
                             reconcile_detections, solve_recaptcha,
                             INJECT_TOKEN_JS, RECAPTCHA_DISCOVERY_JS)
-from product_parser import parse_products, SELECTORS
-from output_writer import save, dedupe_by_sku
+from product_parser import parse_products, SELECTORS, detect_bot_challenge
+from output_writer import save, dedupe_by_sku, EXIT_BLOCKED
 import env_config
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
@@ -70,8 +70,6 @@ logger = logging.getLogger("selenium_scraper")
 # about being stale — the option you just read about simply does not exist.
 BUILD = "2026-08-25.9"
 
-USER_AGENT = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-              "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36")
 
 ITEM_LINK_SELECTOR = SELECTORS["item_link"]
 NEXT_PAGE_SELECTOR = "a[data-testid='pagination-next'], a[rel='next'], li.pagination-next a"
@@ -546,7 +544,6 @@ def build_driver(args) -> webdriver.Chrome:
 
     if args.headless:
         options.add_argument("--headless=new")
-    options.add_argument(f"user-agent={USER_AGENT}")
     options.add_argument("--disable-blink-features=AutomationControlled")
     options.add_argument("--window-size=1366,900")
 
@@ -585,6 +582,18 @@ def build_driver(args) -> webdriver.Chrome:
                 "that's already running.)")
         service = Service(ChromeDriverManager().install())
     driver = webdriver.Chrome(service=service, options=options)
+
+    # Match the UA to the ACTUAL Chrome version this driver just launched,
+    # rather than a hardcoded version number. A UA that names an older Chrome
+    # than the real one's JS engine, WebGL strings and TLS ClientHello all
+    # agree on is itself a mismatch signal a fingerprinter can key on — and a
+    # hardcoded number only ever drifts further out of date over time.
+    real_version = driver.capabilities.get("browserVersion")
+    if real_version:
+        ua = (f"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+              f"(KHTML, like Gecko) Chrome/{real_version} Safari/537.36")
+        driver.execute_cdp_cmd("Network.setUserAgentOverride", {"userAgent": ua})
+
     driver.execute_cdp_cmd("Page.addScriptToEvaluateOnNewDocument", {
         "source": "Object.defineProperty(navigator, 'webdriver', {get: () => undefined})"
     })
@@ -620,6 +629,7 @@ def handle_captcha_if_present(driver, args) -> None:
 def scrape(args) -> None:
     all_products = []
     seen_skus = set()
+    blocked = False
     try:
         driver = build_driver_with_timeout(args)
     except DriverTimeout as e:
@@ -660,6 +670,22 @@ def scrape(args) -> None:
                                 "parsing whatever loaded (may be a bot-check/consent page).")
 
             html = driver.page_source
+
+            vendor = detect_bot_challenge(html)
+            if vendor:
+                debug_html = f"{args.out}_page{page_num}_debug.html"
+                with open(debug_html, "w", encoding="utf-8") as f:
+                    f.write(html)
+                try:
+                    driver.save_screenshot(f"{args.out}_page{page_num}_debug.png")
+                except Exception as e:
+                    logger.warning("Could not capture screenshot: %s", e)
+                logger.error("Blocked by a %s challenge page before parsing (%d bytes) — "
+                             "saved to %s. This is exit 3, distinct from a genuinely "
+                             "empty category (exit 4).", vendor, len(html), debug_html)
+                blocked = True
+                break
+
             products = parse_products(html, driver.current_url, category=args.category)
             logger.info("Parsed %d products from page %d.", len(products), page_num)
 
@@ -698,6 +724,11 @@ def scrape(args) -> None:
         else:
             driver.quit()
 
+    # Only overrides the exit code when the run ended up with nothing at all —
+    # a challenge on a later page after earlier pages already yielded products
+    # still saves what was gathered, same as a mid-run timeout does.
+    if blocked and not all_products:
+        return EXIT_BLOCKED
     return save(all_products, args.out, args.format, allow_empty=args.allow_empty)
 
 

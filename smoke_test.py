@@ -275,6 +275,25 @@ def main() -> int:
     ok &= check("EUR locale: EU decimal convention '1.234,56' parsed as 1234.56",
                 eur[2].price == 1234.56)
 
+    # A single separator with no second one to disambiguate against is
+    # ambiguous between "thousands grouping" and "decimal point". This
+    # project supports exactly four currencies (_CURRENCY_SYMBOLS: USD, EUR,
+    # GBP, JPY), none with a 3-digit decimal subunit, so 3 trailing digits
+    # after the only separator present means thousands, not decimal —
+    # getting this backwards previously turned "$1,234" into 1.234.
+    from product_parser import _prices_in
+    ok &= check("thousands separator: '$1,234' (US, no cents shown) is 1234, not 1.234",
+                _prices_in("$1,234")[0] == [1234.0])
+    ok &= check("thousands separator: '€1.234' (EU, no cents shown) is 1234, not 1.234",
+                _prices_in("€1.234")[0] == [1234.0])
+    ok &= check("thousands separator: '¥123,456' (JPY, no decimal subunit) is 123456",
+                _prices_in("¥123,456")[0] == [123456.0])
+    ok &= check("thousands separator: a lone separator with 2 trailing digits is still "
+                "read as a decimal point, e.g. '$1,23' -> 1.23",
+                _prices_in("$1,23")[0] == [1.23])
+    ok &= check("thousands separator: repeated thousands groups, '$1,234,567' -> 1234567",
+                _prices_in("$1,234,567")[0] == [1234567.0])
+
     with tempfile.TemporaryDirectory() as tmp:
         prefix = os.path.join(tmp, "smoke_out")
         save(products, prefix, "both")
@@ -434,6 +453,27 @@ def main() -> int:
                 "comparing against the site's own structured data",
                 _raw["30081580"].price == 135.0
                 and _raw["30081580"].original_price is None)
+
+    # $ is not always USD — AUD, CAD, SGD, HKD and NZD all render with a bare
+    # $ too, and _CURRENCY_SYMBOLS can only ever guess "USD" for it. JSON-LD's
+    # priceCurrency is the real, structured answer; the overlay must leave it
+    # alone rather than clobbering it with that guess, which would silently
+    # break the "compare prices across countries" use case for every non-US
+    # market that happens to print $.
+    _AUD_HTML = ('<html><body><script type="application/ld+json">'
+                 '{"@type":"ItemList","itemListElement":[{"@type":"Product",'
+                 '"name":"cardigan","brand":{"name":"Lanvin Enfant"},'
+                 '"offers":{"price":135,"priceCurrency":"AUD",'
+                 '"url":"/au/shopping/kids/lanvin-enfant-cardigan-item-30081580.aspx",'
+                 '"availability":"https://schema.org/InStock"}}]}</script>'
+                 + _real_tile("30081580", "lanvin-enfant", "cardigan", 245, 135, 108, 45, 20)
+                    .replace("&euro;", "").replace("Originalpreis ", "$")
+                    .replace("Sale-Preis ", "$").replace("Endpreis ", "$")
+                 + "</body></html>")
+    _aud = parse_products(_AUD_HTML, "https://www.farfetch.com/au/shopping/kids/sale/all/items.aspx")
+    ok &= check("overlay corrects the price from a '$'-tile without touching "
+                "priceCurrency (AUD stays AUD, not overwritten to USD)",
+                len(_aud) == 1 and _aud[0].price == 108.0 and _aud[0].currency == "AUD")
 
     # A tile with ONE price means no discount. JSON-LD is structured data and is
     # the better source there, so the overlay must leave it alone rather than
@@ -778,6 +818,41 @@ def main() -> int:
                 inv_payload.get("invisible") == 1 and "version" not in inv_payload
                 and "action" not in inv_payload and "min_score" not in inv_payload)
 
+    # --- solve_recaptcha() itself, the exact call the three scrapers make --
+    # This signature drifted from its callers once already (missing
+    # api_version/min_score, and a body that called a function which no
+    # longer existed) with nothing here catching it — every check above
+    # exercises the internal _solve_with_2captcha_v1/v2 helpers directly, never
+    # the public function playwright_scraper.py etc. actually import and call.
+    calls.clear()
+    real_post, real_sleep = _cs.requests.post, _cs.time.sleep
+    _cs.requests.post, _cs.time.sleep = _post, lambda *_: None
+    try:
+        token = _cs.solve_recaptcha(live, "KEY", api_version="v2", min_score=0.7)
+    finally:
+        _cs.requests.post, _cs.time.sleep = real_post, real_sleep
+    ok &= check("solve_recaptcha(api_version='v2', min_score=...) — the exact keyword "
+                "call every scraper makes — reaches the v2 createTask/getTaskResult "
+                "path and returns a token",
+                token == "TOKEN_V2")
+
+    real_post, real_get, real_sleep = _cs.requests.post, _cs.requests.get, _cs.time.sleep
+    _cs.requests.post, _cs.requests.get, _cs.time.sleep = _fake_post, _fake_get, lambda *_: None
+    try:
+        token_v1 = _cs.solve_recaptcha(live, "KEY", api_version="v1", min_score=0.7)
+    finally:
+        _cs.requests.post, _cs.requests.get, _cs.time.sleep = real_post, real_get, real_sleep
+    ok &= check("solve_recaptcha(api_version='v1', min_score=...) reaches the legacy "
+                "in.php/res.php path", token_v1 == "TOKEN123")
+
+    try:
+        _cs.solve_recaptcha(live, None)
+        no_key_raised = False
+    except RuntimeError:
+        no_key_raised = True
+    ok &= check("solve_recaptcha() with no API key raises before touching the network",
+                no_key_raised)
+
     # --- sign-up modal selectors -------------------------------------------
     # The modal diagnostics are not part of the published scraper (they drive a
     # registration form, which this project never submits), so these checks only
@@ -836,6 +911,30 @@ def main() -> int:
                     and os.path.exists(prefix + "_ae.json"))
         ok &= check("a non-empty save returns 0", save(products, prefix + "_ok", "json") == 0)
 
+    # --- blocked-vs-empty exit code -----------------------------------------
+    # README documents exit 3 (blocked before parsing) as distinct from exit 4
+    # (genuinely zero products), but nothing detected a bot-challenge page in
+    # any of the three browser engines until this was shared from
+    # scraper_api_client.py into product_parser.py — a category page sitting
+    # behind Akamai/Cloudflare would previously reach parse_products, get 0
+    # products back, and exit 4 exactly like an empty category, which is the
+    # ambiguity the exit-code contract exists to prevent.
+    from output_writer import EXIT_BLOCKED
+    from product_parser import detect_bot_challenge, BOT_CHALLENGE_MARKERS
+    import scraper_api_client as _sac
+
+    ok &= check("EXIT_BLOCKED (3) and EXIT_NO_PRODUCTS (4) are distinct codes",
+                EXIT_BLOCKED == 3 and EXIT_BLOCKED != EXIT_NO_PRODUCTS)
+    ok &= check("detect_bot_challenge: an Akamai challenge page is recognised",
+                detect_bot_challenge('<div id="sec-if-cpt-container">...</div>') == "akamai")
+    ok &= check("detect_bot_challenge: a Cloudflare challenge page is recognised",
+                detect_bot_challenge('<div class="cf-challenge">...</div>') == "cloudflare")
+    ok &= check("detect_bot_challenge: an ordinary listing page is not flagged",
+                detect_bot_challenge(SAMPLE_LISTING_HTML) is None)
+    ok &= check("scraper_api_client shares the same BOT_CHALLENGE_MARKERS, not "
+                "a second copy that can drift out of sync",
+                _sac.BOT_CHALLENGE_MARKERS is BOT_CHALLENGE_MARKERS)
+
     # --- page.content() mid-navigation --------------------------------------
     # Playwright raises when the document swaps under the snapshot, which
     # farfetch.com's client-side geo-redirect makes routine.
@@ -852,6 +951,31 @@ def main() -> int:
         _skips.append(f"page.content() navigation-race checks "
                       f"(playwright not installed: {exc.name})")
     if _ps is not None:
+
+        ok &= check("playwright_scraper._chrome_ua names the browser's REAL version, "
+                    "not a hardcoded one that only ever drifts out of date",
+                    _ps._chrome_ua("127.0.6533.17")
+                    == "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                       "(KHTML, like Gecko) Chrome/127.0.6533.17 Safari/537.36")
+
+        # get_attribute("href") is the raw, unresolved HTML attribute — the
+        # previous "startswith('http') else base + href" concatenation
+        # mishandled an absolute-path href once the base URL's own query
+        # string was stripped first, pasting two absolute paths into one
+        # broken URL.
+        _base = "https://www.farfetch.com/de/shopping/kids/girls-clothing-4/items.aspx?page=1"
+        ok &= check("pagination: an absolute-path href replaces the base URL's path "
+                    "and query, not concatenated onto it",
+                    _ps._resolve_pagination_url(
+                        _base, "/de/shopping/kids/girls-clothing-4/items.aspx?page=2")
+                    == "https://www.farfetch.com/de/shopping/kids/girls-clothing-4/items.aspx?page=2")
+        ok &= check("pagination: a full absolute href is used as-is",
+                    _ps._resolve_pagination_url(_base, "https://www.farfetch.com/other?x=1")
+                    == "https://www.farfetch.com/other?x=1")
+        ok &= check("pagination: a page-relative href resolves against the base URL's path",
+                    _ps._resolve_pagination_url("https://www.farfetch.com/de/shopping/kids/items.aspx",
+                                                "sub/items.aspx?page=2")
+                    == "https://www.farfetch.com/de/shopping/kids/sub/items.aspx?page=2")
 
         class _NavPage:
             """Raises the navigation error N times, then succeeds."""
@@ -913,6 +1037,22 @@ def main() -> int:
         empty = playwright_init_script({})
         ok &= check("fingerprint: an empty fingerprint yields a script that patches nothing",
                     "null" in empty and "getParameter" in empty)
+
+    # ---- Puppeteer/pyppeteer: UA derived from the real launched version ----
+    # Guarded the same way as the Playwright block above: importing
+    # puppeteer_scraper pulls in pyppeteer, which is not installed in the
+    # offline CI job on purpose.
+    try:
+        import puppeteer_scraper as _pup
+    except ImportError as exc:
+        _pup = None
+        _skips.append(f"puppeteer_scraper UA checks (pyppeteer not installed: {exc.name})")
+    if _pup is not None:
+        ok &= check("puppeteer_scraper._chrome_ua names the browser's REAL version, "
+                    "not a hardcoded one that only ever drifts out of date",
+                    _pup._chrome_ua("127.0.6533.17")
+                    == "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                       "(KHTML, like Gecko) Chrome/127.0.6533.17 Safari/537.36")
 
     # ---- Selenium: --chromedriver on the LOCAL path -----------------------
     # This was remote-only, which broke exactly the machine that already had a

@@ -29,15 +29,24 @@ from pyppeteer import launch, connect
 from captcha_solver import (detect_recaptcha_v3, detect_recaptcha_in_page,
                             reconcile_detections, solve_recaptcha,
                             INJECT_TOKEN_JS, RECAPTCHA_DISCOVERY_JS)
-from product_parser import parse_products, SELECTORS
-from output_writer import save, dedupe_by_sku
+from product_parser import parse_products, SELECTORS, detect_bot_challenge
+from output_writer import save, dedupe_by_sku, EXIT_BLOCKED
 import env_config
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger("puppeteer_scraper")
 
-USER_AGENT = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-              "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36")
+def _chrome_ua(chromium_version: str) -> str:
+    """Build a desktop-Chrome UA naming the browser's OWN real version.
+
+    Not a hardcoded version number: that drifts the moment a newer bundled
+    Chromium ships, and a UA claiming an older Chrome than what the JS
+    engine, WebGL strings and TLS ClientHello all actually report is itself a
+    mismatch a fingerprinter can key on.
+    """
+    return (f"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+            f"(KHTML, like Gecko) Chrome/{chromium_version} Safari/537.36")
+
 
 ITEM_LINK_SELECTOR = SELECTORS["item_link"]
 NEXT_PAGE_SELECTOR = "a[data-testid='pagination-next'], a[rel='next'], li.pagination-next a"
@@ -108,6 +117,7 @@ async def handle_captcha_if_present(page, args) -> None:
 async def scrape(args) -> None:
     all_products = []
     seen_skus = set()
+    blocked = False
 
     if args.cdp_endpoint:
         logger.info("Connecting to existing browser over CDP: %s", _mask_credentials(args.cdp_endpoint))
@@ -128,7 +138,12 @@ async def scrape(args) -> None:
         # Only override the UA when we launched our own bundled Chromium —
         # see playwright_scraper.py for why this matters when connected via
         # --cdp-endpoint (mismatched fingerprint got a previous run flagged).
-        await page.setUserAgent(USER_AGENT)
+        # browser.version() returns CDP's raw product string, e.g.
+        # "HeadlessChrome/124.0.6367.60" — take the real version number after
+        # the slash rather than assuming a fixed one.
+        raw_version = await browser.version()
+        chromium_version = raw_version.rsplit("/", 1)[-1]
+        await page.setUserAgent(_chrome_ua(chromium_version))
     else:
         # RETROACTIVE ADDITION — see playwright_scraper.py in this same
         # project for the full story. Tried first when --cdp-endpoint is
@@ -167,6 +182,22 @@ async def scrape(args) -> None:
                                 "parsing whatever loaded (may be a bot-check/consent page).")
 
             html = await page.content()
+
+            vendor = detect_bot_challenge(html)
+            if vendor:
+                debug_html = f"{args.out}_page{page_num}_debug.html"
+                with open(debug_html, "w", encoding="utf-8") as f:
+                    f.write(html)
+                try:
+                    await page.screenshot({"path": f"{args.out}_page{page_num}_debug.png", "fullPage": True})
+                except Exception as e:
+                    logger.warning("Could not capture screenshot: %s", e)
+                logger.error("Blocked by a %s challenge page before parsing (%d bytes) — "
+                             "saved to %s. This is exit 3, distinct from a genuinely "
+                             "empty category (exit 4).", vendor, len(html), debug_html)
+                blocked = True
+                break
+
             products = parse_products(html, page.url, category=args.category)
             logger.info("Parsed %d products from page %d.", len(products), page_num)
 
@@ -207,6 +238,11 @@ async def scrape(args) -> None:
         else:
             await browser.close()
 
+    # Only overrides the exit code when the run ended up with nothing at all —
+    # a challenge on a later page after earlier pages already yielded products
+    # still saves what was gathered, same as a mid-run timeout does.
+    if blocked and not all_products:
+        return EXIT_BLOCKED
     return save(all_products, args.out, args.format, allow_empty=args.allow_empty)
 
 

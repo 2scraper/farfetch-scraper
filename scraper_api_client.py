@@ -30,7 +30,7 @@ instead of content, and this client exits 3 rather than writing it as a result.
 This is a property of the target, not of the API: on pages that do not require
 JS or carry a challenge, the browserless path is the cheapest option there is.
 
-It fails loudly (see _detect_bot_challenge) rather than silently writing
+It fails loudly (see product_parser.detect_bot_challenge) rather than silently writing
 an empty JSON file, so a challenge page never reaches your pipeline
 dressed as a result.
 
@@ -78,7 +78,7 @@ from typing import Optional
 
 import requests
 
-from product_parser import parse_products
+from product_parser import parse_products, detect_bot_challenge, BOT_CHALLENGE_MARKERS
 from output_writer import save
 import env_config
 
@@ -97,15 +97,6 @@ MAX_API_TIMEOUT = 120
 # HTTP 422 from the API — which reads as "you called it wrong".
 EXIT_API_ERROR = 5
 
-# Fingerprints of the two bot-challenge families seen across this project
-# family. Matched against the returned body so a challenge page is
-# reported as a challenge, not silently parsed into 0 products.
-BOT_CHALLENGE_MARKERS = {
-    "akamai": ("sec-if-cpt-container", "Powered and protected by Akamai", "_sec/cp_challenge"),
-    "cloudflare": ("cf-challenge", "challenge-platform", "cdn-cgi/challenge-platform"),
-}
-
-
 def _mask_credentials(url: str) -> str:
     """Never print a username:password embedded in a ws://... or http://... URL."""
     if "@" not in url:
@@ -116,15 +107,6 @@ def _mask_credentials(url: str) -> str:
     scheme, rest = url[:scheme_sep + 3], url[scheme_sep + 3:]
     _, _, host_part = rest.partition("@")
     return f"{scheme}***:***@{host_part}"
-
-
-def _detect_bot_challenge(html: str):
-    """Return the vendor name if this body looks like a bot-challenge
-    interstitial rather than real content, else None."""
-    for vendor, markers in BOT_CHALLENGE_MARKERS.items():
-        if any(marker in html for marker in markers):
-            return vendor
-    return None
 
 
 def _build_wait_for(args) -> Optional[str]:
@@ -238,7 +220,7 @@ def _run_once(args, attempt: int = 1, attempts: int = 1) -> int:
             f.write(html)
         logger.info("Raw HTML written to %s", args.dump_html)
 
-    vendor = _detect_bot_challenge(html)
+    vendor = detect_bot_challenge(html)
     if vendor:
         logger.error(
             "The Scraper API returned a %s bot-challenge page (%d bytes), not real content.",
