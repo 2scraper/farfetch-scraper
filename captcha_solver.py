@@ -542,7 +542,8 @@ def _solve_with_2captcha_v1(api_key: str, challenge: CaptchaChallenge,
     raise TimeoutError("2captcha.com did not return a token in time")
 
 
-def solve_recaptcha(challenge: CaptchaChallenge, twocaptcha_api_key: Optional[str]) -> str:
+def solve_recaptcha(challenge: CaptchaChallenge, twocaptcha_api_key: Optional[str],
+                     api_version: str = "v2", min_score: float = 0.7) -> str:
     """Public entry point: solve `challenge` through 2captcha and return the token.
 
     There used to be a `use_antidetect` branch here, behind a CLI flag of the
@@ -560,7 +561,8 @@ def solve_recaptcha(challenge: CaptchaChallenge, twocaptcha_api_key: Optional[st
             "API you may not need either: Captcha.setAutoSolve can clear it "
             "inside the browser."
         )
-    return _solve_with_2captcha(twocaptcha_api_key, challenge)
+    solver = _solve_with_2captcha_v1 if api_version == "v1" else _solve_with_2captcha_v2
+    return solver(twocaptcha_api_key, challenge, min_score=min_score)
 
 
 INJECT_TOKEN_JS = """

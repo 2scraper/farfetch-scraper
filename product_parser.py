@@ -125,6 +125,26 @@ _DISCOUNT_RE = re.compile(r"-(\d{1,2})%")
 # sitting in plain sight in the URL. Recover it from there.
 _SKU_IN_URL_RE = re.compile(r"-item-(\d+)\.aspx")
 
+# Fingerprints of the two bot-challenge families seen across this project
+# family. Originally lived only in scraper_api_client.py; needed here too so
+# the three browser engines can tell "blocked before parsing" (EXIT_BLOCKED)
+# apart from "the page rendered fine and genuinely has zero products"
+# (EXIT_NO_PRODUCTS) — the two collapsed into the same exit code before this
+# was shared, contradicting the exit-code contract in the README.
+BOT_CHALLENGE_MARKERS = {
+    "akamai": ("sec-if-cpt-container", "Powered and protected by Akamai", "_sec/cp_challenge"),
+    "cloudflare": ("cf-challenge", "challenge-platform", "cdn-cgi/challenge-platform"),
+}
+
+
+def detect_bot_challenge(html: str) -> Optional[str]:
+    """Return the vendor name if `html` looks like a bot-challenge
+    interstitial rather than real content, else None."""
+    for vendor, markers in BOT_CHALLENGE_MARKERS.items():
+        if any(marker in html for marker in markers):
+            return vendor
+    return None
+
 
 def _sku_from_url(url: Optional[str]) -> Optional[str]:
     """Pull the product id out of a Farfetch product URL, if it's there."""
@@ -138,9 +158,16 @@ def _prices_in(text: str):
     """Return ([amounts], currency_code_or_None) for all prices in `text`.
 
     Handles both symbol-first and symbol-last forms, and both decimal
-    conventions: "1,234.56" (US) and "1.234,56" (EU). The disambiguation
-    rule is 'whichever separator comes last is the decimal point' — which
-    is correct for every locale Farfetch serves.
+    conventions: "1,234.56" (US) and "1.234,56" (EU).
+
+    When BOTH separators appear, 'whichever comes last is the decimal point'
+    disambiguates correctly on its own. When only one kind appears, that is
+    ambiguous between a thousands grouping and a decimal point — "$1,234"
+    could be 1234 or (misread) 1.234 — and this project supports exactly
+    four currencies (_CURRENCY_SYMBOLS), none of which uses a 3-digit decimal
+    subunit. So a single separator followed by exactly 3 digits is a
+    thousands grouping, not a decimal point; anything else (1 or 2 digits, or
+    no separator at all) is read as a decimal amount instead.
     """
     amounts, currency = [], None
     for m in _PRICE_RE.finditer(text):
@@ -149,12 +176,18 @@ def _prices_in(text: str):
         if currency is None:
             currency = _CURRENCY_SYMBOLS.get(sym)
         last_dot, last_comma = raw.rfind("."), raw.rfind(",")
-        if last_dot > last_comma:
-            norm = raw.replace(",", "")
-        elif last_comma > last_dot:
-            norm = raw.replace(".", "").replace(",", ".")
+        if last_dot != -1 and last_comma != -1:
+            if last_dot > last_comma:
+                norm = raw.replace(",", "")
+            else:
+                norm = raw.replace(".", "").replace(",", ".")
         else:
-            norm = raw
+            sep_pos = max(last_dot, last_comma)
+            trailing = raw[sep_pos + 1:] if sep_pos != -1 else ""
+            if len(trailing) == 3 and trailing.isdigit():
+                norm = raw.replace(".", "").replace(",", "")
+            else:
+                norm = raw.replace(",", ".")
         try:
             amounts.append(float(norm))
         except ValueError:
@@ -475,7 +508,7 @@ def _overlay_tile_prices(products, html: str, base_url: str):
         entry = tiles.get(product.sku)
         if entry is None:
             continue
-        amounts, currency, text = entry
+        amounts, _tile_currency, text = entry  # tile currency deliberately unused, see below
         if len(set(amounts)) < 2:
             continue
 
@@ -495,8 +528,14 @@ def _overlay_tile_prices(products, html: str, base_url: str):
         product.price = low
         product.original_price = high
         product.discount_pct = _discount_from(low, high, text)
-        if currency:
-            product.currency = currency
+        # Deliberately NOT overwriting product.currency from the tile here.
+        # JSON-LD's priceCurrency is structured data straight from the site;
+        # the tile's currency is guessed from a bare symbol, and $ alone maps
+        # to USD in _CURRENCY_SYMBOLS regardless of whether the real currency
+        # is AUD/CAD/SGD/HKD/NZD — overlaying it would replace a correct
+        # currency with a wrong one on every non-USD "$" market, silently
+        # breaking the cross-country price comparison this project documents
+        # as a use case.
         corrected += 1
 
     if corrected:

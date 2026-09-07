@@ -146,3 +146,41 @@ jobs:
             exit 1
           fi
           echo "clean"
+
+  engine-smoke:
+    # The offline job above installs NO engine library on purpose (that's
+    # what makes it offline), which means smoke_test.py's own
+    # playwright_scraper/puppeteer_scraper-guarded checks (UA built from the
+    # real launched browser version, the content() navigation-race retry,
+    # fingerprint glue) silently skip in every CI run — "skipped, engine not
+    # installed" reads the same in the log whether that's expected or a real
+    # import regression. This job installs the packages (not the browser
+    # binaries — the offline suite never launches one) so those checks
+    # actually execute at least once, and fails if they report skipped anyway.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install core + engine packages (no browser binaries needed)
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install playwright pyppeteer
+
+      - name: Offline test suite, with engines actually importable
+        run: |
+          python smoke_test.py | tee smoke.log
+          if grep -q "not installed: playwright\|not installed: pyppeteer" smoke.log; then
+            echo "FAILED: playwright/pyppeteer-guarded checks skipped even though "\
+                 "the packages were installed in this job — likely a real import error."
+            exit 1
+          fi
+
+      - name: Every engine CLI answers --help
+        run: |
+          python playwright_scraper.py --help >/dev/null
+          python puppeteer_scraper.py --help >/dev/null

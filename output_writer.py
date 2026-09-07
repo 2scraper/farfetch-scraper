@@ -71,6 +71,12 @@ def write_csv(products: List[Product], path: str) -> None:
 # (crash) so a caller can tell "ran, found nothing" from "blew up".
 EXIT_NO_PRODUCTS = 4
 
+# Exit code for a run blocked by a bot-check/challenge page before parsing
+# even started — distinct from EXIT_NO_PRODUCTS so a caller can tell "the
+# category is genuinely empty" from "something stood between us and the
+# content". See product_parser.detect_bot_challenge.
+EXIT_BLOCKED = 3
+
 
 def save(products: List[Product], out_prefix: str, fmt: str,
          allow_empty: bool = False) -> int:
