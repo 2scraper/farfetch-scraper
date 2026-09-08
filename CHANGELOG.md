@@ -9,6 +9,18 @@ a promise that every flag and exit code is contractually frozen.
 ## [Unreleased]
 
 ### Fixed
+- **Space-grouped thousands are read correctly.** `1 234 €` parsed as **234**
+  — an order of magnitude off, silently. French, Russian and other locales
+  group with a space, and a rendered page uses a no-break variant so the
+  number does not wrap: plain space, NBSP (U+00A0) and narrow NBSP (U+202F)
+  are all handled now. Space grouping requires full three-digit groups, so a
+  size list beside a price (`5 yrs, 6 yrs 200 €`) cannot merge into one
+  number.
+- **Prefixed dollar symbols name their currency.** `HK$1,234` reported 1234
+  **USD** — the wrong currency rather than a rounding error, and directly
+  against this project's cross-country comparison use. `HK$`, `A$`, `C$`,
+  `S$`, `NZ$`, `NT$`, `R$`, `AU$`, `CA$` and `US$` now map properly; a bare
+  `$` still reads as USD, which is what it means on the US site.
 - **Proxy credentials no longer reach a browser command line** in the
   pyppeteer and Selenium engines. Both appended the whole `--proxy` value to
   Chromium's `--proxy-server`, which becomes part of the browser process's
@@ -29,6 +41,22 @@ a promise that every flag and exit code is contractually frozen.
   - Products inside an `@graph` block were silently missed, so a site
     publishing that way would report an EMPTY category for what is really
     an unread format — the exact confusion the exit codes exist to prevent.
+
+### Documented
+- The README's geo-redirect claim is narrowed to what was actually measured:
+  a fresh, cookie-less visit is redirected on exit IP. Farfetch also
+  documents a customer-set *shopping location* with currency following the
+  shipping destination, so exit IP decides the DEFAULT for a stateless
+  scraper rather than being the site's only input. Readers are pointed at
+  verifying the market in the output (`currency`, and the locale in the
+  sidecar's `final_url`) instead of assuming.
+- The price overlay's load-bearing assumption is now stated, and pinned by a
+  test: every price in a tile is taken to belong to one discount chain, so an
+  installment price inside a tile would be read as the product price. A live
+  106-tile check found none — the page's Klarna/`Raten` text sits in the
+  footer, outside any tile — so it is recorded as a known limitation rather
+  than guarded with locale-chasing word lists or a ratio threshold that
+  would reject this site's real 60%+ discounts.
 
 ## [0.4.0] — 2026-09-07
 

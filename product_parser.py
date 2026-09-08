@@ -112,6 +112,17 @@ SELECTORS = {
 # currency-sensitive.
 _CURRENCY_SYMBOLS = {"$": "USD", "€": "EUR", "£": "GBP", "¥": "JPY"}
 
+# A bare "$" is not enough on its own: several markets prefix it, and
+# reporting HK$1,234 as 1234 USD is not a rounding error, it is the wrong
+# currency. Longest-first, so "HK$" is tried before "$" (see _PREFIXED_RE).
+# A bare "$" still maps to USD via _CURRENCY_SYMBOLS — on the US site that
+# is what it means, and the JSON-LD path supplies the real currency whenever
+# the site publishes one, so this only decides the fallback path's guess.
+_PREFIXED_SYMBOLS = {
+    "HK$": "HKD", "NZ$": "NZD", "AU$": "AUD", "CA$": "CAD", "US$": "USD",
+    "A$": "AUD", "C$": "CAD", "S$": "SGD", "R$": "BRL", "NT$": "TWD",
+}
+
 # Markets where Farfetch prints a 3-letter ISO code instead of a symbol —
 # "AED 100", "SAR 250", "100 CHF". A tile priced that way used to match
 # nothing in _PRICE_RE and was therefore dropped as "not a product tile",
@@ -130,10 +141,28 @@ _CURRENCY_CODES = frozenset("""
     BRL MXN ARS CLP COP PEN UYU
 """.split())
 
-# Amount, in either decimal convention: 1,234.56 / 1.234,56 / 125 / 125.00
-_AMOUNT = r"[\d.,]+(?:[.,]\d{1,2})?"
+# Space characters used as a THOUSANDS separator. French, Russian and
+# several other locales group with a space rather than a comma or a dot, and
+# a rendered page uses a no-break variant so the number does not wrap: a
+# plain space, NBSP (U+00A0), narrow NBSP (U+202F) and thin space (U+2009)
+# all appear in the wild. Before these were recognised, "1 234 €" matched
+# only its last group and parsed as 234 — an order of magnitude off, silently.
+_GROUP_SPACES = "    "
+
+# Amount, in any of the three grouping conventions:
+#   1,234.56 / 1.234,56 / 1 234,56 / 125 / 125.00
+#
+# The space-grouped form deliberately requires FULL groups of exactly three
+# digits (`1 234`, not `5 200` from a size list next to a price). Sizes on
+# this site read "5 yrs, 6 yrs", so they cannot match — but a looser pattern
+# would happily read two unrelated numbers as one.
+_AMOUNT = (r"\d{1,3}(?:[" + _GROUP_SPACES + r"]\d{3})+(?:[.,]\d{1,2})?"
+           r"|[\d.,]+(?:[.,]\d{1,2})?")
+# Compound symbols before the bare ones, so "HK$" is not read as "$".
+_PREFIXED_RE = "|".join(re.escape(s) for s in
+                        sorted(_PREFIXED_SYMBOLS, key=len, reverse=True))
 _PRICE_RE = re.compile(
-    r"(?:([$€£¥])\s?(" + _AMOUNT + r")"                  # symbol first: $125.00 / €125,00
+    r"(?:(" + _PREFIXED_RE + r"|[$€£¥])\s?(" + _AMOUNT + r")"  # symbol first: HK$1,234 / €125,00
     r"|(" + _AMOUNT + r")\s?([$€£¥])"                    # symbol last:  125,00 €
     r"|\b([A-Z]{3})\s(" + _AMOUNT + r")\b"               # code first:   AED 100
     r"|\b(" + _AMOUNT + r")\s([A-Z]{3})\b)"              # code last:    100 CHF
@@ -188,6 +217,12 @@ def _normalize_amount(raw: str) -> Optional[float]:
     3 digits is a thousands grouping, not a decimal point; anything else (1 or
     2 digits, or no separator at all) is read as a decimal amount instead.
     """
+    # A grouping space is punctuation, not part of the number. Stripped
+    # before anything else so the dot/comma logic below sees "1234,56"
+    # rather than "1 234,56".
+    for space in _GROUP_SPACES:
+        raw = raw.replace(space, "")
+
     last_dot, last_comma = raw.rfind("."), raw.rfind(",")
     if last_dot != -1 and last_comma != -1:
         if last_dot > last_comma:
@@ -226,10 +261,11 @@ def _prices_in(text: str):
             continue
         raw = m.group(2) or m.group(3) or m.group(6) or m.group(7)
         if currency is None:
-            # A written-out ISO code names the currency outright; a bare
-            # symbol can only ever be mapped to the most likely code for it
-            # (see _CURRENCY_SYMBOLS — "$" is not necessarily USD).
-            currency = code or _CURRENCY_SYMBOLS.get(sym)
+            # A written-out ISO code names the currency outright, and a
+            # prefixed symbol ("HK$") is nearly as good. Only a BARE symbol
+            # is a guess — see _PREFIXED_SYMBOLS.
+            currency = (code or _PREFIXED_SYMBOLS.get(sym)
+                        or _CURRENCY_SYMBOLS.get(sym))
         amount = _normalize_amount(raw)
         if amount is not None:
             amounts.append(amount)
