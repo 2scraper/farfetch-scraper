@@ -1278,6 +1278,100 @@ def main() -> int:
                         for f in ("playwright_scraper.py", "puppeteer_scraper.py",
                                   "selenium_scraper.py")))
 
+        # ---- captcha: detected is not the same as blocking ------------------
+        # Reproduced from an audit: a page carrying products AND the sign-up
+        # modal's hidden reCAPTCHA, run with no API key, raised RuntimeError
+        # out of solve_recaptcha, through handle_captcha_if_present, and out
+        # of scrape() — a traceback in place of products that were right
+        # there. Separately, solving a modal widget when the catalogue is
+        # already readable spends money on a challenge guarding nothing.
+        class _CaptchaPage:
+            """A page with `n_links` product links and a detectable captcha."""
+            LIVE = {"found": True, "size": "invisible", "action": None,
+                    "sitekey": "6LeifPcbAAAAAJaiPe_xgLTfnbdpEMAYJAAnVFJT",
+                    "enterprise": False, "containerId": "register-captcha",
+                    "hints": [], "badge": True, "challengeFrame": True,
+                    "scripts": [], "renderParam": "explicit"}
+
+            def __init__(self, n_links):
+                self.n, self.reloaded, self.url = n_links, False, "https://x/"
+
+            def content(self):
+                return ('<html><div id="register-captcha" class="g-recaptcha">'
+                        '<iframe title="reCAPTCHA" src="https://recaptcha.net/'
+                        'recaptcha/api2/anchor?k=6LeifPcbAAAAAJaiPe_xgLTfnbdpEM'
+                        'AYJAAnVFJT&size=invisible"></iframe></div><script src='
+                        '"https://recaptcha.net/recaptcha/api.js?render=explicit"'
+                        '></script></html>')
+
+            def query_selector_all(self, _sel):
+                return [None] * self.n
+
+            def evaluate(self, _js, *_a):
+                return dict(self.LIVE)
+
+            def wait_for_timeout(self, _ms):
+                pass
+
+            def reload(self, **_kw):
+                self.reloaded = True
+
+        class _CapArgs:
+            twocaptcha_key = None
+            captcha_api = "v2"
+            min_score = 0.7
+            solve_captcha = "when-blocked"
+
+        _cp = _CaptchaPage(96)
+        _ca = _CapArgs()
+        try:
+            _ps.handle_captcha_if_present(_cp, _ca)
+            _crashed = False
+        except Exception:  # noqa: BLE001
+            _crashed = True
+        ok &= check("captcha: with products already on the page, the challenge "
+                    "is NOT solved — it guards the sign-up modal, not the "
+                    "catalogue, and solving it would spend a paid task on "
+                    "nothing",
+                    not _crashed and not _cp.reloaded)
+
+        _cp0 = _CaptchaPage(0)
+        try:
+            _ps.handle_captcha_if_present(_cp0, _CapArgs())
+            _crashed0 = False
+        except Exception:  # noqa: BLE001
+            _crashed0 = True
+        ok &= check("captcha: no API key no longer raises out of the run — it "
+                    "warns and lets the products (or the exit-3 block report) "
+                    "speak for themselves",
+                    not _crashed0 and not _cp0.reloaded)
+
+        _cpa = _CaptchaPage(96)
+        _caa = _CapArgs()
+        _caa.solve_captcha = "always"
+        try:
+            _ps.handle_captcha_if_present(_cpa, _caa)
+            _crasheda = False
+        except Exception:  # noqa: BLE001
+            _crasheda = True
+        ok &= check("captcha: --solve-captcha always goes past the "
+                    "already-readable check, for whoever would rather spend a "
+                    "solve than risk missing content",
+                    not _crasheda)
+
+        _psrc_cap = open("playwright_scraper.py", encoding="utf-8").read()
+        ok &= check("captcha: the readiness check counts links directly instead "
+                    "of forcing the 20s wait_for_function to run first — which "
+                    "would waste 20s on a page the captcha genuinely gates",
+                    "page.query_selector_all(ITEM_LINK_SELECTOR)" in _psrc_cap)
+        for _eng in ("puppeteer_scraper.py", "selenium_scraper.py"):
+            _esrc_cap = open(_eng, encoding="utf-8").read()
+            ok &= check(f"{_eng}: same captcha policy, so the engines cannot "
+                        f"differ on whether a run crashes or pays",
+                        'getattr(args, "solve_captcha", "when-blocked")' in _esrc_cap
+                        and "cannot be "  in _esrc_cap
+                        and '"--solve-captcha"' in _esrc_cap)
+
         class _NavPage:
             """Raises the navigation error N times, then succeeds."""
             def __init__(self, fail_times): self.left = fail_times; self.waits = 0

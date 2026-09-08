@@ -474,6 +474,26 @@ Runs after **every** navigation, on any page — not scoped to one URL. Both
 detectors always run: one over the static HTML, one in the live page over
 `___grecaptcha_cfg`, and the results are reconciled.
 
+**Detected is not the same as blocking, and that distinction costs money.**
+This site carries a reCAPTCHA in its sign-up modal that has nothing to do with
+the catalogue, so a detection on a page whose products are already rendered is
+guarding nothing you want. `--solve-captcha` decides what to do about it:
+
+| Value | Behaviour |
+|---|---|
+| `when-blocked` *(default)* | Solve only when the catalogue is **not** already readable. Product links are counted on the spot — no waiting — so this costs nothing to check. |
+| `always` | Solve whenever one is detected. Choose this if you would rather spend a solve than risk missing content that only appears afterwards. |
+
+The check deliberately does **not** work by running the readiness wait first:
+on a page the captcha genuinely gates, that would burn 20 seconds before
+solving, and solving first is what makes the products appear.
+
+**A challenge this run cannot solve never takes the run down.** No key, or a
+solver error, is a warning — the products may well be readable anyway, and a
+traceback in their place is strictly worse. If the challenge really was
+blocking, the run reports that as [exit 3](#exit-codes) rather than as a
+crash.
+
 That reconciliation matters more than it sounds. Farfetch's own wrapper element
 declares `data-version="v3"`, while the Google loader the page actually ships is
 `api.js?render=explicit` with `size: "invisible"` — the v2-invisible signature.
