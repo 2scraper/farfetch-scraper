@@ -6,7 +6,7 @@ All notable changes to this project are documented here. Format follows
 library with a stable API) reasonably can — a patch bump means "fixes", not
 a promise that every flag and exit code is contractually frozen.
 
-## [Unreleased]
+## [0.4.1] — 2026-09-08
 
 ### Added
 - **`--solve-captcha when-blocked|always`** (default `when-blocked`) on all
