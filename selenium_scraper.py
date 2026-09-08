@@ -641,11 +641,34 @@ def handle_captcha_if_present(driver, args) -> None:
     if not challenge:
         return
 
+    # Detected is not the same as blocking — see playwright_scraper.py for the
+    # full reasoning. find_elements is instant, so this costs nothing.
+    if getattr(args, "solve_captcha", "when-blocked") == "when-blocked":
+        visible = len(driver.find_elements(By.CSS_SELECTOR, ITEM_LINK_SELECTOR))
+        if visible > MIN_CARD_MATCHES:
+            logger.info("%s detected via %s, but %d product links are already "
+                        "on the page — not solving it. Pass --solve-captcha "
+                        "always to solve it anyway.",
+                        challenge.kind, challenge.source, visible)
+            return
+
     logger.warning("%s detected via %s (sitekey=%s, action=%s) — attempting to solve.",
                    challenge.kind, challenge.source, challenge.sitekey, challenge.action)
-    token = solve_recaptcha(challenge, args.twocaptcha_key,
-                           api_version=args.captcha_api,
-                           min_score=args.min_score)
+
+    # A captcha this run cannot solve must not take the run down with it.
+    if not args.twocaptcha_key:
+        logger.warning("No 2captcha API key, so this challenge cannot be "
+                       "solved — continuing with whatever the page already "
+                       "holds. If it was blocking, the run reports exit 3.")
+        return
+    try:
+        token = solve_recaptcha(challenge, args.twocaptcha_key,
+                               api_version=args.captcha_api,
+                               min_score=args.min_score)
+    except Exception as e:  # noqa: BLE001 — a solver failure is not a crash
+        logger.error("Solving the challenge failed (%s) — continuing with "
+                     "whatever the page holds.", e)
+        return
     driver.execute_script(f"({INJECT_TOKEN_JS})(arguments[0]);", token)
     logger.info("Token injected. Reloading page to continue.")
     time.sleep(1.5)
@@ -841,6 +864,11 @@ def parse_args():
                    help="Which 2captcha solver API to use. v2 is the current JSON API "
                         "(api.2captcha.com/createTask); v1 is the legacy in.php/res.php "
                         "pair. Default v2, with an automatic one-shot fallback to v1.")
+    p.add_argument("--solve-captcha", choices=["when-blocked", "always"],
+                   default="when-blocked",
+                   help="when-blocked (default): only pay to solve a challenge "
+                        "if the catalogue is not already readable. always: "
+                        "solve whenever one is detected.")
     p.add_argument("--min-score", type=float, default=0.7,
                    help="reCAPTCHA v3 minimum score to request (0.3, 0.7 or 0.9 — "
                         "the API only accepts these three). Ignored for v2 widgets.")

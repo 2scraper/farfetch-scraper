@@ -439,11 +439,47 @@ def handle_captcha_if_present(page, args) -> None:
     if not challenge:
         return
 
+    # Detected is not the same as blocking. This site carries a reCAPTCHA in
+    # its sign-up modal that has nothing to do with the catalogue, so a
+    # detection on a page whose products are already present means the
+    # challenge is not standing between us and anything. Counting the links
+    # is instant — no wait_for_function, no 20s — which is why the check can
+    # sit here rather than forcing the readiness wait to run first (doing
+    # that would cost 20 wasted seconds on a page the captcha genuinely
+    # gates, where solving first is what makes the products appear).
+    if getattr(args, "solve_captcha", "when-blocked") == "when-blocked":
+        visible = len(page.query_selector_all(ITEM_LINK_SELECTOR))
+        if visible > MIN_CARD_MATCHES:
+            logger.info("%s detected via %s, but %d product links are already "
+                        "on the page — not solving it. The catalogue is not "
+                        "what this challenge is guarding. Pass "
+                        "--solve-captcha always to solve it anyway.",
+                        challenge.kind, challenge.source, visible)
+            return
+
     logger.warning("%s detected via %s (sitekey=%s, action=%s) — attempting to solve.",
                    challenge.kind, challenge.source, challenge.sitekey, challenge.action)
-    token = solve_recaptcha(challenge, args.twocaptcha_key,
-                           api_version=args.captcha_api,
-                           min_score=args.min_score)
+
+    # A captcha this run cannot solve must not take the run down with it. The
+    # products may well be readable anyway, and a traceback in place of them
+    # is strictly worse than a warning: the missing key raised RuntimeError
+    # out of solve_recaptcha, through here, and out of scrape().
+    if not args.twocaptcha_key:
+        logger.warning("No 2captcha API key, so this challenge cannot be "
+                       "solved — continuing with whatever the page already "
+                       "holds. Pass --twocaptcha-key or set TWOCAPTCHA_KEY if "
+                       "the run comes back blocked (exit 3).")
+        return
+    try:
+        token = solve_recaptcha(challenge, args.twocaptcha_key,
+                               api_version=args.captcha_api,
+                               min_score=args.min_score)
+    except Exception as e:  # noqa: BLE001 — a solver failure is not a crash
+        logger.error("Solving the challenge failed (%s) — continuing with "
+                     "whatever the page holds. If it was in fact blocking, "
+                     "the run will report that as exit 3.", e)
+        return
+
     page.evaluate(INJECT_TOKEN_JS, token)
     logger.info("Token injected. Reloading page to continue.")
     page.wait_for_timeout(1500)
@@ -922,6 +958,15 @@ def parse_args():
                    help="Which 2captcha solver API to use. v2 is the current JSON API "
                         "(api.2captcha.com/createTask); v1 is the legacy in.php/res.php "
                         "pair. Default v2, with an automatic one-shot fallback to v1.")
+    p.add_argument("--solve-captcha", choices=["when-blocked", "always"],
+                   default="when-blocked",
+                   help="when-blocked (default): only pay to solve a challenge "
+                        "if the catalogue is not already readable — this site "
+                        "carries a reCAPTCHA in its sign-up modal that guards "
+                        "nothing we want. always: solve whenever one is "
+                        "detected, which is the safer choice if you would "
+                        "rather spend a solve than risk missing content that "
+                        "only appears afterwards.")
     p.add_argument("--min-score", type=float, default=0.7,
                    help="reCAPTCHA v3 minimum score to request (0.3, 0.7 or 0.9 — "
                         "the API only accepts these three). Ignored for v2 widgets.")

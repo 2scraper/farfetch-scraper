@@ -8,7 +8,26 @@ a promise that every flag and exit code is contractually frozen.
 
 ## [Unreleased]
 
+### Added
+- **`--solve-captcha when-blocked|always`** (default `when-blocked`) on all
+  three browser engines. A detected challenge is not necessarily a blocking
+  one: this site carries a reCAPTCHA in its sign-up modal, and solving it on
+  a page whose products are already rendered spends a paid task on a
+  challenge guarding nothing. `when-blocked` counts product links on the
+  spot — no waiting, so the check is free — and only solves when the
+  catalogue is not already readable. `always` keeps the previous behaviour
+  for anyone who would rather spend a solve than risk missing content.
+  - The check deliberately does not work by running the readiness wait
+    first: on a page the captcha genuinely gates, that would burn 20 seconds
+    before solving, and solving first is what makes the products appear.
+
 ### Fixed
+- **A captcha the run cannot solve no longer takes the run down.** With no
+  API key, `solve_recaptcha` raised `RuntimeError` out of the handler and out
+  of `scrape()` — a traceback in place of products that were already on the
+  page. Reproduced from an audit. Now a missing key, or any solver error, is
+  a warning and the run continues; if the challenge really was blocking, that
+  surfaces as exit 3 rather than as a crash.
 - **Space-grouped thousands are read correctly.** `1 234 €` parsed as **234**
   — an order of magnitude off, silently. French, Russian and other locales
   group with a space, and a rendered page uses a no-break variant so the
