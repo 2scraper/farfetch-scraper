@@ -336,6 +336,39 @@ def main() -> int:
                 "'SARAH 100' yields nothing",
                 _prices_in("SARAH 100") == ([], None))
 
+    # A space is the thousands separator in French, Russian and others, and a
+    # rendered page uses a no-break variant so the number does not wrap. All
+    # three forms appeared in an audit and all three parsed as 234, an order
+    # of magnitude off, silently.
+    ok &= check("space-grouped thousands: '1 234 €' is 1234, not 234",
+                _prices_in("1 234 €") == ([1234.0], "EUR"))
+    ok &= check("no-break space (U+00A0) groups thousands too — this is what a "
+                "rendered page actually contains",
+                _prices_in("1 234 €") == ([1234.0], "EUR"))
+    ok &= check("narrow no-break space (U+202F) as well",
+                _prices_in("1 234 €") == ([1234.0], "EUR"))
+    ok &= check("space grouping combines with a decimal comma: "
+                "'1 234,56 €' -> 1234.56",
+                _prices_in("1 234,56 €") == ([1234.56], "EUR"))
+    ok &= check("space grouping requires FULL groups of three digits, so a size "
+                "list beside a price ('5 yrs, 6 yrs 200 €') does not merge into "
+                "one number",
+                _prices_in("Verfügbar in 5 yrs, 6 yrs 200 €")
+                == ([200.0], "EUR"))
+
+    # A bare "$" is genuinely ambiguous, but a PREFIXED one is not, and
+    # reporting HK$1,234 as USD is the wrong currency rather than a rounding
+    # error — directly against this project's cross-country comparison use.
+    ok &= check("HK$ is HKD, not USD", _prices_in("HK$1,234") == ([1234.0], "HKD"))
+    ok &= check("A$ is AUD and NT$ is TWD, and the prefix is tried before the "
+                "bare '$' so it cannot be swallowed",
+                _prices_in("A$99") == ([99.0], "AUD")
+                and _prices_in("NT$1 500") == ([1500.0], "TWD"))
+    ok &= check("a bare '$' still reads as USD — on the US site that is what it "
+                "means, and JSON-LD supplies the real currency when the site "
+                "publishes one",
+                _prices_in("$1,234") == ([1234.0], "USD"))
+
     with tempfile.TemporaryDirectory() as tmp:
         prefix = os.path.join(tmp, "smoke_out")
         save(products, prefix, "both")
@@ -572,6 +605,42 @@ def main() -> int:
     ok &= check("overlay refuses to overwrite when the JSON-LD price is not one "
                 "of the tile's prices (scoping-failure guard)",
                 _dis[0].price == 999.0 and _dis[0].original_price is None)
+
+    # ---- KNOWN LIMITATION, pinned deliberately -----------------------------
+    # The overlay assumes every price in a tile belongs to ONE discount chain,
+    # which is measured behaviour for this site: Farfetch prints original /
+    # sale / final and publishes only the middle one, so min() is the price a
+    # customer pays. An INSTALLMENT price in the same tile would break that
+    # assumption — min() would take the per-payment figure.
+    #
+    # Not defended against, on purpose. Checked against a live 106-tile
+    # capture (2026-09-07): zero tiles contained an installment marker and
+    # zero had a min more than 2.5x below the next price. The page does
+    # mention Klarna and "Raten", but only in the footer and a translation
+    # bundle, outside any tile's scope. Guarding it would mean either chasing
+    # wording across every locale, or a ratio threshold that would reject the
+    # real 60%+ discounts this site runs constantly.
+    #
+    # So this test does not assert the RIGHT answer — it pins the current one,
+    # so that if Farfetch ever moves installments into a tile, the change
+    # surfaces here as a deliberate decision rather than as "why are our
+    # discounts 81%".
+    _INSTALMENT = ('<html><body><script type="application/ld+json">'
+                   + json.dumps({"@type": "ItemList", "itemListElement": [
+                       {"@type": "Product", "name": "coat",
+                        "offers": {"price": 150, "priceCurrency": "EUR",
+                                   "url": "/de/shopping/kids/x-item-70000001.aspx"}}]})
+                   + '</script>'
+                     '<div><div><a href="/de/shopping/kids/x-item-70000001.aspx">'
+                     '<p>200 &euro;</p><p>150 &euro;</p>'
+                     '<p>oder 4 Zahlungen von 37,50 &euro;</p>'
+                     '</a></div></div></body></html>')
+    _inst = parse_products(_INSTALMENT, _SALE_URL)[0]
+    ok &= check("KNOWN LIMITATION: an installment price inside a tile would be "
+                "taken as the product price (min of the chain). Not seen on "
+                "this site in a live 106-tile check; pinned so a change is "
+                "noticed rather than silent",
+                _inst.price == 37.5 and _inst.discount_pct == 81.2)
 
     # JSON-LD with no rendered tiles at all: the overlay must be a no-op, not a
     # crash and not a wipe.

@@ -68,8 +68,9 @@ category URL — see [Troubleshooting](TROUBLESHOOTING.md).
 - **Resale premium checks** — Farfetch retail price against a marketplace price
   for the same item.
 - **Currency and market comparison** — the same category priced from a different
-  country, by changing the exit IP rather than the URL. Farfetch keys currency
-  and language off the exit IP; see [Geo-redirect](#site-specific-behaviour).
+  country, by changing the exit IP rather than the URL. A fresh, cookie-less
+  visit is geo-redirected on exit IP; verify the market in the output rather
+  than assuming it — see [Geo-redirect](#site-specific-behaviour).
 
 Listing-level fields only. This repo does not open product pages, so no sizes,
 materials, colour variants or descriptions — those live one level deeper.
@@ -91,7 +92,7 @@ and the honest list is short.** What a paid service actually buys:
 | You need | Why your own setup runs out | What covers it |
 |---|---|---|
 | Many requests per hour | Behavioural scoring degrades as one address repeats. Your own IP is the one you cannot rotate. | [Proxies](#3-proxies) |
-| A specific country's prices | Farfetch decides currency and language from the exit IP. Your address gives you exactly one market. | [Proxies](#3-proxies) or the [Scraping Browser API](#2-scraping-browser-api) `country-` segment |
+| A specific country's prices | A fresh visit is geo-redirected on exit IP, and your address gives you exactly one market. | [Proxies](#3-proxies) or the [Scraping Browser API](#2-scraping-browser-api) `country-` segment |
 | A challenge that does not clear | A real browser usually clears it; when it does not, something has to answer. | [Captcha solving](#1-captcha-solving), or the browser solving it in-session |
 | No browser infrastructure to run | Managing Chromium, versions and concurrency is its own job. | [Scraping Browser API](#2-scraping-browser-api) |
 | Consistent device identity | A default automation fingerprint is uniform and therefore distinctive. | [Fingerprints](#4-fingerprints) |
@@ -378,8 +379,8 @@ that case separately instead.
 Three things about that row, because each looks like a bug and is not:
 
 - **`currency` is EUR and the title is German.** That run exited in Europe.
-  Farfetch keys currency, language and the URL locale off the exit IP, not off
-  the URL you request — see [Geo-redirect](#site-specific-behaviour). The same
+  A fresh visit is geo-redirected on exit IP — currency, language and the URL
+  locale follow the address, not the URL you request — see [Geo-redirect](#site-specific-behaviour). The same
   category through a US address returns USD and English.
 - **`original_price` and `discount_pct` are `null` here because that product
   was not discounted.** On a sale item all three price columns populate. Worth
@@ -501,7 +502,7 @@ ws://{login}-zone-scraping_browser-country-{cc}-pid-{profileId}:{password}@cb.2c
 | Segment | Meaning |
 |---|---|
 | `zone-scraping_browser` | Product zone |
-| `country-us` | Exit country for the session. Farfetch keys currency and language off the exit IP, so this also decides those — as does a country-targeted `--proxy`. |
+| `country-us` | Exit country for the session. A fresh visit's currency and language follow the exit IP, so this also decides those — as does a country-targeted `--proxy`. |
 | `pid-p1` | Profile id: cookies and storage persist per profile |
 
 **One live CDP connection per profile.** A second connection to the same `pid`
@@ -645,11 +646,29 @@ Three details that are easy to get wrong on this site:
   means the search escaped into a shared grid wrapper, where a product can
   inherit its neighbour's data.
 
-Prices parse `$ € £ ¥` **and** 3-letter ISO codes (`AED 100`, `100 CHF`) in
-either position, in both decimal conventions (`1,234.56` and `1.234,56`). When
-both separators appear, whichever comes last is the decimal point; when only one
-does, three trailing digits means a thousands grouping (`$1,234` is 1234, not
-1.234 — none of the currencies here have a 3-digit subunit).
+Prices parse `$ € £ ¥`, prefixed dollars (`HK$`, `A$`, `NT$`, …) **and**
+3-letter ISO codes (`AED 100`, `100 CHF`) in either position, in all three
+grouping conventions: `1,234.56`, `1.234,56` and `1 234,56` — including the
+no-break and narrow-no-break spaces a rendered page actually uses. When both a
+dot and a comma appear, whichever comes last is the decimal point; when only
+one does, three trailing digits means a thousands grouping (`$1,234` is 1234,
+not 1.234 — none of the currencies here have a 3-digit subunit). Space
+grouping requires full three-digit groups, so a size list beside a price
+(`5 yrs, 6 yrs 200 €`) cannot merge into one number.
+
+A **prefixed** dollar names its currency (`HK$` is HKD, not USD); a bare `$`
+is a guess and reads as USD, which is what it means on the US site. The
+JSON-LD path supplies the real currency whenever the site publishes one, and
+the DOM overlay never overwrites it.
+
+**One assumption worth knowing**, because it is the overlay's load-bearing
+one: every price in a tile is taken to belong to the same discount chain, so
+the lowest is what a customer pays. An installment price inside a tile would
+break that. Checked against a live 106-tile capture — none carried one, and
+the page's Klarna/`Raten` text sits in the footer, outside any tile — so it is
+pinned as a known limitation in the test suite rather than guarded against
+with locale-chasing word lists or a ratio threshold that would reject this
+site's real 60%+ discounts.
 
 Codes are matched against an allowlist of real ISO 4217 codes rather than a bare
 `[A-Z]{3}`, so a size chart (`XXL 100`) doesn't become a phantom price. A written
@@ -661,9 +680,21 @@ overwrites a currency that JSON-LD stated explicitly.
 
 ## Site-specific behaviour
 
-**Geo-redirect.** Farfetch redirects on **exit IP**, and the URL you request has
-no say in it. A European address gives `/de/` URLs, `125 €` with the symbol after
-the number, and localised product names; a US address gives `$125` and English.
+**Geo-redirect.** Farfetch redirects a fresh visit on **exit IP**, and the URL
+you request has no say in it. Measured repeatedly: a European address gives
+`/de/` URLs, `125 €` with the symbol after the number, and localised product
+names; a US address gives `$125` and English.
+
+That is a measurement of what a first, cookie-less visit does — **not the whole
+mechanism.** Farfetch's own help pages describe a *shopping location* the
+customer can set, with currency following the shipping destination, and that
+choice is remembered per session. So the exit IP is what decides the **default**
+for a scraper arriving with no state, which is exactly the case here (every
+rotation starts a fresh browser — see [proxies](#3-proxies)); it is not a claim
+that IP is the only input the site has. If you need a specific market
+guaranteed rather than inferred, verify it in the output — `currency` on every
+row, and the locale in the sidecar's `final_url` — instead of assuming the IP
+settled it.
 
 So pin the exit IP, whichever way you reach the site:
 
