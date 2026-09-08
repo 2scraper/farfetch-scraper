@@ -258,6 +258,28 @@ def _parse_rating_from_aria(aria_label: str):
     return None, None
 
 
+def _image_url(image):
+    """First usable image URL from any shape schema.org allows for `image`.
+
+    All four are legal and this project has met three: a bare string, a list
+    of strings, an ImageObject (`{"@type": "ImageObject", "url": ...}`), and a
+    list of those. The old one-liner indexed `[0]` into whatever it found,
+    so an ImageObject raised KeyError and killed the run — a crash over a
+    field that is decoration next to price and sku.
+    """
+    if isinstance(image, str):
+        return image or None
+    if isinstance(image, dict):
+        url = image.get("url") or image.get("contentUrl")
+        return url if isinstance(url, str) else None
+    if isinstance(image, (list, tuple)):
+        for item in image:
+            found = _image_url(item)
+            if found:
+                return found
+    return None
+
+
 def _parse_jsonld(html: str, base_url: str) -> List[Product]:
     soup = BeautifulSoup(html, "html.parser")
     products: List[Product] = []
@@ -270,18 +292,41 @@ def _parse_jsonld(html: str, base_url: str) -> List[Product]:
 
         blocks = data if isinstance(data, list) else [data]
         for block in blocks:
-            items = block.get("itemListElement") if isinstance(block, dict) else None
-            candidates = items if items else [block]
+            if not isinstance(block, dict):
+                continue
+            # `@graph` is the other standard way schema.org markup is
+            # published: one block holding a flat list of typed nodes rather
+            # than an ItemList. Farfetch does not use it today, but a parser
+            # that silently returns zero products when a site switches to it
+            # reports "empty category" for what is really an unread format —
+            # the exact failure this project has an exit code to distinguish.
+            graph = block.get("@graph")
+            items = block.get("itemListElement")
+            if isinstance(graph, list):
+                candidates = graph
+            elif items:
+                candidates = items
+            else:
+                candidates = [block]
 
             for entry in candidates:
                 node = entry.get("item", entry) if isinstance(entry, dict) else entry
                 if not isinstance(node, dict) or node.get("@type") not in ("Product", ["Product"]):
                     continue
 
-                offers = node.get("offers", {})
+                # `or {}` on every one of these, not just a default: the
+                # default only applies when the key is ABSENT, and JSON-LD in
+                # the wild carries explicit nulls. `"offers": null` used to
+                # raise AttributeError on the next line and take the whole
+                # run down with it.
+                offers = node.get("offers") or {}
                 if isinstance(offers, list):
-                    offers = offers[0] if offers else {}
-                agg_rating = node.get("aggregateRating", {}) or {}
+                    offers = next((o for o in offers if isinstance(o, dict)), {})
+                if not isinstance(offers, dict):
+                    offers = {}
+                agg_rating = node.get("aggregateRating") or {}
+                if not isinstance(agg_rating, dict):
+                    agg_rating = {}
 
                 # Farfetch's own JSON-LD (confirmed live) nests the product
                 # URL under offers.url, not directly on the Product node —
@@ -306,7 +351,7 @@ def _parse_jsonld(html: str, base_url: str) -> List[Product]:
                     rating=_to_float(str(agg_rating.get("ratingValue"))) if agg_rating.get("ratingValue") else None,
                     review_count=int(agg_rating["reviewCount"]) if str(agg_rating.get("reviewCount", "")).isdigit() else None,
                     in_stock=("InStock" in str(offers.get("availability", ""))) if offers.get("availability") else None,
-                    image_url=node.get("image") if isinstance(node.get("image"), str) else (node.get("image") or [None])[0],
+                    image_url=_image_url(node.get("image")),
                     # Upgraded to "jsonld+dom" by _overlay_tile_prices when
                     # the rendered tile corroborates or corrects this figure.
                     price_source="jsonld",

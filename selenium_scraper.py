@@ -63,6 +63,7 @@ from captcha_solver import (detect_recaptcha_v3, detect_recaptcha_in_page,
 from product_parser import (parse_products, SELECTORS, detect_bot_challenge,
                             page_url)
 from output_writer import dedupe_by_sku, finish_run
+from proxy_pool import mask as mask_proxy
 import env_config
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
@@ -558,11 +559,26 @@ def build_driver(args) -> webdriver.Chrome:
     options.add_argument("--window-size=1366,900")
 
     if args.proxy:
-        # Selenium's basic --proxy-server flag doesn't support inline user:pass;
-        # for authenticated 2Captcha proxies use a Selenium-Wire / extension
-        # setup in production. Shown here in its simple unauthenticated form.
-        options.add_argument(f"--proxy-server={args.proxy}")
-        logger.info("Using 2Captcha proxy: %s", args.proxy)
+        # Chromium's --proxy-server cannot authenticate, so credentials in
+        # this URL would not work anyway — but leaving them in the string
+        # does something worse than not working: --proxy-server becomes part
+        # of the browser's command line, where anything on the machine that
+        # can run `ps` reads them, and the old log line printed them outright.
+        # So strip them, pass only scheme://host:port, and say plainly that
+        # authentication needs Selenium-Wire or an extension rather than
+        # letting a user believe a user:pass URL is doing something.
+        parsed = urlparse(args.proxy)
+        port = f":{parsed.port}" if parsed.port else ""
+        options.add_argument(f"--proxy-server={parsed.scheme}://{parsed.hostname}{port}")
+        logger.info("Using proxy %s", mask_proxy(args.proxy))
+        if parsed.username or parsed.password:
+            logger.warning(
+                "The credentials in --proxy were dropped, not sent: Chromium's "
+                "--proxy-server cannot authenticate, and keeping them in the "
+                "flag would only put them in this browser's command line. If "
+                "this proxy requires auth, requests through it will fail — use "
+                "Selenium-Wire or a proxy-auth extension, or run "
+                "playwright_scraper.py, which authenticates properly.")
 
     # --chromedriver is honoured on THIS path too, not just the remote one.
     # It used to be remote-only, which was wrong in a way that only shows up on

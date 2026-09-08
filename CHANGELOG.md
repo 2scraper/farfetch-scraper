@@ -6,6 +6,30 @@ All notable changes to this project are documented here. Format follows
 library with a stable API) reasonably can — a patch bump means "fixes", not
 a promise that every flag and exit code is contractually frozen.
 
+## [Unreleased]
+
+### Fixed
+- **Proxy credentials no longer reach a browser command line** in the
+  pyppeteer and Selenium engines. Both appended the whole `--proxy` value to
+  Chromium's `--proxy-server`, which becomes part of the browser process's
+  argv — readable by anything that can run `ps` — and logged the URL
+  verbatim on the next line. Now only `scheme://host:port` goes on the
+  command line and the log is masked. pyppeteer additionally sends the
+  credentials over CDP via `page.authenticate`, which is the supported way
+  and actually works; Selenium warns that it dropped them, since Chromium's
+  flag cannot authenticate at all and pretending otherwise is worse than
+  saying so. (Playwright was already correct — 0.3.0.)
+- **Three legal JSON-LD shapes that the parser mishandled**, all reproduced
+  against the old code:
+  - `"offers": null` raised `AttributeError` and killed the run. A default
+    only applies to an ABSENT key, and explicit nulls occur in the wild.
+  - `image` as an `ImageObject` (or a list of them) raised `KeyError` —
+    a crash over a decorative field. Now reads `url`/`contentUrl` from any
+    of the four shapes schema.org allows.
+  - Products inside an `@graph` block were silently missed, so a site
+    publishing that way would report an EMPTY category for what is really
+    an unread format — the exact confusion the exit codes exist to prevent.
+
 ## [0.4.0] — 2026-09-07
 
 ### Added

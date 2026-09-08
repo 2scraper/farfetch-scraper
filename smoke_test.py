@@ -1655,6 +1655,73 @@ def main() -> int:
                     _dr._check_comparable(_A(os.path.join(tmp, "nope.json"),
                                              os.path.join(tmp, "nope2.json"))) is True)
 
+    # ---- JSON-LD shapes that are legal but were not handled ----------------
+    # All of these are valid schema.org and all were reproduced against the
+    # old parser: the first two CRASHED the run (a null and an ImageObject),
+    # the third returned zero products silently. A crash over a decorative
+    # field, or an "empty category" that is really an unread format, is worse
+    # than a missing image.
+    def _ld(node_extra, sku):
+        node = {"@type": "Product", "name": "x",
+                "offers": {"price": 10, "priceCurrency": "EUR",
+                           "url": f"/shopping/kids/a-item-{sku}.aspx"}}
+        node.update(node_extra)
+        return ('<html><body><script type="application/ld+json">'
+                + json.dumps({"@type": "ItemList", "itemListElement": [node]})
+                + "</script></body></html>")
+
+    _LDU = "https://www.farfetch.com/shopping/kids/items.aspx"
+    ok &= check("JSON-LD with an explicit \"offers\": null parses instead of "
+                "raising — a default only applies to an ABSENT key, and nulls "
+                "occur in the wild",
+                len(parse_products(_ld({"offers": None}, "90000001"), _LDU)) == 1)
+    ok &= check("an empty offers list is treated as no offer, not an IndexError",
+                len(parse_products(_ld({"offers": []}, "90000002"), _LDU)) == 1)
+    ok &= check("image as an ImageObject yields its url (it used to raise "
+                "KeyError and kill the run over a decorative field)",
+                parse_products(_ld({"image": {"@type": "ImageObject",
+                                              "url": "http://i/1.jpg"}},
+                                   "90000003"), _LDU)[0].image_url
+                == "http://i/1.jpg")
+    ok &= check("image as a LIST of ImageObjects yields the first usable url, "
+                "including via contentUrl",
+                parse_products(_ld({"image": [{"@type": "ImageObject",
+                                               "contentUrl": "http://i/2.jpg"}]},
+                                   "90000004"), _LDU)[0].image_url
+                == "http://i/2.jpg")
+    ok &= check("image: null yields None rather than raising",
+                parse_products(_ld({"image": None}, "90000005"),
+                               _LDU)[0].image_url is None)
+    ok &= check("an explicit \"aggregateRating\": null parses",
+                len(parse_products(_ld({"aggregateRating": None}, "90000006"),
+                                   _LDU)) == 1)
+    _GRAPH = ('<html><body><script type="application/ld+json">'
+              + json.dumps({"@context": "https://schema.org", "@graph": [
+                  {"@type": "WebPage", "name": "not a product"},
+                  {"@type": "Product", "name": "in graph",
+                   "offers": {"price": 10, "priceCurrency": "EUR",
+                              "url": "/shopping/kids/a-item-90000007.aspx"}}]})
+              + "</script></body></html>")
+    ok &= check("products inside an @graph block are found — the other standard "
+                "way schema.org is published; missing them reported an EMPTY "
+                "category for what was really an unread format",
+                [p.sku for p in parse_products(_GRAPH, _LDU)] == ["90000007"])
+
+    # ---- proxy credentials must not reach a browser command line -----------
+    # Chromium's --proxy-server becomes part of the browser process's argv,
+    # readable by anything that can run `ps`. Playwright got this right via
+    # its own username/password fields; the other two engines appended the
+    # whole --proxy value, credentials included, and logged it verbatim.
+    _SECRET_PROXY = "http://myuser:s3cr3t@gate.example.com:9999"
+    for _engine in ("puppeteer_scraper.py", "selenium_scraper.py"):
+        _esrc = open(_engine, encoding="utf-8").read()
+        ok &= check(f"{_engine}: the proxy URL is no longer logged verbatim",
+                    'logger.info("Using 2Captcha proxy: %s", args.proxy)' not in _esrc)
+        ok &= check(f"{_engine}: --proxy-server is built from scheme/host/port "
+                    f"only, so credentials cannot reach the browser's argv",
+                    "--proxy-server={args.proxy}" not in _esrc
+                    and "parsed.hostname" in _esrc or "proxy_parts.hostname" in _esrc)
+
     # ---- proxy pool and rotation -------------------------------------------
     # `--proxy` was one static string applied once at launch: the shape of a
     # demo, not of the thing proxies are bought for. These pin the rules that
