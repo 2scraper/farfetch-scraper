@@ -23,6 +23,7 @@ import argparse
 import asyncio
 import logging
 import sys
+from urllib.parse import urlparse
 
 from pyppeteer import launch, connect
 
@@ -32,6 +33,7 @@ from captcha_solver import (detect_recaptcha_v3, detect_recaptcha_in_page,
 from product_parser import (parse_products, SELECTORS, detect_bot_challenge,
                             page_url)
 from output_writer import dedupe_by_sku, finish_run
+from proxy_pool import mask as mask_proxy
 import env_config
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
@@ -143,12 +145,32 @@ async def scrape(args) -> None:
             "args": ["--disable-blink-features=AutomationControlled", "--window-size=1366,900"],
         }
         if args.proxy:
-            launch_args["args"].append(f"--proxy-server={args.proxy}")
-            logger.info("Using 2Captcha proxy: %s", args.proxy)
+            # Only scheme://host:port goes on the command line. The old code
+            # appended the whole --proxy value, credentials included, which
+            # put them in the browser process's argv for anything that can
+            # run `ps` — and logged them verbatim on the next line. Unlike
+            # Selenium, pyppeteer CAN authenticate properly: page.authenticate
+            # below sends them over CDP instead, so nothing is lost by
+            # stripping them here.
+            proxy_parts = urlparse(args.proxy)
+            proxy_port = f":{proxy_parts.port}" if proxy_parts.port else ""
+            launch_args["args"].append(
+                f"--proxy-server={proxy_parts.scheme}://{proxy_parts.hostname}{proxy_port}")
+            logger.info("Using proxy %s", mask_proxy(args.proxy))
         browser = await launch(**launch_args)
 
     pages = await browser.pages()
     page = pages[0] if pages else await browser.newPage()
+
+    if args.proxy and not args.cdp_endpoint:
+        creds = urlparse(args.proxy)
+        if creds.username or creds.password:
+            # Over CDP (Network.setExtraHTTPHeaders' proper cousin), not on a
+            # command line: this is the supported way to authenticate a proxy
+            # in Chromium, and it keeps the password out of argv.
+            await page.authenticate({"username": creds.username or "",
+                                     "password": creds.password or ""})
+            logger.info("Proxy credentials sent over CDP, not via the command line.")
     if not args.cdp_endpoint:
         # Only override the UA when we launched our own bundled Chromium —
         # see playwright_scraper.py for why this matters when connected via
