@@ -18,6 +18,7 @@ import os
 import re
 import builtins
 import inspect
+import subprocess
 import sys
 import tempfile
 
@@ -2069,6 +2070,57 @@ def main() -> int:
                 "use_antidetect" not in inspect.signature(_cs.solve_recaptcha).parameters)
     ok &= check("the placeholder antidetect endpoint constant is gone",
                 not hasattr(_cs, "ANTIDETECT_LOCAL_API"))
+
+    # THE SHIPPED CI CHECKS RUN, AND PASS ON THIS REPO.
+    #
+    # `.github/ci_checks.py` was in this repo and invoked by NOTHING — not
+    # CI, not this suite — while `tests.yml` carried an inline grep doing a
+    # narrower version of the same job with its own allowlist. The inline one
+    # matched only ws:// and wss://, so an `http://user:pass@` credential
+    # would have sailed past CI; the shipped one, which does match http://,
+    # meanwhile failed on this repo's own main because the documentation
+    # placeholder in proxy_pool.py and the masking fixtures here were missing
+    # from its allowlist.
+    #
+    # Two sources of truth, one dead and one with a hole. Running the shipped
+    # one here as well means a failure shows up locally, before a push.
+    _repo_root = os.path.dirname(os.path.abspath(__file__))
+    _script = os.path.join(_repo_root, ".github", "ci_checks.py")
+    ok &= check("ci_checks.py is present", os.path.exists(_script))
+    if os.path.exists(_script):
+        _proc = subprocess.run([sys.executable, _script, "--all"],
+                               cwd=_repo_root, capture_output=True, text=True)
+        ok &= check(f"ci_checks.py --all passes on this repo "
+                    f"(exit {_proc.returncode})", _proc.returncode == 0)
+        if _proc.returncode != 0:
+            for _line in (_proc.stdout + _proc.stderr).strip().split("\n")[-12:]:
+                print(f"        {_line}")
+        _wf = open(os.path.join(_repo_root, ".github", "workflows",
+                                "tests.yml"), encoding="utf-8").read()
+        ok &= check("tests.yml runs the shipped check rather than an inline "
+                    "copy",
+                    "ci_checks.py --secret-check" in _wf
+                    or "ci_checks.py --all" in _wf)
+        ok &= check("...and carries no second, narrower inline credential "
+                    "grep", "(ws|wss)://[^ " not in _wf)
+
+    # `--fp-tags` MUST DEFAULT TO ONE OS-FAMILY TAG. It shipped as
+    # "Windows,Chrome,Desktop", which the fingerprint API rejects with HTTP
+    # 400 — so --fingerprint failed on every invocation, while
+    # fingerprint_client.py's own --tags help said ONE tag all along.
+    # Measured against the live API on 2026-09-10: `Windows` succeeds, and
+    # `Windows,Chrome,Desktop`, `Chrome` and `Desktop` each 400.
+    import glob as _glob
+    for _path in sorted(_glob.glob(os.path.join(_repo_root, "*_scraper.py"))):
+        _m = re.search(r'--fp-tags"\s*,\s*default="([^"]*)"',
+                       open(_path, encoding="utf-8").read())
+        if _m is None:
+            continue
+        ok &= check(f"{os.path.basename(_path)}'s --fp-tags default is ONE "
+                    f"tag the API accepts",
+                    "," not in _m.group(1)
+                    and _m.group(1) in ("Windows", "Microsoft Windows",
+                                        "Android"))
 
     print()
     if _skips:
