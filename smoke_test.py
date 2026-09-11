@@ -1407,7 +1407,8 @@ def main() -> int:
         from fingerprint_client import playwright_context_kwargs, playwright_init_script
 
         FP = {"id": "fp_test", "country": "us",
-              "screen": {"width": 1920, "height": 1080},
+              "screen": {"width": 1920, "height": 1080,
+                         "deviceScaleFactor": 1},
               "userAgent": {"value": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/145.0.0.0"},
               "navigator": {"platform": "Win32", "hardwareConcurrency": 8, "deviceMemory": 8},
               "webgl": {"vendor": 'Google Inc. "quoted"', "renderer": "ANGLE (RTX 3060)"}}
@@ -1421,6 +1422,13 @@ def main() -> int:
                     and kw["screen"]["width"] == 1920)
 
         js = playwright_init_script(FP)
+        # The device pixel ratio, which Playwright takes as its own option
+        # and which was dropped on the floor until a live browser was
+        # compared against the fingerprint: one stating 1.25 produced a
+        # browser reporting `devicePixelRatio === 1`, an identity
+        # contradicting itself on an axis a fingerprinter reads for free.
+        ok &= check("fingerprint: the device scale factor is carried",
+                    kw.get("device_scale_factor") == 1)
         ok &= check("fingerprint: values are JSON-encoded, so a quote in an API string "
                     "cannot break out of the script",
                     '\\"quoted\\"' in js and "Google Inc. \"quoted\"" not in js)
