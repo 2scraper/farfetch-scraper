@@ -2130,6 +2130,47 @@ def main() -> int:
                     and _m.group(1) in ("Windows", "Microsoft Windows",
                                         "Android"))
 
+    # HOW fingerprint_client FINDS ITS KEY, which is a separate defect from
+    # which tags it sends. `--key` defaulted to `os.environ.get(
+    # "TWOCAPTCHA_KEY")` alone, so a key put in `.env` — exactly as the
+    # README and .env.example instruct — worked for every engine and failed
+    # HERE with "No API key". A documented mechanism not applied on one path,
+    # which is the shape of half the defects the family notes list. Found on
+    # a sibling repo's first live --fingerprint run and confirmed present
+    # here.
+    import fingerprint_client as _fpc
+    import env_config as _envc
+    _fp_src = inspect.getsource(_fpc.main)
+    ok &= check("fingerprint_client loads .env itself, rather than hoping an "
+                "engine did", "env_config.load_env()" in _fp_src)
+    ok &= check("...and reads the key through the family's loader",
+                'env_config.env_value("TWOCAPTCHA_KEY")' in _fp_src)
+    # Through `env_value` and NOT `os.environ.get`, because only the former
+    # applies the placeholder rule. Measured both ways with
+    # TWOCAPTCHA_KEY=your_2captcha_api_key_here exported: os.environ.get
+    # sends the placeholder to the API and the run reports "Fingerprint API
+    # rejected the key (401) — note this is a separate subscription", which
+    # sends the reader to check a subscription they never needed.
+    ok &= check("...not straight from os.environ, which skips the "
+                "placeholder rule",
+                'os.environ.get("TWOCAPTCHA_KEY")' not in _fp_src)
+    _saved = os.environ.get("TWOCAPTCHA_KEY")
+    try:
+        os.environ["TWOCAPTCHA_KEY"] = "your_2captcha_api_key_here"
+        _read_back = _envc.env_value("TWOCAPTCHA_KEY")
+    finally:
+        if _saved is None:
+            os.environ.pop("TWOCAPTCHA_KEY", None)
+        else:
+            os.environ["TWOCAPTCHA_KEY"] = _saved
+    ok &= check("a placeholder still reads as unset on this path",
+                _read_back is None)
+    # The default must never reach `--help`: argparse prints one only when
+    # the help string asks for it, so this is one substring away from
+    # printing a live credential to anyone who types --help.
+    ok &= check("the --key help text does not interpolate its default",
+                "%(default)s" not in _fp_src)
+
     print()
     if _skips:
         print(f"{len(_skips)} group(s) of checks SKIPPED — an optional engine "
