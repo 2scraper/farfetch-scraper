@@ -59,7 +59,7 @@ playwright = ["playwright>=1.40.0"]
 puppeteer = ["pyppeteer>=1.0.2"]
 selenium = ["selenium>=4.15.0"]
 # Mirrors requirements-dev.txt, by hand, like the rest of this file.
-dev = ["pytest>=7.0", "ruff~=0.14", "mypy~=1.18"]
+dev = ["pytest>=7.0", "ruff~=0.14", "mypy~=1.18", "types-requests~=2.32"]
 
 [tool.setuptools]
 # This repo is a flat collection of standalone scripts, not a package
@@ -75,11 +75,13 @@ py-modules = [
     "diff_runs",
     "env_config",
     "fingerprint_client",
+    "notify",
     "output_writer",
     "playwright_scraper",
     "product_parser",
     "proxy_pool",
     "puppeteer_scraper",
+    "run_state",
     "scraper_api_client",
     "selenium_scraper",
 ]
@@ -152,6 +154,8 @@ files = [
     "product_parser.py",
     "proxy_pool.py",
     "env_config.py",
+    "notify.py",
+    "run_state.py",
 ]
 ignore_missing_imports = true
 # Not `strict`: this is a scripts collection, and demanding annotations

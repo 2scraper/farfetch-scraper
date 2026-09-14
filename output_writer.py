@@ -6,6 +6,9 @@ Shared product model + JSON/CSV writers used by all three scrapers.
 
 import csv
 import json
+import uuid
+
+import notify
 from dataclasses import dataclass, asdict, field
 from datetime import datetime, timezone
 from typing import Optional, List, Set
@@ -194,7 +197,10 @@ def write_run_meta(out_prefix: str, meta: dict) -> str:
 
 def run_meta(status: str, stop_reason: str, pages_requested: int,
              pages_completed: int, start_url: str, final_url: str,
-             products: int, pages_failed: Optional[List[int]] = None) -> dict:
+             products: int, pages_failed: Optional[List[int]] = None,
+             *, run_id: Optional[str] = None,
+             started_at: Optional[float] = None,
+             rows: Optional[List[Product]] = None) -> dict:
     """Build the metadata dict for a finished run.
 
     `status` is the field a consumer branches on:
@@ -210,8 +216,10 @@ def run_meta(status: str, stop_reason: str, pages_requested: int,
     while 4 and 5 succeed. Recording the numbers keeps the sidecar honest
     about WHICH part of the catalogue is missing, not just how much.
     """
-    return {
+    finished = datetime.now(timezone.utc)
+    meta = {
         "source": "farfetch.com",
+        "run_id": run_id or new_run_id(),
         "status": status,
         "stop_reason": stop_reason,
         "pages_requested": pages_requested,
@@ -220,7 +228,65 @@ def run_meta(status: str, stop_reason: str, pages_requested: int,
         "products": products,
         "start_url": start_url,
         "final_url": final_url,
-        "finished_at": datetime.now(timezone.utc).isoformat(),
+        "finished_at": finished.isoformat(),
+    }
+    if started_at is not None:
+        meta["started_at"] = datetime.fromtimestamp(
+            started_at, timezone.utc).isoformat()
+        meta["duration_s"] = round(finished.timestamp() - started_at, 1)
+    if rows is not None:
+        meta["quality"] = quality_metrics(rows)
+    return meta
+
+
+def new_run_id() -> str:
+    """A short id for one run.
+
+    Exists so a log line, a sidecar and a support request can be tied
+    together — "the run that failed" is not identifying when a scraper is on
+    a schedule. Short and random rather than a hash of the arguments: two
+    runs of the same command ARE different runs, and that is the thing being
+    identified.
+    """
+    return uuid.uuid4().hex[:12]
+
+
+def quality_metrics(products: List[Product]) -> dict:
+    """Coverage of the columns that are allowed to be null, as fractions.
+
+    In the sidecar rather than only in the canary, because a consumer needs
+    it for the same reason the canary does: a run can return the right NUMBER
+    of rows with a column silently empty, and "96 products" says nothing
+    about whether their prices rendered. Previously this was computed only
+    inside .github/canary_check.py, so every other consumer had to recompute
+    it — or, in practice, not notice.
+
+    Fractions, not counts: a count has to be read against the row total to
+    mean anything, and a fraction is what a threshold compares against.
+    Rounded to three places so a sidecar diff does not churn on noise.
+    """
+    total = len(products)
+    if not total:
+        return {"rows": 0}
+
+    def share(pred) -> float:
+        return round(sum(1 for p in products if pred(p)) / total, 3)
+
+    return {
+        "rows": total,
+        "priced": share(lambda p: p.price is not None),
+        "with_currency": share(lambda p: p.currency is not None),
+        "with_title": share(lambda p: bool(p.title)),
+        "with_brand": share(lambda p: bool(p.brand)),
+        "with_image": share(lambda p: bool(p.image_url)),
+        "with_sku": share(lambda p: p.sku is not None),
+        "discounted": share(lambda p: p.discount_pct is not None),
+        # The one that is provenance rather than coverage: how much of the
+        # price data was confirmed against a rendered tile instead of taken
+        # from JSON-LD alone. A drop here is how a snapshot-taken-too-early
+        # run announces itself.
+        "dom_confirmed_price": share(
+            lambda p: p.price_source == "jsonld+dom"),
     }
 
 
@@ -274,7 +340,10 @@ def finish_run(products: List[Product], out_prefix: str, fmt: str,
                allow_empty: bool, *, blocked: bool, stop_reason: str,
                pages_requested: int, pages_completed: int,
                start_url: str, final_url: str,
-               pages_failed: Optional[List[int]] = None) -> int:
+               pages_failed: Optional[List[int]] = None,
+               run_id: Optional[str] = None,
+               started_at: Optional[float] = None,
+               webhook: Optional[str] = None) -> int:
     """Write output + the run-metadata sidecar; return the exit code.
 
     Shared by all three browser engines so the status/exit-code mapping
@@ -290,15 +359,32 @@ def finish_run(products: List[Product], out_prefix: str, fmt: str,
     rc = save(products, out_prefix, fmt, allow_empty=allow_empty)
     wrote_output = bool(products) or allow_empty
 
+    status = "complete" if (products and complete) else (
+        "partial" if products else "failed")
+    # Built ALWAYS, written only beside a file that exists. The sidecar rule
+    # is unchanged — a "failed" sidecar next to the previous run's still-intact
+    # good output would contradict it — but the webhook needs the same summary
+    # for exactly the runs that write nothing, which are the ones somebody
+    # wants to be told about.
+    meta = run_meta(
+        status=status, stop_reason=stop_reason,
+        pages_requested=pages_requested, pages_completed=pages_completed,
+        pages_failed=pages_failed,
+        start_url=start_url, final_url=final_url, products=len(products),
+        run_id=run_id, started_at=started_at, rows=products)
     if wrote_output:
-        status = "complete" if (products and complete) else (
-            "partial" if products else "failed")
-        write_run_meta(out_prefix, run_meta(
-            status=status, stop_reason=stop_reason,
-            pages_requested=pages_requested, pages_completed=pages_completed,
-            pages_failed=pages_failed,
-            start_url=start_url, final_url=final_url, products=len(products)))
+        write_run_meta(out_prefix, meta)
 
+    rc = _finish_code(products, rc, blocked, stop_reason, complete,
+                      out_prefix, pages_completed, pages_requested)
+    if webhook:
+        notify.send(webhook, meta, rc)
+    return rc
+
+
+def _finish_code(products, rc, blocked, stop_reason, complete,
+                 out_prefix, pages_completed, pages_requested) -> int:
+    """The exit code alone, so finish_run can notify after deciding it."""
     if not products:
         # Nothing gathered at all, and the three reasons are not the same
         # answer. Ordered by how much each proves: a named vendor outranks a

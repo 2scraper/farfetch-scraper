@@ -117,6 +117,47 @@ a promise that every flag and exit code is contractually frozen.
 
 ### Added
 
+- **`--resume`, and a checkpoint every multi-page run writes.** A run that
+  died on page 17 of 20 used to start again at page 1.
+  `<out>.progress.json` is written after every page and deleted by a run that
+  completes; `--resume` continues from it.
+
+  Not behind a flag on the first run, on purpose: nobody passes
+  `--checkpoint` on the run that is about to be killed, and by then the pages
+  are gone.
+
+  Two refusals, both deliberate. A checkpoint written for a **different** URL,
+  page count or category is refused with the difference named — resuming the
+  wrong one merges two categories into one file, which looks like a successful
+  scrape of something that was never scraped. And pages are only SKIPPED when
+  pagination is addressable (`?page=N`): where the site chains next-links,
+  page 17 is unreachable without fetching 16, so it says so rather than
+  silently producing a run missing its middle. Changing `--retries`,
+  `--proxy` or `--concurrency` between the two runs does not invalidate it —
+  none of them changes what a page contains.
+
+  Verified end-to-end against a local stand-in listing: run 1 hits a 503 on
+  page 3 and keeps pages 1-2; run 2 with `--resume` requests only pages 1, 3
+  and 4 — page 2 never appears in the server's access log.
+
+- **Run id, timings and quality metrics in the sidecar.** `run_id` (logged on
+  the first line too, so a log line and an artefact can be tied together),
+  `started_at`, `duration_s`, and a `quality` block giving the coverage of
+  every nullable column as a fraction. That last was previously computed only
+  inside `.github/canary_check.py`, so every other consumer had to recompute
+  it — or, in practice, not notice that a run returned the right NUMBER of
+  rows with a column silently empty.
+
+- **`--webhook URL`** POSTs the run summary plus the exit code when the run
+  finishes. It fires on **failure too**, which is the main use: a run that
+  gathers nothing deliberately writes no sidecar, so anything keyed on the
+  sidecar is silent for exactly the runs worth an alert. It never fails the
+  run, is bounded at 10s with no retries, and never logs the URL — most
+  webhook URLs carry their token in the path, and `requests` puts the full URL
+  into the text of every connection error. `FARFETCH_WEBHOOK` in `.env` is
+  preferred over the flag, because argv is readable by anything that can run
+  `ps`.
+
 - **Console scripts.** `pip install .[playwright]` now produces
   `farfetch-scraper`, `farfetch-scraper-playwright`, `-selenium`,
   `-puppeteer`, `-api`, `-diff`, `-fingerprint` and `-env`.

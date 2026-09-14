@@ -220,6 +220,8 @@ The three browser engines share these:
 | `--captcha-api` | `v2` | `v2` (current JSON API) or `v1` (legacy `in.php`) |
 | `--min-score` | `0.7` | reCAPTCHA v3 score to request — `0.3`, `0.7` or `0.9` only |
 | `--allow-empty` | off | Write output even when 0 products were found |
+| `--resume` | off | Continue a run that stopped early, from the checkpoint every multi-page run writes |
+| `--webhook URL` | — | POST the run summary when the run finishes, including when it fails |
 | `--dump-html` | – | Save the exact HTML the parser was given, on success too |
 | `--headless` / `--headful` | headless | Local browser only |
 
@@ -332,9 +334,71 @@ Every run that writes output also writes `<out>.meta.json` beside it:
   "products": 192,
   "start_url": "https://www.farfetch.com/shopping/kids/girls-clothing-4/items.aspx",
   "final_url": "https://www.farfetch.com/de/shopping/kids/girls-clothing-4/items.aspx?page=2",
-  "finished_at": "2026-09-07T12:45:31.199634+00:00"
+  "run_id": "3e4df617423b",
+  "started_at": "2026-09-07T12:45:27.700000+00:00",
+  "finished_at": "2026-09-07T12:45:31.199634+00:00",
+  "duration_s": 3.5,
+  "quality": {
+    "rows": 192,
+    "priced": 0.995,
+    "with_currency": 1.0,
+    "with_title": 1.0,
+    "with_brand": 1.0,
+    "with_image": 0.99,
+    "with_sku": 1.0,
+    "discounted": 0.43,
+    "dom_confirmed_price": 0.87
+  }
 }
 ```
+
+`quality` is coverage of the columns that are allowed to be null, as
+fractions. A run can return the right NUMBER of rows with a column silently
+empty — "96 products" says nothing about whether their prices rendered — so
+the shares are recorded rather than left for each consumer to recompute.
+`dom_confirmed_price` is the one that is provenance rather than coverage: how
+much of the price data was confirmed against a rendered tile instead of taken
+from JSON-LD alone. A drop there is how a snapshot taken too early announces
+itself.
+
+`run_id` is one id per run, logged on the first line and written here, so a
+log line and an artefact can be tied together — "the run that failed" stops
+being identifying once a scraper is on a schedule.
+
+### Resuming a run that stopped early
+
+Every multi-page run writes `<out>.progress.json` after each page, and a run
+that completes deletes it. `--resume` continues from it:
+
+```bash
+python3 playwright_scraper.py --url "$URL" --pages 20      # dies on page 17
+python3 playwright_scraper.py --url "$URL" --pages 20 --resume
+```
+
+It is not behind a flag on the first run on purpose: nobody passes
+`--checkpoint` on the run that is about to be killed, and by the time they
+want it the pages are gone.
+
+Two things it will not do. It refuses a checkpoint written for a **different**
+URL, page count or category, naming the difference — resuming the wrong one
+would merge two categories into one file, which looks like a successful scrape
+of something that was never scraped. And it only skips pages when the
+listing's pagination is **addressable** (`?page=N`): where the site chains
+next-links, page 17 cannot be reached without fetching 16, so it says so and
+re-fetches. Changing `--retries`, `--proxy` or `--concurrency` between the two
+runs is fine — none of them changes what a page contains.
+
+### Telling something else the run finished
+
+`--webhook URL` POSTs the block above, plus `exit_code`, when the run ends.
+
+It fires on **failure too**, which is the main use: a run that gathers nothing
+deliberately writes no sidecar, so anything keyed on the sidecar is silent for
+exactly the runs worth an alert. It never fails the run — an unreachable
+endpoint is a warning and the exit code is untouched — and the URL is never
+logged, because most webhook URLs carry their token in the path. Prefer
+`FARFETCH_WEBHOOK` in `.env` over the flag: argv is readable by anything that
+can run `ps`.
 
 `status` is the field to branch on: `complete` (everything requested was
 fetched, or the site's pagination ran out), `partial` (stopped early), `failed`

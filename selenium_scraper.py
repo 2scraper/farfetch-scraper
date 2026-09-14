@@ -63,7 +63,7 @@ from captcha_solver import (detect_recaptcha_v3, detect_recaptcha_in_page,
 from product_parser import (parse_products, SELECTORS, detect_bot_challenge,
                             describe_block, page_url)
 from output_writer import (dedupe_by_sku, finish_run,
-                           EXIT_DRIVER_TIMEOUT)
+                           EXIT_DRIVER_TIMEOUT, new_run_id)
 from proxy_pool import mask as mask_proxy
 import env_config
 from arg_types import positive_int, nonneg_float
@@ -689,6 +689,12 @@ def handle_captcha_if_present(driver, args) -> None:
 
 
 def scrape(args) -> int:
+    # One id per run, logged here and written into the sidecar, so a
+    # log line and an artefact can be tied together. "the run that
+    # failed" is not identifying for a scraper on a schedule.
+    run_id = new_run_id()
+    started_at = time.time()
+    logger.info("Run %s starting: %s", run_id, args.url)
     all_products = []
     seen_skus = set()
     blocked = False
@@ -823,6 +829,8 @@ def scrape(args) -> int:
 
     return finish_run(all_products, args.out, args.format, args.allow_empty,
                       blocked=blocked, stop_reason=stop_reason,
+                      run_id=run_id, started_at=started_at,
+                      webhook=args.webhook,
                       pages_requested=args.pages, pages_completed=pages_completed,
                       start_url=args.url, final_url=final_url)
 
@@ -869,6 +877,15 @@ def parse_args():
                         f"{DEFAULT_DRIVER_TIMEOUT_LOCAL}s locally (launching a real browser "
                         f"with a fresh profile took 48s on a live run).")
     p.add_argument("--twocaptcha-key", default=None, help="2captcha.com API key")
+    p.add_argument("--webhook", default=None, metavar="URL",
+                   help="POST the run summary (the same fields as the "
+                        ".meta.json sidecar, plus the exit code) to this "
+                        "URL when the run finishes — including when it "
+                        "fails, which is the case worth being told about. "
+                        "Never fails the run, never logged (the URL is "
+                        "usually the credential). Prefer FARFETCH_WEBHOOK "
+                        "in .env over this flag: argv is readable by "
+                        "anything that can run ps.")
     p.add_argument("--allow-empty", action="store_true",
                    help="Write output files even when 0 products were found. Off by "
                         "default so a failed run can't overwrite a good result; exit "

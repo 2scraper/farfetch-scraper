@@ -42,6 +42,7 @@ Requires: pip install -r requirements.txt -r requirements-playwright.txt
 
 import argparse
 import logging
+import os
 import queue
 import sys
 import threading
@@ -58,7 +59,9 @@ from captcha_solver import (detect_recaptcha_v3, detect_recaptcha_in_page,
                             INJECT_TOKEN_JS)
 from product_parser import (parse_products, SELECTORS, detect_bot_challenge,
                             describe_block, page_url)
-from output_writer import dedupe_by_sku, finish_run, stop_reason_for
+from output_writer import (dedupe_by_sku, finish_run, stop_reason_for,
+                           COMPLETE_STOP_REASONS, new_run_id)
+from run_state import Checkpoint
 from proxy_pool import (from_args as proxy_pool_from_args, to_playwright, mask,
                         ROTATE_MODES, ProxyError, ProxyPool)
 import env_config
@@ -727,7 +730,8 @@ def _worker_pool(pool, worker_index: int):
     return ProxyPool(proxies[offset:] + proxies[:offset], rotate="per-run")
 
 
-def _fetch_pages_concurrently(args, pool, specs, concurrency: int):
+def _fetch_pages_concurrently(args, pool, specs, concurrency: int,
+                              checkpoint=None):
     """Fetch `specs` [(page_num, url), ...] across `concurrency` workers.
 
     Each worker owns its own Playwright instance, browser and exit: with the
@@ -765,6 +769,13 @@ def _fetch_pages_concurrently(args, pool, specs, concurrency: int):
                                                   page_num, url)
                         with results_lock:
                             results.append(outcome)
+                            # Written from the COLLECTING side, inside the
+                            # lock that already serialises results — not from
+                            # each worker, which would have several threads
+                            # rewriting one file.
+                            if checkpoint is not None and outcome.ok:
+                                checkpoint.record(page_num, outcome.products,
+                                                  outcome.final_url)
                         if outcome.ok and not outcome.products:
                             logger.info("[%s] page %d returned no products — "
                                         "treating that as the end of the listing "
@@ -795,12 +806,30 @@ def _fetch_pages_concurrently(args, pool, specs, concurrency: int):
 
 
 def scrape(args) -> int:
+    # One id per run, logged here and written into the sidecar, so a
+    # log line and an artefact can be tied together. "the run that
+    # failed" is not identifying for a scraper on a schedule.
+    run_id = new_run_id()
+    started_at = time.time()
+    logger.info("Run %s starting: %s", run_id, args.url)
     # One entry per page attempted, merged after the loop rather than folded
     # into shared state during it — see PageOutcome for why that ordering
     # matters more than it looks.
     outcomes: List[PageOutcome] = []
     seen_skus = set()
     blocked = False
+
+    # Written after every page, always — see run_state.py for why this is not
+    # behind a flag. --resume reads it; a completed run deletes it.
+    checkpoint = Checkpoint(args.out, args)
+    if args.resume:
+        for line in checkpoint.resume():
+            logger.info("%s", line)
+    elif checkpoint.enabled and os.path.exists(checkpoint.path):
+        logger.info("A checkpoint from an earlier run is at %s. It will be "
+                    "overwritten as this run progresses; pass --resume to "
+                    "continue that run instead of restarting it.",
+                    checkpoint.path)
     # Why the loop ended. "completed" means every requested page was
     # fetched; "pagination_exhausted" means the site itself ran out of pages
     # (also a complete result — there was nothing more to get). Anything else
@@ -856,7 +885,31 @@ def scrape(args) -> int:
                 blocked = first.blocked_by is not None
             else:
                 seen_skus.update(p.sku for p in first.products if p.sku is not None)
+                checkpoint.record(1, first.products, first.final_url)
                 planned = _plan_page_urls(session.page, args, first.final_url)
+
+                # Restored pages can only be SKIPPED when pages are
+                # addressable. Page 17's URL is unknowable without visiting
+                # 16 when pagination is a chain of links, so a resume there
+                # would have to walk every page anyway — and quietly not
+                # doing so would produce a run missing its middle. Say it
+                # instead.
+                restorable = [n for n in checkpoint.resumed_from if n >= 2]
+                if restorable and planned is None:
+                    logger.warning("--resume has %d stored page(s), but this "
+                                   "listing's pagination is a chain of links "
+                                   "rather than addressable URLs, so page N "
+                                   "cannot be reached without fetching N-1. "
+                                   "Re-fetching from page 2.", len(restorable))
+                    restorable = []
+                for n in restorable:
+                    outcomes.append(PageOutcome(
+                        page_num=n, url="(restored from checkpoint)",
+                        final_url=checkpoint.final_urls.get(n),
+                        products=checkpoint.pages[n]))
+                    seen_skus.update(p.sku for p in checkpoint.pages[n]
+                                     if p.sku is not None)
+                skip = set(restorable)
 
                 if args.pages > 1 and concurrency > 1 and planned is None:
                     logger.warning("--concurrency %d requested, but this listing's "
@@ -870,12 +923,13 @@ def scrape(args) -> int:
                     # done its job, and holding it open would cost one more
                     # browser than asked for.
                     session.close()
-                    specs = [(n, planned[n - 2]) for n in range(2, args.pages + 1)]
+                    specs = [(n, planned[n - 2]) for n in range(2, args.pages + 1)
+                             if n not in skip]
                     logger.info("Fetching pages 2-%d across %d workers%s.",
                                 args.pages, concurrency,
                                 f" over {len(pool)} exit(s)" if pool else "")
                     rest, unattempted, exhausted = _fetch_pages_concurrently(
-                        args, pool, specs, concurrency)
+                        args, pool, specs, concurrency, checkpoint)
                     outcomes.extend(rest)
 
                     failed = [o for o in rest if not o.ok]
@@ -906,8 +960,17 @@ def scrape(args) -> int:
                             pool.advance(f"per-page rotation, page {page_num}")
                             session.relaunch()
 
+                        if page_num in skip:
+                            # Already held, and addressable, so the next URL
+                            # is constructible without visiting this one.
+                            url = planned[page_num - 1] if page_num < args.pages else url
+                            continue
+
                         outcome = _fetch_one_page(session, args, pool, page_num, url)
                         outcomes.append(outcome)
+                        if outcome.ok:
+                            checkpoint.record(page_num, outcome.products,
+                                              outcome.final_url)
                         if not outcome.ok:
                             stop_reason = stop_reason_for(
                                 load_failed=outcome.load_failed,
@@ -966,11 +1029,24 @@ def scrape(args) -> int:
     final_url = (max(ok_pages, key=lambda o: o.page_num).final_url
                  if ok_pages else args.url)
 
-    return finish_run(all_products, args.out, args.format, args.allow_empty,
-                      blocked=blocked, stop_reason=stop_reason,
-                      pages_requested=args.pages, pages_completed=len(ok_pages),
-                      pages_failed=failed_pages,
-                      start_url=args.url, final_url=final_url)
+    rc = finish_run(all_products, args.out, args.format, args.allow_empty,
+                    blocked=blocked, stop_reason=stop_reason,
+                      run_id=run_id, started_at=started_at,
+                      webhook=args.webhook,
+                    pages_requested=args.pages, pages_completed=len(ok_pages),
+                    pages_failed=failed_pages,
+                    start_url=args.url, final_url=final_url)
+
+    # Only a run that saw everything drops its checkpoint. A partial or failed
+    # run keeps it — that is the run --resume exists for, and deleting it here
+    # would throw away the pages it did get.
+    if stop_reason in COMPLETE_STOP_REASONS and all_products:
+        checkpoint.clear()
+    elif checkpoint.enabled and checkpoint.pages:
+        logger.info("Checkpoint kept at %s (%d page(s)) — re-run the same "
+                    "command with --resume to continue from there.",
+                    checkpoint.path, len(checkpoint.pages))
+    return rc
 
 
 def parse_args():
@@ -1013,6 +1089,23 @@ def parse_args():
                         "this many OTHER exits before giving up (default 2). "
                         "Needs a pool of more than one; ignored otherwise.")
     p.add_argument("--twocaptcha-key", default=None, help="2captcha.com API key")
+    p.add_argument("--resume", action="store_true",
+                   help="Continue a run that stopped early, using the "
+                        "<out>.progress.json checkpoint every multi-page run "
+                        "writes. Pages already held are not fetched again. "
+                        "Refused if the checkpoint is for a different URL, "
+                        "page count or category. Only skips pages when the "
+                        "listing's pagination is addressable (?page=N) — a "
+                        "chain of next-links has to be walked in order.")
+    p.add_argument("--webhook", default=None, metavar="URL",
+                   help="POST the run summary (the same fields as the "
+                        ".meta.json sidecar, plus the exit code) to this "
+                        "URL when the run finishes — including when it "
+                        "fails, which is the case worth being told about. "
+                        "Never fails the run, never logged (the URL is "
+                        "usually the credential). Prefer FARFETCH_WEBHOOK "
+                        "in .env over this flag: argv is readable by "
+                        "anything that can run ps.")
     p.add_argument("--allow-empty", action="store_true",
                    help="Write output files even when 0 products were found. Off by "
                         "default so a failed run can't overwrite a good result with "

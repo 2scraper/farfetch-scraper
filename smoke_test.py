@@ -17,6 +17,7 @@ import argparse
 import contextlib
 import io
 import json
+import logging
 import os
 import re
 import builtins
@@ -1352,6 +1353,113 @@ def main() -> int:
                     "can fail out of order",
                     "pages_failed=failed_pages" in _src)
 
+        # --- the checkpoint: resume without re-fetching ------------------
+        # A run that dies on page 17 of 20 used to start again at page 1. The
+        # checkpoint is written after EVERY page and always, never behind a
+        # flag — nobody passes --checkpoint on the run that is about to be
+        # killed, and by then the pages are gone.
+        import run_state as _rs
+
+        class _Args:
+            def __init__(self, url="https://www.farfetch.com/shopping/kids/items.aspx",
+                         pages=5, category="Kids", out="x"):
+                self.url, self.pages, self.category, self.out = url, pages, category, out
+
+        with tempfile.TemporaryDirectory() as _tmp:
+            _pfx = os.path.join(_tmp, "run")
+            _a = _Args(out=_pfx)
+            _cp = _rs.Checkpoint(_pfx, _a)
+            _p1 = [Product(sku="a", price=1.0), Product(sku="b", price=2.0)]
+            _p2 = [Product(sku="c", price=3.0)]
+            _cp.record(1, _p1, "https://x/1")
+            _cp.record(2, _p2, "https://x/2")
+
+            ok &= check("the checkpoint is on disk after each page, not at the "
+                        "end — the run it exists for is the one that never "
+                        "reaches the end",
+                        os.path.exists(_rs.path_for(_pfx)))
+
+            _cp2 = _rs.Checkpoint(_pfx, _Args(out=_pfx))
+            _msg = _cp2.resume()
+            ok &= check("...and a fresh Checkpoint restores those pages, in "
+                        "page order, with their products intact",
+                        _cp2.resumed_from == [1, 2]
+                        and [p.sku for p in _cp2.products_in_page_order()]
+                        == ["a", "b", "c"])
+            ok &= check("...saying which pages it restored, rather than "
+                        "resuming silently",
+                        any("1-2" in m for m in _msg))
+
+            # The whole risk of resume in one check. Mixing two categories
+            # into one file looks like a successful scrape of something that
+            # was never scraped — worse than any crash.
+            _other = _rs.Checkpoint(_pfx, _Args(url="https://www.farfetch.com/shopping/women/items.aspx",
+                                                out=_pfx))
+            _m2 = _other.resume()
+            ok &= check("a checkpoint for a DIFFERENT url is refused, and the "
+                        "message names the difference",
+                        _other.resumed_from == []
+                        and any("DIFFERENT run" in m and "start_url" in m
+                                for m in _m2))
+
+            _diff_pages = _rs.Checkpoint(_pfx, _Args(pages=9, out=_pfx))
+            ok &= check("...so is one for a different page count",
+                        _diff_pages.resume() and _diff_pages.resumed_from == [])
+            _diff_cat = _rs.Checkpoint(_pfx, _Args(category="Women", out=_pfx))
+            ok &= check("...and one for a different category label",
+                        _diff_cat.resume() and _diff_cat.resumed_from == [])
+
+            # Retry/proxy settings are exactly what a person changes between
+            # the crash and the retry. Refusing on those would refuse every
+            # real resume.
+            _a_retry = _Args(out=_pfx)
+            _a_retry.retries, _a_retry.proxy = 99, "http://x:1"
+            ok &= check("changing --retries or --proxy does NOT invalidate a "
+                        "checkpoint — neither changes what a page contains",
+                        _rs.identity(_a_retry) == _rs.identity(_a))
+
+            _bumped = json.loads(open(_rs.path_for(_pfx), encoding="utf-8").read())
+            _bumped["format_version"] = _rs.FORMAT_VERSION + 1
+            with open(_rs.path_for(_pfx), "w", encoding="utf-8") as _f:
+                json.dump(_bumped, _f)
+            _oldfmt = _rs.Checkpoint(_pfx, _Args(out=_pfx))
+            ok &= check("a checkpoint from a build whose Product had other "
+                        "columns is refused, not fed to the dataclass",
+                        _oldfmt.resume() and _oldfmt.resumed_from == [])
+
+            with open(_rs.path_for(_pfx), "w", encoding="utf-8") as _f:
+                _f.write('{"format_version": 1, "pages": {"1": ')   # truncated
+            _trunc = _rs.Checkpoint(_pfx, _Args(out=_pfx))
+            ok &= check("a truncated checkpoint (the process died mid-write) "
+                        "is reported and skipped, never crashes the resume",
+                        _trunc.resume() and _trunc.resumed_from == [])
+
+            _cp.clear()
+            ok &= check("a completed run deletes its checkpoint — a stale one "
+                        "would offer to resume a run that is already done",
+                        not os.path.exists(_rs.path_for(_pfx)))
+
+            _single = _rs.Checkpoint(_pfx, _Args(pages=1, out=_pfx))
+            _single.record(1, _p1)
+            ok &= check("a single-page run writes no checkpoint at all — there "
+                        "is no page to resume to",
+                        not os.path.exists(_rs.path_for(_pfx)))
+
+            _creds = _Args(url="https://user:secret@www.farfetch.com/x", out=_pfx)
+            ok &= check("a URL carrying credentials is masked before it is "
+                        "written to disk",
+                        "secret" not in json.dumps(_rs.identity(_creds)))
+
+        ok &= check("playwright only SKIPS a stored page when pagination is "
+                    "addressable — page 17 is unreachable without 16 when the "
+                    "site chains next-links, and silently not fetching it "
+                    "would produce a run missing its middle",
+                    "restorable and planned is None" in _src)
+        ok &= check("a partial run KEEPS its checkpoint; only a complete one "
+                    "clears it",
+                    "if stop_reason in COMPLETE_STOP_REASONS and all_products:"
+                    in _src)
+
         # Phase 2: each worker owns a browser AND an exit for its lifetime.
         import proxy_pool as _pp_here
         _shared = _pp_here.ProxyPool(["http://a:1", "http://b:2", "http://c:3"])
@@ -1915,7 +2023,8 @@ def main() -> int:
     # finish_run writes a sidecar recording that, and diff_runs refuses.
     from output_writer import (finish_run, EXIT_PARTIAL,
                                EXIT_FETCH_FAILED, COMPLETE_STOP_REASONS,
-                               FETCH_FAILURE_STOP_REASONS, stop_reason_for)
+                               FETCH_FAILURE_STOP_REASONS, stop_reason_for,
+                               quality_metrics, new_run_id)
     import diff_runs as _dr
 
     ok &= check("EXIT_PARTIAL (6) is distinct from 0, EXIT_BLOCKED and "
@@ -2015,6 +2124,122 @@ def main() -> int:
                     "(files written before run metadata existed)",
                     _dr._check_comparable(_A(os.path.join(tmp, "nope.json"),
                                              os.path.join(tmp, "nope2.json"))) is True)
+
+    # --- run metadata: id, timings, quality ------------------------------
+    _rows = [Product(sku="a", price=1.0, currency="USD", title="t",
+                     brand="b", image_url="i", price_source="jsonld+dom"),
+             Product(sku="b", price=None, currency=None, title=None)]
+    _q = quality_metrics(_rows)
+    ok &= check("quality metrics are FRACTIONS, not counts — a count has to "
+                "be read against the row total to mean anything, and a "
+                "fraction is what a threshold compares against",
+                _q["rows"] == 2 and _q["priced"] == 0.5
+                and _q["dom_confirmed_price"] == 0.5
+                and _q["with_currency"] == 0.5)
+    ok &= check("...and an empty result reports rows=0 rather than dividing "
+                "by it",
+                quality_metrics([]) == {"rows": 0})
+    ok &= check("two runs get two different run ids — two runs of the same "
+                "command ARE different runs, which is the thing being "
+                "identified",
+                new_run_id() != new_run_id() and len(new_run_id()) == 12)
+
+    # --- the webhook ------------------------------------------------------
+    # Three properties, each because the obvious version gets it wrong.
+    import notify as _nf
+
+    _hook = "https://hooks.slack.com/services/T00000000/B00000000/SECRETTOKEN"
+    ok &= check("a webhook URL is described by scheme and host only — most "
+                "carry their token in the PATH, so logging the URL publishes "
+                "the credential",
+                "SECRETTOKEN" not in _nf.describe(_hook)
+                and "hooks.slack.com" in _nf.describe(_hook))
+
+    class _Boom:
+        def post(self, *a, **k):
+            # requests puts the FULL url, query string included, into the text
+            # of its connection errors. This is that, exactly.
+            raise RuntimeError(f"Failed to establish a new connection: {_hook}")
+
+    class _Rejects:
+        status_code = 500
+
+        def post(self, *a, **k):
+            return self
+
+    class _Accepts:
+        status_code = 204
+        sent = None
+
+        def post(self, url, data=None, headers=None, timeout=None):
+            _Accepts.sent = (url, json.loads(data.decode()), timeout)
+            return self
+
+    _real_import = builtins.__import__
+
+    def _with_requests(stub):
+        def _imp(name, *a, **k):
+            if name == "requests":
+                return stub
+            return _real_import(name, *a, **k)
+        return _imp
+
+    for _stub, _expect, _label in (
+            (_Boom(), False, "an unreachable endpoint"),
+            (_Rejects(), False, "an endpoint answering HTTP 500"),
+            (_Accepts(), True, "a working endpoint")):
+        _buf = io.StringIO()
+        _h = logging.StreamHandler(_buf)
+        _nf.logger.addHandler(_h)
+        builtins.__import__ = _with_requests(_stub)
+        try:
+            _delivered = _nf.send(_hook, {"status": "failed"}, 3)
+        finally:
+            builtins.__import__ = _real_import
+            _nf.logger.removeHandler(_h)
+        _logged = _buf.getvalue()
+        ok &= check(f"webhook: {_label} never raises, and never puts the URL "
+                    f"in the log",
+                    _delivered is _expect and "SECRETTOKEN" not in _logged)
+
+    ok &= check("webhook: the payload carries the exit code alongside the "
+                "metadata — that is the field an alerting rule branches on, "
+                "and it is not otherwise in the sidecar",
+                _Accepts.sent is not None
+                and _Accepts.sent[1]["exit_code"] == 3
+                and _Accepts.sent[1]["status"] == "failed")
+    ok &= check("webhook: the POST is bounded, so a hung endpoint cannot hold "
+                "the process open after the data is on disk",
+                _Accepts.sent[2] == _nf.TIMEOUT_S)
+    ok &= check("webhook: no URL means no attempt at all",
+                _nf.send(None, {}, 0) is False)
+
+    # It fires on FAILURE too, which is the main use: finish_run deliberately
+    # writes no sidecar for a run that gathered nothing, so a webhook keyed on
+    # the sidecar would be silent for exactly the runs worth hearing about.
+    _fired = {}
+
+    def _capture(url, meta, rc):
+        _fired["meta"], _fired["rc"] = meta, rc
+        return True
+
+    _real_send = _nf.send
+    _nf.send = _capture
+    try:
+        with tempfile.TemporaryDirectory() as _t:
+            _rc = finish_run([], os.path.join(_t, "n"), "json", False,
+                             blocked=True, stop_reason="blocked_akamai",
+                             pages_requested=1, pages_completed=0,
+                             start_url="u", final_url="u",
+                             webhook="https://example.invalid/hook")
+    finally:
+        _nf.send = _real_send
+    ok &= check("webhook fires for a run that wrote NOTHING — the sidecar is "
+                "deliberately absent there, so a webhook keyed on the sidecar "
+                "would miss every run worth an alert",
+                _fired.get("rc") == EXIT_BLOCKED
+                and _fired["meta"]["status"] == "failed"
+                and _fired["meta"]["stop_reason"] == "blocked_akamai")
 
     ok &= check("EXIT_FETCH_FAILED (5) is distinct from every other code in "
                 "the contract",

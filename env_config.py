@@ -40,6 +40,10 @@ ENV_KEYS = {
     "FARFETCH_CDP_ENDPOINT": "cdp_endpoint",
     "FARFETCH_PROXY": "proxy",
     "FARFETCH_URL": "url",
+    # A webhook URL is usually a credential (Slack and Discord put the
+    # token in the path), which is precisely why it belongs here rather
+    # than on a command line where `ps` can read it.
+    "FARFETCH_WEBHOOK": "webhook",
 }
 # Deliberately NOT here: an output prefix. `--out` already carries a non-empty
 # default, so `apply()` would never see it as unset and the variable would be
