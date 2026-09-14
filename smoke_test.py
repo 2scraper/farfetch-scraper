@@ -13,6 +13,8 @@ your Python environment and the parsing/output logic are working:
 Exits non-zero on any failure so it's CI-friendly.
 """
 
+import contextlib
+import io
 import json
 import os
 import re
@@ -2306,6 +2308,87 @@ def main() -> int:
                     or "ci_checks.py --all" in _wf)
         ok &= check("...and carries no second, narrower inline credential "
                     "grep", "(ws|wss)://[^ " not in _wf)
+
+    # --- canary.yml: the exit-code table it prints must be the engines' ----
+    # The 2026-09-11 audit found the canary announcing "exit 124 — self-imposed
+    # timeout" for a code no engine has ever returned, while having no entry
+    # for 5 or 6 at all. Nothing executed that table, so it drifted silently
+    # for months and a fetch failure was reported as an unknown code. It now
+    # lives in a shipped script that imports the constants, and this pins both
+    # halves: the table agrees with output_writer, and the workflow calls the
+    # script instead of reimplementing a copy of it.
+    _canary_script = os.path.join(_repo_root, ".github", "canary_check.py")
+    ok &= check("canary_check.py is present", os.path.exists(_canary_script))
+    if os.path.exists(_canary_script):
+        sys.path.insert(0, os.path.join(_repo_root, ".github"))
+        import canary_check as _cc
+        from output_writer import EXIT_DRIVER_TIMEOUT
+
+        _contract = {0, 1, 2, EXIT_BLOCKED, EXIT_NO_PRODUCTS,
+                     EXIT_FETCH_FAILED, EXIT_PARTIAL, EXIT_DRIVER_TIMEOUT}
+        ok &= check("the canary's exit-code table covers every code the "
+                    "contract defines — no code can fall through to "
+                    "'unexpected'",
+                    _contract <= set(_cc.EXIT_MEANINGS))
+        ok &= check("...and invents none: every key is a code some engine "
+                    "really returns",
+                    set(_cc.EXIT_MEANINGS) == _contract)
+        ok &= check("124 is named, not a magic number — selenium_scraper uses "
+                    "the shared constant, so the table cannot come to describe "
+                    "something else (it used to say 'the page never became "
+                    "ready'; it is chromedriver failing to START)",
+                    EXIT_DRIVER_TIMEOUT == 124
+                    and "_leave_now(124)" not in open(
+                        os.path.join(_repo_root, "selenium_scraper.py"),
+                        encoding="utf-8").read())
+        # Output is swallowed while probing: check_exit_code PRINTS
+        # "::error::..." lines, and this suite runs inside tests.yml, where
+        # GitHub turns that prefix into a workflow annotation. A green run
+        # that annotates itself with six errors is worse than no check.
+        def _verdict(code, allow_block):
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                return _cc.check_exit_code(code, allow_block=allow_block)
+
+        ok &= check("a clean run is the only code the canary passes on when a "
+                    "block is NOT excused",
+                    _verdict(0, False) == 0
+                    and all(_verdict(c, False) == 1
+                            for c in (1, 2, EXIT_BLOCKED, EXIT_NO_PRODUCTS,
+                                      EXIT_FETCH_FAILED, EXIT_PARTIAL)))
+        ok &= check("--allow-block excuses a BLOCK and nothing else — a "
+                    "datacentre refusal says nothing about the site, but 0 "
+                    "products on a page that loaded still does",
+                    _verdict(EXIT_BLOCKED, True) == 0
+                    and all(_verdict(c, True) == 1
+                            for c in (1, 2, EXIT_NO_PRODUCTS,
+                                      EXIT_FETCH_FAILED, EXIT_PARTIAL)))
+
+        _cwf = open(os.path.join(_repo_root, ".github", "workflows",
+                                 "canary.yml"), encoding="utf-8").read()
+        ok &= check("canary.yml calls the shipped script rather than carrying "
+                    "its own copy of the table",
+                    "canary_check.py --exit-code" in _cwf
+                    and "case \"$code\" in" not in _cwf)
+        # Comment lines are excluded on purpose: the header explains what the
+        # old commented-out --proxy line was and why it is gone, and prose
+        # about a flag cannot leak a credential. Only an executable line can.
+        _cwf_code = [ln for ln in _cwf.splitlines()
+                     if not ln.lstrip().startswith("#")]
+        ok &= check("the canary never puts the proxy credential in argv — it "
+                    "goes through the environment env_config.py already "
+                    "reads (CLAUDE.md §3, §11)",
+                    not any("--proxy" in ln for ln in _cwf_code)
+                    and "FARFETCH_PROXY: ${{ secrets.FARFETCH_PROXY }}" in _cwf)
+        ok &= check("the proxy-backed job SKIPS rather than fails when the "
+                    "secret is absent — a check that is red every morning is "
+                    "a check nobody reads",
+                    "HAVE_PROXY: ${{ secrets.FARFETCH_PROXY != '' }}" in _cwf
+                    and "::notice::Skipped" in _cwf)
+        ok &= check("BOTH canary jobs exercise pagination (--pages 3): with "
+                    "one page a dead next-link stays invisible, which is how "
+                    "the silent-single-page bug survived once already",
+                    sum(1 for ln in _cwf_code if "--pages 3" in ln) == 2)
 
     # `--fp-tags` MUST DEFAULT TO ONE OS-FAMILY TAG. It shipped as
     # "Windows,Chrome,Desktop", which the fingerprint API rejects with HTTP

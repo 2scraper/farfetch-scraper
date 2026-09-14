@@ -6,6 +6,93 @@ All notable changes to this project are documented here. Format follows
 library with a stable API) reasonably can — a patch bump means "fixes", not
 a promise that every flag and exit code is contractually frozen.
 
+## [Unreleased]
+
+> **Behaviour change for existing callers.** A run that gathered nothing and
+> was never able to fetch the page now exits **5**, where it used to exit 4.
+> If your automation branches on 4 meaning "anything went wrong", it needs
+> the new row. The reason for the change is that 4 was never able to mean
+> what it said: read the exit-code table in the README.
+
+### Fixed
+
+- **Akamai's "Access Denied" page was not recognised as a block.** Every
+  request to farfetch.com from a datacentre address returns 318–426 bytes
+  under HTTP 403 — a title, a refusal sentence, and an `errors.edgesuite.net`
+  reference. It carries none of the challenge markers this parser knew, which
+  describe Akamai's *challenge* page, so `detect_bot_challenge()` returned
+  `None` and a plainly blocked run exited **4**, telling the caller the
+  category was empty. Reproduced live on 2026-09-14 (exit 4) and re-run after
+  the fix (exit 3).
+
+  Two details are pinned by fixtures because both are easy to get wrong:
+
+  - The same page reaches the parser in **two spellings**. Akamai
+    entity-escapes the punctuation on the wire
+    (`errors&#46;edgesuite&#46;net`), while a browser parses it and
+    `page.content()` serialises it back out plain. A literal
+    `errors.edgesuite.net` marker therefore matches the three browser engines
+    and silently misses `scraper_api_client` — measured 0 occurrences in the
+    raw form. Entities are normalised before matching.
+  - Only `errors.edgesuite.net` is matched, never a bare `edgesuite`:
+    edgesuite.net is also an ordinary Akamai *asset* domain, and a marker
+    that fires on a good page is worse than no marker. Counted at zero on all
+    seven real-capture fixtures in the suite.
+
+- **A run that never got the page reported "0 products".** A navigation
+  timeout, a dead or unauthenticated proxy and a genuinely empty category
+  were one value to an automated caller, which wants three different
+  responses. They are now `5`, `5` and `4` respectively, and a dead exit is
+  recorded as `proxy_unusable` rather than as a timeout.
+
+  `5` rather than a new code: the contract already reserved it for a failed
+  transport, and the browser engines simply had no way to say so.
+  `scraper_api_client`'s `EXIT_API_ERROR` is now an alias of the shared
+  constant, so there is one definition of 5 instead of two that can drift.
+
+- **The canary interpreted exit codes it no longer matched.** Its table had
+  no entry for 5 or 6, so a fetch failure was announced as an unknown code,
+  and it explained 124 as "the page never became ready" — which is wrong
+  twice: 124 is Selenium's watchdog for *chromedriver failing to start*, and
+  the canary runs Playwright. Nothing executed that table, so it drifted
+  silently. It now lives in `.github/canary_check.py`, which imports the
+  constants and is asserted against them by the offline suite.
+
+- **The canary's proxy secret was a commented-out `--proxy` line**, so
+  enabling it meant setting a secret *and* remembering to edit the workflow —
+  and would have put a credential in `argv`. It goes through the environment
+  `env_config.py` already reads.
+
+### Changed
+
+- **The canary is two signals instead of one.** `reachability-no-proxy` runs
+  free every day and reports a *block* as a skip with a notice rather than a
+  failure: from a GitHub runner — a datacentre address — a refusal says
+  something about the address, not about Farfetch, and a check that is red
+  every morning is one everybody learns to ignore. Everything else still
+  fails it. `production-like` is the authoritative signal, runs only when
+  `FARFETCH_PROXY` is set, skips with a notice when it is not, and is strict
+  about a block too, because from a residential exit a block *is* news.
+
+- **An error status skips the readiness wait.** Playwright was discarding the
+  `Response` that `goto()` returns, and with it the most reliable signal a
+  refusing edge gives. It now records the status; a 4xx/5xx is not a page
+  waiting to paint, so the 20-second wait for product markers — previously
+  spent on every attempt of every page of a blocked run — is skipped. A 4xx
+  whose body names no known vendor is reported as a fetch failure rather than
+  as a block: we know it is not the listing, but not who refused us.
+
+- Selenium's `124` is now the named `EXIT_DRIVER_TIMEOUT` rather than a magic
+  number, which is how the canary came to describe it as something else.
+
+- All three engines describe a block through one shared `describe_block()`,
+  so a refusal is no longer logged as a "challenge page" — wording that sends
+  the reader looking for a widget that is not there.
+
+### Testing
+
+- Offline suite: **274 checks**, up from 232.
+
 ## [0.4.3] — 2026-09-11
 
 ### Fixed

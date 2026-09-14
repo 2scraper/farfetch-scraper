@@ -62,7 +62,8 @@ from captcha_solver import (detect_recaptcha_v3, detect_recaptcha_in_page,
                             INJECT_TOKEN_JS, RECAPTCHA_DISCOVERY_JS)
 from product_parser import (parse_products, SELECTORS, detect_bot_challenge,
                             describe_block, page_url)
-from output_writer import dedupe_by_sku, finish_run
+from output_writer import (dedupe_by_sku, finish_run,
+                           EXIT_DRIVER_TIMEOUT)
 from proxy_pool import mask as mask_proxy
 import env_config
 
@@ -689,7 +690,7 @@ def scrape(args) -> None:
         driver = build_driver_with_timeout(args)
     except DriverTimeout as e:
         logger.error("%s", e)
-        _leave_now(124)
+        _leave_now(EXIT_DRIVER_TIMEOUT)
     except Exception as e:  # noqa: BLE001
         # The alarm may have been laundered into someone else's exception type
         # on the way out (see _timed_out). If it was, report it as the timeout
@@ -698,7 +699,7 @@ def scrape(args) -> None:
             logger.error("%s", _timeout_message())
             logger.error("(surfaced as %s — Selenium re-raised the timeout as its own error)",
                          type(e).__name__)
-            _leave_now(124)
+            _leave_now(EXIT_DRIVER_TIMEOUT)
         raise
     wait = WebDriverWait(driver, 20)
 

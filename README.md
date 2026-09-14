@@ -242,16 +242,35 @@ A contract, not decoration — the harness and any pipeline can branch on these.
 | `0` | Products written |
 | `1` | Unhandled error |
 | `2` | Bad usage |
-| `3` | Blocked before parsing — a bot-check or challenge page |
-| `4` | Ran fine, parsed **0 products** |
-| `5` | Remote API returned an error |
+| `3` | **Blocked before parsing** — a challenge page, or an outright refusal |
+| `4` | Fetched the page fine, parsed **0 products** |
+| `5` | **Never got the page** — navigation timeout, dead proxy, 4xx/5xx, or a Scraper API error |
 | `6` | **Partial run** — products written, but the page loop stopped early |
-| `124` | Self-imposed timeout expired |
+| `124` | Selenium only: chromedriver could not be **started** within the watchdog |
+
+**Exit 4 means the page loaded.** This is the one code that says something
+about the catalogue, and it only fires when the run really got the page,
+really parsed it, and it really held nothing. A run that was refused exits 3;
+a run that never obtained the page exits 5. Those three used to be one value,
+so a dead proxy and an empty category were indistinguishable to an automated
+caller — which wants three different responses:
+
+| Code | What to do about it |
+|---|---|
+| `3` | Change exit address. Retrying the same one only confirms the block. |
+| `4` | Accept the answer, or check the URL — a bare hub URL legitimately returns 0. |
+| `5` | Check your own side first: the proxy, the network, the endpoint. Retry is usually reasonable. |
+
+Exit 3 covers both shapes a block takes, and the log says which. A **challenge**
+page ships a widget and may be solvable; a **refusal** (Akamai's 318-byte
+`Access Denied`, which is what farfetch.com returns to a datacentre address)
+has nothing to solve, so only a different exit changes it.
 
 **Exit 4 writes nothing.** A run that finds nothing leaves the previous output
 file intact rather than replacing it with `[]`, because a consumer cannot tell an
 empty category from a failed run. Pass `--allow-empty` when empty is the expected
-answer; it writes the file and still exits 4.
+answer; it writes the file and still exits 4. Exits 3 and 5 write nothing
+either, and for the same reason.
 
 **Exit 6 writes what it got.** A timeout or a challenge on page 3 of 10 still
 saves the first two pages — discarding good data would be worse — but the result

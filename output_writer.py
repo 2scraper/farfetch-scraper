@@ -126,6 +126,17 @@ EXIT_PARTIAL = 6
 # This only decides what a run holding nothing reports.
 EXIT_FETCH_FAILED = 5
 
+# Exit code for Selenium's driver-startup watchdog: chromedriver could not be
+# BUILT within the timeout, so no page was ever requested. 124 because that is
+# what `timeout(1)` uses and what a harness already understands.
+#
+# Named here rather than spelled 124 inside selenium_scraper because it is
+# part of the documented contract: the canary's exit-code table explained it
+# as "the page never became ready", which is the wrong cause entirely, and a
+# magic number in one engine is how a table comes to describe something else.
+# Unreachable from the other engines, which have no separate driver to start.
+EXIT_DRIVER_TIMEOUT = 124
+
 
 # Stop reasons that mean the run never obtained the page, as opposed to
 # obtaining it and finding nothing on it. Kept as data next to the exit code
