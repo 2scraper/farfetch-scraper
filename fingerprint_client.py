@@ -73,6 +73,7 @@ from typing import Optional
 import requests
 
 import env_config
+from arg_types import positive_int
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger("fingerprint_client")
@@ -362,8 +363,8 @@ def main() -> int:
                         "are rejected by the API with 400, and no combination "
                         "is accepted. Use --country to narrow further.")
     p.add_argument("--country", default=None, help="ISO 3166-1 alpha-2, e.g. us")
-    p.add_argument("--min-browser-version", type=int, default=None)
-    p.add_argument("--browser-version", type=int, default=None)
+    p.add_argument("--min-browser-version", type=positive_int, default=None)
+    p.add_argument("--browser-version", type=positive_int, default=None)
     p.add_argument("--build-version", default=None, help="/generate only, e.g. 145.0.7632.162")
     p.add_argument("--format", dest="fmt", choices=["chromium", "raw"], default="chromium")
     p.add_argument("--generate", action="store_true",

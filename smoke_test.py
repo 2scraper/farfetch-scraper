@@ -13,6 +13,7 @@ your Python environment and the parsing/output logic are working:
 Exits non-zero on any failure so it's CI-friendly.
 """
 
+import argparse
 import contextlib
 import io
 import json
@@ -1372,7 +1373,7 @@ def main() -> int:
         # level because they are one-line decisions with no return value.
         ok &= check("concurrency defaults to 1, so the default run is exactly "
                     "the sequential one",
-                    '"--concurrency", type=int, default=1' in _src)
+                    '"--concurrency", type=positive_int, default=1' in _src)
         ok &= check("raising concurrency without a proxy pool warns that every "
                     "worker leaves from the same address",
                     "with no proxy pool: every worker" in _src)
@@ -2389,6 +2390,209 @@ def main() -> int:
                     "one page a dead next-link stays invisible, which is how "
                     "the silent-single-page bug survived once already",
                     sum(1 for ln in _cwf_code if "--pages 3" in ln) == 2)
+
+    # --- numeric flags are range-checked, in every CLI ---------------------
+    # `--retries 0` was accepted by all three browser engines, and the attempt
+    # loop is `range(1, retries + 1)` — so zero attempts means page.goto() is
+    # never called. The run parsed about:blank (39 bytes, measured 2026-09-14
+    # against a page that returns 559 with --retries 1) and exited 4, "the
+    # page was fetched and held nothing". A wrong answer reached by typing a
+    # number, which is the bug class this repo cares about most.
+    #
+    # The validators live in arg_types.py and are attached as argparse
+    # `type=` callables, so argparse produces the usage error and exit 2
+    # itself, before a browser is launched. The risk that then remains is
+    # DRIFT — a numeric flag added later with a bare `type=int`. This walks
+    # every CLI's AST and closes it.
+    import ast as _ast
+    import arg_types as _at
+
+    _clis = ["playwright_scraper.py", "selenium_scraper.py",
+             "puppeteer_scraper.py", "scraper_api_client.py",
+             "diff_runs.py", "fingerprint_client.py"]
+    _unguarded = []
+    _guarded = 0
+    for _name in _clis:
+        _tree = _ast.parse(open(os.path.join(_repo_root, _name),
+                                encoding="utf-8").read())
+        for _node in _ast.walk(_tree):
+            if not (isinstance(_node, _ast.Call)
+                    and isinstance(_node.func, _ast.Attribute)
+                    and _node.func.attr == "add_argument"):
+                continue
+            _flag = next((a.value for a in _node.args
+                          if isinstance(a, _ast.Constant)
+                          and isinstance(a.value, str)
+                          and a.value.startswith("--")), None)
+            _type = next((k.value for k in _node.keywords if k.arg == "type"),
+                         None)
+            if _flag is None or _type is None:
+                continue
+            # A bare `int`/`float` is the shape being hunted.
+            if isinstance(_type, _ast.Name) and _type.id in ("int", "float"):
+                if _flag not in _at.UNVALIDATED_OK:
+                    _unguarded.append(f"{_name} {_flag}")
+            elif (isinstance(_type, _ast.Name) and _type.id in _at.VALIDATORS):
+                _guarded += 1
+            elif (isinstance(_type, _ast.Call)
+                  and isinstance(_type.func, _ast.Name)
+                  and _type.func.id == "bounded_int"):
+                _guarded += 1
+
+    ok &= check(f"every numeric CLI flag is range-checked ({_guarded} guarded; "
+                f"unguarded: {_unguarded or 'none'}) — a bare type=int is how "
+                f"--retries 0 came to mean 'never fetch the page'",
+                not _unguarded)
+    ok &= check("...and at least one flag in each browser engine is actually "
+                "guarded, so the walk above is finding call sites rather than "
+                "quietly matching nothing",
+                _guarded >= 15)
+
+    # Zero is allowed exactly where it names a real behaviour and refused
+    # where it names none. Pinned in both directions: a validator that
+    # rejects everything would pass a one-sided check.
+    for _fn, _good, _bad in (
+            (_at.positive_int, ("1", "50"), ("0", "-1", "x")),
+            (_at.nonneg_int, ("0", "3"), ("-1", "x")),
+            (_at.nonneg_float, ("0", "0.0", "2.5"), ("-0.1", "x")),
+            (_at.bounded_int(1, 120), ("1", "120", "60"), ("0", "121", "x"))):
+        _name = getattr(_fn, "__name__", "?")
+        _ok_good = all(_fn(v) is not None for v in _good)
+        _ok_bad = True
+        for v in _bad:
+            try:
+                _fn(v)
+                _ok_bad = False
+            except argparse.ArgumentTypeError:
+                pass
+        ok &= check(f"{_name}: accepts {_good} and refuses {_bad}",
+                    _ok_good and _ok_bad)
+
+    # --- the Dockerfile's COPY list vs the entrypoint's import graph -------
+    # An explicit COPY list is right — the image should carry no test suite
+    # and no stray .env — but it falls behind, and CI is the only thing that
+    # builds the image. Every repo in this family has shipped an image that
+    # died with ModuleNotFoundError on every invocation, --help included,
+    # because one module was missing from that list (CLAUDE.md §10). This
+    # check needs no Docker, and it is what catches a module added today.
+    _dockerfile = open(os.path.join(_repo_root, "Dockerfile"),
+                       encoding="utf-8").read()
+    _copied = set(re.findall(r"([A-Za-z_][A-Za-z0-9_]*\.py)", _dockerfile))
+
+    # Walk the entrypoint's imports transitively, keeping only modules that
+    # are files in this repo.
+    _local = {f[:-3] for f in os.listdir(_repo_root) if f.endswith(".py")}
+    _needed, _queue = set(), ["playwright_scraper"]
+    while _queue:
+        _mod = _queue.pop()
+        if _mod in _needed or _mod not in _local:
+            continue
+        _needed.add(_mod)
+        _t = _ast.parse(open(os.path.join(_repo_root, _mod + ".py"),
+                             encoding="utf-8").read())
+        for _n in _ast.walk(_t):
+            if isinstance(_n, _ast.Import):
+                _queue += [a.name.split(".")[0] for a in _n.names]
+            elif isinstance(_n, _ast.ImportFrom) and _n.level == 0 and _n.module:
+                _queue.append(_n.module.split(".")[0])
+
+    _missing = sorted(m for m in _needed if m + ".py" not in _copied)
+    ok &= check(f"the Dockerfile COPYs every module its entrypoint imports "
+                f"(needs {len(_needed)}; missing: {_missing or 'none'}) — a "
+                f"module left out breaks the image on EVERY invocation, "
+                f"--help included",
+                not _missing)
+    ok &= check("...and still carries no test suite or fixtures into the "
+                "image",
+                "smoke_test.py" not in _copied and "tests" not in _dockerfile)
+
+    # pyproject lists the same flat modules. A new module missing here
+    # installs a package whose console script cannot import itself.
+    _pyproject = open(os.path.join(_repo_root, "pyproject.toml"),
+                      encoding="utf-8").read()
+    _declared = set(re.findall(r'^\s*"([a-z_]+)",\s*$', _pyproject, re.M))
+    _undeclared = sorted(m for m in _needed if m not in _declared)
+    ok &= check(f"pyproject's py-modules lists every module the entrypoint "
+                f"imports (missing: {_undeclared or 'none'})",
+                not _undeclared)
+
+    # --- console scripts point at something that exists -------------------
+    # A [project.scripts] entry naming a missing module or a non-callable
+    # installs perfectly happily and fails only when a user runs it — the
+    # same "looks configured, is not" shape as the rest of this file. Checked
+    # statically so it does not need an install.
+    _scripts = dict(re.findall(r'^([a-z0-9-]+) = "([a-z_]+:[a-z_]+)"\s*$',
+                               _pyproject, re.M))
+    ok &= check(f"pyproject declares console scripts ({len(_scripts)} of them)",
+                len(_scripts) >= 8)
+    _bad_targets = []
+    for _cmd, _target in sorted(_scripts.items()):
+        _mod, _fn = _target.split(":")
+        if _mod not in _declared:
+            _bad_targets.append(f"{_cmd} -> {_mod} not in py-modules")
+            continue
+        _t = _ast.parse(open(os.path.join(_repo_root, _mod + ".py"),
+                             encoding="utf-8").read())
+        if not any(isinstance(n, (_ast.FunctionDef, _ast.AsyncFunctionDef))
+                   and n.name == _fn for n in _t.body):
+            _bad_targets.append(f"{_cmd} -> {_target} is not a top-level def")
+    ok &= check(f"every console script points at a real top-level function in "
+                f"a declared module (bad: {_bad_targets or 'none'})",
+                not _bad_targets)
+
+    # The three engines go through cli_entry, not straight at their own
+    # main(). Installing ONE extra — which is what the README says to do —
+    # still puts all three commands on PATH, and running the other two used
+    # to print a ModuleNotFoundError traceback for a command the install
+    # itself created. cli_entry turns that into exit 2 and the pip line.
+    ok &= check("the engine commands go through cli_entry, so a missing "
+                "driver is a usage error naming the extra to install rather "
+                "than a traceback",
+                all(_scripts.get(f"farfetch-scraper-{_e}", "").startswith("cli_entry:")
+                    for _e in ("playwright", "selenium", "puppeteer")))
+
+    import cli_entry as _ce
+    ok &= check("...and cli_entry knows every engine, with the right driver "
+                "name for each — pyppeteer's module and its extra differ, "
+                "which is why this is a map and not a string operation",
+                _ce._ENGINES["puppeteer_scraper"] == ("pyppeteer", "puppeteer")
+                and set(_ce._ENGINES) == {"playwright_scraper",
+                                          "selenium_scraper",
+                                          "puppeteer_scraper"})
+
+    # Both halves of the triage, with the import stubbed so neither case
+    # launches a browser. The engine's OWN driver missing is a usage error;
+    # anything else must surface as itself, or a genuinely broken module gets
+    # reported as "you forgot an extra" and the real cause is never seen.
+    _real_import = _ce.importlib.import_module
+
+    def _raise_missing(name):
+        def _stub(_mod):
+            raise ModuleNotFoundError(f"No module named {name!r}", name=name)
+        return _stub
+
+    _ce.importlib.import_module = _raise_missing("pyppeteer")
+    _buf = io.StringIO()
+    with contextlib.redirect_stderr(_buf):
+        _rc_missing_driver = _ce._run("puppeteer_scraper")
+    _msg = _buf.getvalue()
+
+    _ce.importlib.import_module = _raise_missing("bs4")
+    try:
+        _ce._run("puppeteer_scraper")
+        _other = "swallowed"
+    except ModuleNotFoundError as e:
+        _other = e.name
+    _ce.importlib.import_module = _real_import
+
+    ok &= check("cli_entry: the engine's own driver missing is exit 2 with "
+                "the pip line, not a traceback for a command the install "
+                "itself created",
+                _rc_missing_driver == 2
+                and "pip install" in _msg and "puppeteer" in _msg)
+    ok &= check("cli_entry: any OTHER missing module is re-raised unchanged — "
+                "a broken import must never be blamed on a missing extra",
+                _other == "bs4")
 
     # `--fp-tags` MUST DEFAULT TO ONE OS-FAMILY TAG. It shipped as
     # "Windows,Chrome,Desktop", which the fingerprint API rejects with HTTP

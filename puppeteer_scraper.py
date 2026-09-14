@@ -35,6 +35,7 @@ from product_parser import (parse_products, SELECTORS, detect_bot_challenge,
 from output_writer import dedupe_by_sku, finish_run
 from proxy_pool import mask as mask_proxy
 import env_config
+from arg_types import positive_int, nonneg_float
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger("puppeteer_scraper")
@@ -340,11 +341,11 @@ def parse_args():
                    help="Farfetch category/hub/search listing URL. Required, unless "
                         "FARFETCH_URL is set in the environment or in .env.")
     p.add_argument("--category", default=None, help="Label to tag output rows with. Defaults to the category segment of the URL, so the column is never empty just because the flag was omitted.")
-    p.add_argument("--pages", type=int, default=1, help="Number of listing pages to crawl")
-    p.add_argument("--delay", type=float, default=2.0, help="Delay between pages, seconds")
-    p.add_argument("--retries", type=int, default=3,
+    p.add_argument("--pages", type=positive_int, default=1, help="Number of listing pages to crawl")
+    p.add_argument("--delay", type=nonneg_float, default=2.0, help="Delay between pages, seconds")
+    p.add_argument("--retries", type=positive_int, default=3,
                    help="Attempts per page load before giving up (default 3)")
-    p.add_argument("--retry-delay", type=float, default=2.0,
+    p.add_argument("--retry-delay", type=nonneg_float, default=2.0,
                    help="Seconds before the first page-load retry, doubling "
                         "thereafter (default 2.0)")
     p.add_argument("--format", choices=["json", "csv", "both"], default="both")
@@ -365,6 +366,7 @@ def parse_args():
                         "if the catalogue is not already readable. always: "
                         "solve whenever one is detected.")
     p.add_argument("--min-score", type=float, default=0.7,
+                   choices=[0.3, 0.7, 0.9],
                    help="reCAPTCHA v3 minimum score to request (0.3, 0.7 or 0.9 — "
                         "the API only accepts these three). Ignored for v2 widgets.")
     p.add_argument("--cdp-endpoint", default=None,
@@ -384,9 +386,19 @@ def parse_args():
     return args
 
 
-if __name__ == "__main__":
+def main() -> int:
+    """The entry point, as a callable — see playwright_scraper.main().
+
+    asyncio.run() is inside main() rather than around it so the console
+    script entry point is an ordinary sync callable, which is what a
+    [project.scripts] target has to be.
+    """
     args = parse_args()
     try:
-        sys.exit(asyncio.run(scrape(args)))
+        return asyncio.run(scrape(args))
     except KeyboardInterrupt:
-        sys.exit(1)
+        return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

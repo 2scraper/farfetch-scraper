@@ -23,6 +23,32 @@ dependencies = [
 [project.urls]
 Homepage = "https://github.com/2scraper/farfetch-scraper"
 
+# Console scripts, so `pip install .[playwright]` produces a real command
+# instead of a directory you have to cd into and invoke with `python3`.
+#
+# The prefix is the repo name, not a bare `scrape`: these install onto a PATH
+# shared with everything else the user has, and a generic name there is worse
+# than a long one. Each engine gets its own command rather than one command
+# with an --engine flag, because the engines have DIFFERENT dependencies and
+# only one of them is expected to be installed (see the extras above) — a
+# dispatcher would import a driver that is deliberately absent.
+#
+# `python3 playwright_scraper.py ...` keeps working exactly as before and is
+# still what the README documents; this is an addition, not a replacement.
+# The module layout is unchanged too: this is a flat collection of scripts,
+# and turning it into a package namespace would rewrite every documented
+# invocation, every import, the Dockerfile and both workflows, to move a
+# prefix around. The console scripts are the part that was actually missing.
+[project.scripts]
+farfetch-scraper = "cli_entry:playwright"
+farfetch-scraper-playwright = "cli_entry:playwright"
+farfetch-scraper-selenium = "cli_entry:selenium"
+farfetch-scraper-puppeteer = "cli_entry:puppeteer"
+farfetch-scraper-api = "scraper_api_client:main"
+farfetch-scraper-diff = "diff_runs:main"
+farfetch-scraper-fingerprint = "fingerprint_client:main"
+farfetch-scraper-env = "env_config:main"
+
 # Mirrors requirements-playwright.txt / requirements-puppeteer.txt /
 # requirements-selenium.txt. Install exactly one — see those files for why:
 # playwright and pyppeteer pin incompatible pyee versions, pyppeteer and
@@ -42,7 +68,9 @@ dev = ["pytest>=7.0"]
 # invoked as a script (see CONTRIBUTING.md), not a module an installed
 # dependency would import.
 py-modules = [
+    "arg_types",
     "captcha_solver",
+    "cli_entry",
     "diff_runs",
     "env_config",
     "fingerprint_client",

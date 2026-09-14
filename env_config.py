@@ -28,6 +28,7 @@ scripts behave exactly as before.
 
 import logging
 import os
+import sys
 from pathlib import Path
 
 logger = logging.getLogger(__name__)
@@ -184,9 +185,12 @@ def apply(args, keys=None, quiet=False):
     return args
 
 
-if __name__ == "__main__":
-    # `python3 env_config.py` — report what is configured, without printing
-    # any secret. Useful as a first step when a key "isn't being picked up".
+def main() -> int:
+    """Report what is configured, without printing any secret.
+
+    The first thing to run when a key "isn't being picked up". A callable so
+    the console script has something to point at.
+    """
     logging.basicConfig(level=logging.INFO, format="%(message)s")
     where = load_env()
     print(f".env file:      {where or 'not found (this is fine — env vars still work)'}")
@@ -202,3 +206,8 @@ if __name__ == "__main__":
     extras = unknown_keys()
     if extras:
         print("\nUnrecognised keys in .env (typo?): " + ", ".join(extras))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
