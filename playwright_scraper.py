@@ -59,8 +59,10 @@ from captcha_solver import (detect_recaptcha_v3, detect_recaptcha_in_page,
                             INJECT_TOKEN_JS)
 from product_parser import (parse_products, SELECTORS, detect_bot_challenge,
                             describe_block, page_url)
+from product_detail_parser import parse_product_detail
 from output_writer import (dedupe_by_sku, finish_run, stop_reason_for,
-                           COMPLETE_STOP_REASONS, new_run_id)
+                           COMPLETE_STOP_REASONS, new_run_id,
+                           ProductVariant)
 from run_state import Checkpoint
 from proxy_pool import (from_args as proxy_pool_from_args, to_playwright, mask,
                         ROTATE_MODES, ProxyError, ProxyPool)
@@ -805,6 +807,87 @@ def _fetch_pages_concurrently(args, pool, specs, concurrency: int,
     return results, sorted(unattempted), exhausted.is_set()
 
 
+
+def _crawl_details(session, args, listing_rows, checkpoint):
+    """Open each listed product and return one row per size.
+
+    Sequential, deliberately, for a first cut: detail mode multiplies a run's
+    requests by the number of products on a page (~18 here), and raising that
+    again with workers is a decision that wants a live measurement behind it
+    rather than a default.
+
+    The URLs come from the LISTING ROWS rather than from the page's HTML, so
+    the crawl and the listing parser cannot disagree about what counts as a
+    product — and the listing rows are already de-duplicated, which matters
+    because a tile links to its product twice.
+
+    Returns (rows, failures, attempted).
+    """
+    urls, seen = [], set()
+    for row in listing_rows:
+        if row.url and row.url not in seen:
+            seen.add(row.url)
+            urls.append(row.url)
+
+    total = len(urls)
+    if args.max_products and total > args.max_products:
+        logger.warning("Listing has %d products; --max-products %d caps this "
+                       "run. The cap is recorded in the run metadata, so a "
+                       "truncated crawl does not read as a complete one.",
+                       total, args.max_products)
+        urls = urls[:args.max_products]
+
+    logger.info("Detail mode: opening %d product page(s)%s.", len(urls),
+                f" of {total}" if len(urls) != total else "")
+
+    rows, failures = [], []
+    for i, url in enumerate(urls, start=1):
+        if checkpoint.has(i):
+            continue
+        if i > 1:
+            time.sleep(args.delay)
+        try:
+            resp = session.page.goto(url, wait_until="domcontentloaded",
+                                     timeout=60000)
+            status = resp.status if resp else None
+            if status is not None and status >= 400:
+                logger.warning("Product %d/%d: HTTP %d for %s — skipping.",
+                               i, len(urls), status, url)
+                failures.append(url)
+                continue
+            session.page.wait_for_timeout(1500)
+            html = session.page.content()
+        except (PWTimeout, PWError) as e:
+            reason = _proxy_failure(e)
+            logger.warning("Product %d/%d failed (%s) — skipping.", i,
+                           len(urls), reason or type(e).__name__)
+            failures.append(url)
+            continue
+
+        vendor = detect_bot_challenge(html)
+        if vendor:
+            logger.error("Product %d/%d: blocked by %s — skipping.", i,
+                         len(urls), describe_block(html, vendor))
+            failures.append(url)
+            continue
+
+        variants = parse_product_detail(html, session.page.url,
+                                        category=args.category)
+        if not variants:
+            # The parser already said why. Recorded as a failure rather than
+            # as "this product has no sizes", which is what an empty list
+            # would otherwise quietly mean.
+            failures.append(url)
+            continue
+
+        logger.info("Product %d/%d: %d size(s) — %s", i, len(urls),
+                    len(variants), (variants[0].title or "")[:60])
+        rows.extend(variants)
+        checkpoint.record(i, variants, session.page.url)
+
+    return rows, failures, len(urls)
+
+
 def scrape(args) -> int:
     # One id per run, logged here and written into the sidecar, so a
     # log line and an artefact can be tied together. "the run that
@@ -1029,10 +1112,45 @@ def scrape(args) -> int:
     final_url = (max(ok_pages, key=lambda o: o.page_num).final_url
                  if ok_pages else args.url)
 
-    rc = finish_run(all_products, args.out, args.format, args.allow_empty,
+    rows, row_type = all_products, None
+    if args.mode == "detail":
+        # A fresh session for the crawl. The listing session is closed by now
+        # — and under --concurrency it was closed before the workers even
+        # started — so reopening is the consistent choice rather than
+        # threading one browser through two different phases.
+        detail_cp = Checkpoint(args.out, args, row_type=ProductVariant)
+        if args.resume:
+            for line in detail_cp.resume():
+                logger.info("%s", line)
+        with sync_playwright() as pw:
+            dsession = _BrowserSession(pw, args, pool,
+                                       remote=bool(args.cdp_endpoint)).open()
+            try:
+                rows, detail_failures, attempted = _crawl_details(
+                    dsession, args, all_products, detail_cp)
+            finally:
+                dsession.close()
+
+        rows = detail_cp.products_in_page_order() or rows
+        row_type = ProductVariant
+        if detail_failures:
+            # A crawl that lost products is not a complete view of them, and
+            # the run must not claim to be. The listing pages all succeeding
+            # says nothing about the product pages.
+            logger.warning("%d of %d product page(s) yielded nothing — the "
+                           "result covers the rest.", len(detail_failures),
+                           attempted)
+            if stop_reason in COMPLETE_STOP_REASONS:
+                stop_reason = "detail_pages_failed"
+        elif args.max_products and attempted >= args.max_products:
+            # Truncation is not failure, but it is not completeness either.
+            if stop_reason in COMPLETE_STOP_REASONS:
+                stop_reason = "max_products_reached"
+
+    rc = finish_run(rows, args.out, args.format, args.allow_empty,
                     blocked=blocked, stop_reason=stop_reason,
                       run_id=run_id, started_at=started_at,
-                      webhook=args.webhook,
+                      webhook=args.webhook, mode=args.mode, row_type=row_type,
                     pages_requested=args.pages, pages_completed=len(ok_pages),
                     pages_failed=failed_pages,
                     start_url=args.url, final_url=final_url)
@@ -1040,7 +1158,7 @@ def scrape(args) -> int:
     # Only a run that saw everything drops its checkpoint. A partial or failed
     # run keeps it — that is the run --resume exists for, and deleting it here
     # would throw away the pages it did get.
-    if stop_reason in COMPLETE_STOP_REASONS and all_products:
+    if stop_reason in COMPLETE_STOP_REASONS and rows:
         checkpoint.clear()
     elif checkpoint.enabled and checkpoint.pages:
         logger.info("Checkpoint kept at %s (%d page(s)) — re-run the same "
@@ -1089,6 +1207,19 @@ def parse_args():
                         "this many OTHER exits before giving up (default 2). "
                         "Needs a pool of more than one; ignored otherwise.")
     p.add_argument("--twocaptcha-key", default=None, help="2captcha.com API key")
+    p.add_argument("--mode", choices=["listing", "detail"], default="listing",
+                   help="listing (default): one row per product, read from "
+                        "the category page. detail: open each product page "
+                        "and emit one row per SIZE, with per-size price, "
+                        "strikethrough price and availability. Detail costs "
+                        "one extra request per product, so a 3-page run of "
+                        "~18 products a page is ~54 more fetches — see "
+                        "--max-products.")
+    p.add_argument("--max-products", type=nonneg_int, default=0, metavar="N",
+                   help="In --mode detail, stop after N product pages "
+                        "(0 = no limit, the default). A cap is reported in "
+                        "the run metadata, so a truncated crawl never reads "
+                        "as a complete one.")
     p.add_argument("--resume", action="store_true",
                    help="Continue a run that stopped early, using the "
                         "<out>.progress.json checkpoint every multi-page run "

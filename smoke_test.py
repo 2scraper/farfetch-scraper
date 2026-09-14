@@ -31,7 +31,10 @@ import ast as _ast
 import captcha_solver as _cs
 from bs4 import BeautifulSoup
 from product_parser import parse_products, category_from_url, detect_bot_challenge
-from output_writer import (save, dedupe_by_sku, Product, finish_run,
+import csv
+
+from output_writer import (save, dedupe_by_sku, Product, finish_run, run_meta,
+                           write_csv, ProductVariant,
                            stop_reason_for, new_run_id, quality_metrics,
                            EXIT_NO_PRODUCTS, EXIT_BLOCKED, EXIT_PARTIAL,
                            EXIT_FETCH_FAILED, EXIT_DRIVER_TIMEOUT,
@@ -1700,7 +1703,7 @@ def check_page_content_mid_navigation(ok: bool) -> bool:
                     "restorable and planned is None" in _src)
         ok &= check("a partial run KEEPS its checkpoint; only a complete one "
                     "clears it",
-                    "if stop_reason in COMPLETE_STOP_REASONS and all_products:"
+                    "if stop_reason in COMPLETE_STOP_REASONS and rows:"
                     in _src)
 
         # Phase 2: each worker owns a browser AND an exit for its lifetime.
@@ -2777,7 +2780,6 @@ def check_product_detail_pages(ok: bool) -> bool:
     """product detail pages: one row per size"""
     from product_detail_parser import (parse_product_detail, composition,
                                        labelled_blocks, discount_pct)
-    from output_writer import ProductVariant
 
     full = parse_product_detail(SAMPLE_DETAIL_FULL_PRICE_HTML, "https://x/")
     sale = parse_product_detail(SAMPLE_DETAIL_SALE_HTML, "https://x/")
@@ -2956,6 +2958,96 @@ def check_product_detail_pages(ok: bool) -> bool:
                 [f for f in fields if f in set(Product().__dict__)]
                 and list(ProductVariant().__dict__)[:4]
                 == list(Product().__dict__)[:4])
+
+    # --- the crawl that drives the parser ------------------------------
+    # The sidecar has to say which kind of row the file holds: the repo used
+    # to have one kind, so the repo implied it, and it no longer does.
+    ok &= check("run_meta records the mode, defaulting to listing",
+                run_meta(status="complete", stop_reason="completed",
+                         pages_requested=1, pages_completed=1, start_url="u",
+                         final_url="u", products=1)["mode"] == "listing"
+                and run_meta(status="complete", stop_reason="completed",
+                             pages_requested=1, pages_completed=1,
+                             start_url="u", final_url="u", products=1,
+                             mode="detail")["mode"] == "detail")
+
+    # An empty run's CSV header must describe what the file was FOR. With two
+    # row kinds, defaulting to Product would give an empty detail run a
+    # listing header — columns describing something it does not contain.
+    with tempfile.TemporaryDirectory() as _t:
+        _lp = os.path.join(_t, "l.csv")
+        _dp = os.path.join(_t, "d.csv")
+        write_csv([], _lp)
+        write_csv([], _dp, row_type=ProductVariant)
+        _lh = next(csv.reader(open(_lp, encoding="utf-8")))
+        _dh = next(csv.reader(open(_dp, encoding="utf-8")))
+        ok &= check("an empty CSV still carries a header, and it is the "
+                    "header of the row kind that run was for",
+                    "rating" in _lh and "size" not in _lh
+                    and "size" in _dh and "rating" not in _dh)
+
+    # The checkpoint stores rows; it has to rebuild them as the right class.
+    class _A:
+        def __init__(self, mode="listing"):
+            self.url, self.pages, self.category = "https://x/", 5, "Kids"
+            self.out, self.mode = "x", mode
+
+    import run_state as _rs2
+    with tempfile.TemporaryDirectory() as _t:
+        _pfx = os.path.join(_t, "r")
+        _a = _A(mode="detail")
+        _cp = _rs2.Checkpoint(_pfx, _a, row_type=ProductVariant)
+        _cp.record(1, [ProductVariant(sku="1-19", size="4 Jahre", price=45.0)])
+        _back = _rs2.Checkpoint(_pfx, _A(mode="detail"),
+                                row_type=ProductVariant)
+        _back.resume()
+        ok &= check("a detail checkpoint rebuilds ProductVariant rows — "
+                    "hardcoding Product raises TypeError on the first "
+                    "unexpected key, AFTER the run has announced it is "
+                    "resuming",
+                    len(_back.pages.get(1, [])) == 1
+                    and _back.pages[1][0].size == "4 Jahre")
+        _wrong = _rs2.Checkpoint(_pfx, _A(mode="listing"))
+        _msgs = _wrong.resume()
+        ok &= check("a LISTING run refuses a detail checkpoint: the mode is "
+                    "part of the identity, because the two hold rows of "
+                    "different shapes",
+                    _wrong.resumed_from == []
+                    and any("DIFFERENT run" in m for m in _msgs))
+
+    # The engine wiring, at the source level: these are one-line decisions
+    # whose only observable effect is in a file the suite cannot produce
+    # without a browser. Read here rather than reusing the copy another
+    # section happens to hold — a section that depends on a sibling's local
+    # is the coupling the split just removed.
+    _eng_src = open(os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                 "playwright_scraper.py"),
+                    encoding="utf-8").read()
+    ok &= check("the engine offers --mode listing|detail and caps a crawl "
+                "with --max-products",
+                '"--mode", choices=["listing", "detail"]' in _eng_src
+                and '"--max-products"' in _eng_src)
+    ok &= check("...and tells finish_run which mode and which row type, so "
+                "the sidecar and an empty CSV both describe what the run was "
+                "for",
+                "mode=args.mode, row_type=row_type" in _eng_src)
+    ok &= check("a capped crawl does not report itself as complete",
+                'stop_reason = "max_products_reached"' in _eng_src)
+    ok &= check("...nor does one whose product pages failed — the listing "
+                "pages all succeeding says nothing about the product pages",
+                'stop_reason = "detail_pages_failed"' in _eng_src)
+    ok &= check("neither reason is in COMPLETE_STOP_REASONS",
+                "max_products_reached" not in COMPLETE_STOP_REASONS
+                and "detail_pages_failed" not in COMPLETE_STOP_REASONS)
+
+    import diff_runs as _dr2
+    ok &= check("diff_runs refuses to compare a listing run with a detail "
+                "run, and --force does not apply — every line of that diff "
+                "would be an artefact of the comparison",
+                "_check_same_mode" in open(
+                    os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                 "diff_runs.py"), encoding="utf-8").read()
+                and hasattr(_dr2, "_check_same_mode"))
     return ok
 
 

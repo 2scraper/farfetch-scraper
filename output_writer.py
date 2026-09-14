@@ -125,14 +125,21 @@ def write_json(products: List[Product], path: str) -> None:
         json.dump([asdict(p) for p in products], f, ensure_ascii=False, indent=2)
 
 
-def write_csv(products: List[Product], path: str) -> None:
+def write_csv(products: List[Product], path: str,
+              row_type=None) -> None:
     # An empty result still gets the header row. A zero-byte file makes a
     # consumer fail on read (no columns to parse) instead of reading a valid
     # table with zero rows — and "an empty result is still a well-formed
     # result" is the same principle as `save` refusing to overwrite good data.
+    #
+    # `row_type` says WHICH header, and only matters when there are no rows to
+    # take it from. With a second row kind in the repo, defaulting to Product
+    # would give an empty detail run a listing header — a file whose columns
+    # describe something it does not contain.
     if not products:
         with open(path, "w", encoding="utf-8", newline="") as f:
-            csv.DictWriter(f, fieldnames=list(asdict(Product()).keys())).writeheader()
+            csv.DictWriter(f, fieldnames=list(
+                asdict((row_type or Product)()).keys())).writeheader()
         return
     fieldnames = list(asdict(products[0]).keys())
     with open(path, "w", encoding="utf-8", newline="") as f:
@@ -252,7 +259,8 @@ def run_meta(status: str, stop_reason: str, pages_requested: int,
              products: int, pages_failed: Optional[List[int]] = None,
              *, run_id: Optional[str] = None,
              started_at: Optional[float] = None,
-             rows: Optional[List[Product]] = None) -> dict:
+             rows: Optional[List[Product]] = None,
+             mode: str = "listing") -> dict:
     """Build the metadata dict for a finished run.
 
     `status` is the field a consumer branches on:
@@ -272,6 +280,11 @@ def run_meta(status: str, stop_reason: str, pages_requested: int,
     meta = {
         "source": "farfetch.com",
         "run_id": run_id or new_run_id(),
+        # WHICH KIND of row this file holds. The repo used to have one, so the
+        # repo implied it; with detail rows it no longer does, and a consumer
+        # that reads a variant file as a listing file gets several rows per
+        # product and calls it a catalogue that grew.
+        "mode": mode,
         "status": status,
         "stop_reason": stop_reason,
         "pages_requested": pages_requested,
@@ -343,7 +356,7 @@ def quality_metrics(products: List[Product]) -> dict:
 
 
 def save(products: List[Product], out_prefix: str, fmt: str,
-         allow_empty: bool = False) -> int:
+         allow_empty: bool = False, row_type=None) -> int:
     """Write JSON/CSV and return a process exit code.
 
     Returns 0 when products were written, EXIT_NO_PRODUCTS when there were
@@ -370,7 +383,7 @@ def save(products: List[Product], out_prefix: str, fmt: str,
         write_json(products, f"{out_prefix}.json")
         print(f"[+] Saved {len(products)} products -> {out_prefix}.json")
     if fmt in ("csv", "both"):
-        write_csv(products, f"{out_prefix}.csv")
+        write_csv(products, f"{out_prefix}.csv", row_type=row_type)
         print(f"[+] Saved {len(products)} products -> {out_prefix}.csv")
     return 0 if products else EXIT_NO_PRODUCTS
 
@@ -395,7 +408,8 @@ def finish_run(products: List[Product], out_prefix: str, fmt: str,
                pages_failed: Optional[List[int]] = None,
                run_id: Optional[str] = None,
                started_at: Optional[float] = None,
-               webhook: Optional[str] = None) -> int:
+               webhook: Optional[str] = None,
+               mode: str = "listing", row_type=None) -> int:
     """Write output + the run-metadata sidecar; return the exit code.
 
     Shared by all three browser engines so the status/exit-code mapping
@@ -408,7 +422,8 @@ def finish_run(products: List[Product], out_prefix: str, fmt: str,
     diff_runs.py would refuse to compare data that is in fact fine.
     """
     complete = stop_reason in COMPLETE_STOP_REASONS
-    rc = save(products, out_prefix, fmt, allow_empty=allow_empty)
+    rc = save(products, out_prefix, fmt, allow_empty=allow_empty,
+              row_type=row_type)
     wrote_output = bool(products) or allow_empty
 
     status = "complete" if (products and complete) else (
@@ -423,7 +438,8 @@ def finish_run(products: List[Product], out_prefix: str, fmt: str,
         pages_requested=pages_requested, pages_completed=pages_completed,
         pages_failed=pages_failed,
         start_url=start_url, final_url=final_url, products=len(products),
-        run_id=run_id, started_at=started_at, rows=products)
+        run_id=run_id, started_at=started_at, rows=products,
+        mode=mode)
     if wrote_output:
         write_run_meta(out_prefix, meta)
 

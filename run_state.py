@@ -76,6 +76,11 @@ def identity(args) -> dict:
         "start_url": _mask_url(args.url or ""),
         "pages_requested": args.pages,
         "category": args.category,
+        # The MODE belongs to identity even though it is not a URL: a listing
+        # checkpoint holds one row per product and a detail checkpoint one row
+        # per size, so resuming one as the other would restore rows of the
+        # wrong shape into a run that then writes them as if they fitted.
+        "mode": getattr(args, "mode", "listing"),
     }
 
 
@@ -89,9 +94,14 @@ class Checkpoint:
     well-defined across the two.
     """
 
-    def __init__(self, out_prefix: str, args):
+    def __init__(self, out_prefix: str, args, row_type=Product):
         self.path = path_for(out_prefix)
         self.identity = identity(args)
+        # Which dataclass the stored rows rebuild into. Hardcoding Product
+        # here would raise TypeError halfway through resuming a detail run, on
+        # the first unexpected key — after the file had already been read and
+        # the run had already announced it was resuming.
+        self.row_type = row_type
         self.pages: Dict[int, List[Product]] = {}
         self.final_urls: Dict[int, Optional[str]] = {}
         self.resumed_from: List[int] = []
@@ -193,7 +203,8 @@ class Checkpoint:
         for num_s, page in (data.get("pages") or {}).items():
             try:
                 num = int(num_s)
-                self.pages[num] = [Product(**row) for row in page["products"]]
+                self.pages[num] = [self.row_type(**row)
+                                  for row in page["products"]]
                 self.final_urls[num] = page.get("final_url")
                 restored.append(num)
             except (TypeError, ValueError, KeyError) as e:

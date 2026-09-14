@@ -64,6 +64,7 @@ category URL — see [Troubleshooting](TROUBLESHOOTING.md).
 - [Engines](#engines)
 - [Configuration](#configuration)
 - [Flags](#flags) · [Exit codes](#exit-codes) · [Concurrency](#concurrency) · [Run metadata](#run-metadata)
+- [Product detail mode](#product-detail-mode) · [Resuming a run](#resuming-a-run-that-stopped-early)
 - [Output](#output)
 - [Diffing two runs](#diffing-two-runs)
 - [Using 2Captcha](#using-2captcha)
@@ -88,8 +89,8 @@ category URL — see [Troubleshooting](TROUBLESHOOTING.md).
   visit is geo-redirected on exit IP; verify the market in the output rather
   than assuming it — see [Geo-redirect](#site-specific-behaviour).
 
-Listing-level fields only. This repo does not open product pages, so no sizes,
-materials, colour variants or descriptions — those live one level deeper.
+Listing-level by default. `--mode detail` opens each product page as well and
+emits **one row per size** — see [Product detail mode](#product-detail-mode).
 
 ---
 
@@ -236,6 +237,8 @@ The three browser engines share these:
 | `--captcha-api` | `v2` | `v2` (current JSON API) or `v1` (legacy `in.php`) |
 | `--min-score` | `0.7` | reCAPTCHA v3 score to request — `0.3`, `0.7` or `0.9` only |
 | `--allow-empty` | off | Write output even when 0 products were found |
+| `--mode listing\|detail` | `listing` | `detail` opens each product page and emits one row per **size** |
+| `--max-products N` | 0 (no limit) | In `--mode detail`, stop after N product pages |
 | `--resume` | off | Continue a run that stopped early, from the checkpoint every multi-page run writes |
 | `--webhook URL` | — | POST the run summary when the run finishes, including when it fails |
 | `--dump-html` | – | Save the exact HTML the parser was given, on success too |
@@ -380,6 +383,46 @@ itself.
 `run_id` is one id per run, logged on the first line and written here, so a
 log line and an artefact can be tied together — "the run that failed" stops
 being identifying once a scraper is on a schedule.
+
+### Product detail mode
+
+`--mode detail` fetches the listing as usual, then opens each product page and
+emits **one row per size**:
+
+```bash
+python3 playwright_scraper.py --url "$URL" --pages 1 --mode detail --out sizes
+```
+
+```
+sku          size       price  was   stock  color  composition
+36899289-19  4 Jahre    60.00  —     true   Weiß   Bio-Baumwolle 100%
+36899289-21  6 Jahre    60.00  —     true   Weiß   Bio-Baumwolle 100%
+33056780-19  4 Jahre    33.00  65.00 true   Blau   Baumwolle 100%
+```
+
+The key is the **variant** sku (`36899289-19`); `product_id` (`36899289`)
+groups a product's sizes. It is a different row shape from listing mode, so
+the run's `mode` is recorded in the sidecar and `diff_runs.py` refuses to
+compare the two — `--force` does not apply to that one, because every line of
+such a diff would be an artefact of the comparison.
+
+It costs **one request per product**, so a page of ~18 products is ~18 extra
+fetches. `--max-products N` caps that, and a capped run is reported as
+`partial` with `stop_reason: max_products_reached` rather than as a complete
+view of the catalogue.
+
+What a detail page gives that a listing page does not: per-size availability,
+the material composition, the colour, the full image set, and — the one that
+matters most for price monitoring — an **honest discount**. A listing
+publishes one price, and on a discounted item it is the middle of the chain,
+which is why listing mode reconciles it against the rendered tile. A detail
+page publishes the whole chain as structured data, so `price` and
+`original_price` are facts there and `price_source` says `jsonld-variant`.
+
+What it does **not** give, measured across seven captured product pages rather
+than assumed: no ratings (`aggregateRating` appears nowhere), no merchant or
+boutique, and no shipping details. Those are not columns, because a column
+that is null on every row of every run is worse than a missing one.
 
 ### Resuming a run that stopped early
 

@@ -117,6 +117,31 @@ a promise that every flag and exit code is contractually frozen.
 
 ### Added
 
+- **`--mode detail`: one row per SIZE.** The listing tells you a product
+  exists; the product page tells you which sizes are in stock and what each
+  costs. `--mode detail` fetches the listing as before, then opens each
+  product and emits a `ProductVariant` row per size — keyed on the variant
+  sku (`36899289-19`), with `product_id` grouping a product's sizes.
+
+  The detail page publishes the **whole discount chain** as structured data,
+  unlike the listing, which publishes the middle of it. So `price` and
+  `original_price` are facts there, `discount_pct` is arithmetic, and no DOM
+  price overlay is ported — it could not work anyway, because a detail page's
+  DOM holds zero rendered price strings.
+
+  `--max-products N` caps the crawl; a capped or partly-failed crawl is
+  reported as `partial` with `max_products_reached` / `detail_pages_failed`
+  rather than as a complete view.
+
+  The sidecar now records `mode`, and `diff_runs.py` refuses to compare a
+  listing run with a detail run — the one refusal `--force` does not override,
+  because the two have different row shapes and different keys, so every line
+  of that diff would be an artefact of the comparison.
+
+  Measured on seven captured product pages rather than assumed: there are no
+  ratings on a detail page (`aggregateRating` appears nowhere), no merchant or
+  boutique, and no shipping details, so none of those became columns.
+
 - **`--resume`, and a checkpoint every multi-page run writes.** A run that
   died on page 17 of 20 used to start again at page 1.
   `<out>.progress.json` is written after every page and deleted by a run that
