@@ -178,6 +178,55 @@ jobs:
         # workflow and leaving the config behind.
         run: mypy
 
+  docker:
+    # Nothing in this repo built the image until now, which is how every repo
+    # in this family came to ship one that died with ModuleNotFoundError on
+    # every invocation, `--help` included — the Dockerfile's own comment says
+    # so. The offline suite now checks the COPY list against the entrypoint's
+    # import graph statically, but that proves one of four things. The other
+    # three need a real build.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build
+        run: docker build -t farfetch-scraper:ci .
+
+      - name: The entrypoint runs
+        # The CMD is --help, which is the exact invocation a missing module
+        # breaks. If a COPY line is wrong, this is where it shows.
+        run: docker run --rm farfetch-scraper:ci | head -5
+
+      - name: Chromium really launches
+        # `playwright install --with-deps chromium` exiting 0 is not evidence
+        # the browser starts: a missing shared library only surfaces on
+        # launch. Nothing else in CI would catch that.
+        run: |
+          docker run --rm --entrypoint python3 farfetch-scraper:ci -c "
+          from playwright.sync_api import sync_playwright
+          with sync_playwright() as p:
+              b = p.chromium.launch()
+              print('chromium ok', b.version)
+              b.close()
+          "
+
+      - name: The image carries no .env, no test suite and no fixtures
+        # A .env baked into an image is a credential published to everyone who
+        # can pull it. The other two are not secrets, just weight — but a
+        # smoke_test.py inside the image means the COPY list is broader than
+        # it looks and the .env exclusion may be too.
+        run: |
+          set +e
+          found=$(docker run --rm --entrypoint sh farfetch-scraper:ci -c \
+            'ls -a /app' | grep -E '^\.env$|^smoke_test\.py$|^tests$|^\.git$')
+          if [ -n "$found" ]; then
+            echo "::error::The image contains files it must not ship:"
+            echo "$found"
+            exit 1
+          fi
+          echo "image contents are clean"
+          docker run --rm --entrypoint sh farfetch-scraper:ci -c 'ls /app'
+
   engine-smoke:
     # The offline job above installs NO engine library on purpose (that's what
     # makes it offline), so smoke_test.py's engine-guarded checks (the UA built

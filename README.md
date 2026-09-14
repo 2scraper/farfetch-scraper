@@ -32,6 +32,22 @@ python3 playwright_scraper.py \
   --pages 1 --format both --out girls_clothing
 ```
 
+Or install it as a command, or pull the image:
+
+```bash
+pip install '.[playwright]' && playwright install chromium
+farfetch-scraper --url "$URL" --pages 1        # same tool, on your PATH
+
+docker run --rm -v "$PWD/out:/out" ghcr.io/2scraper/farfetch-scraper \
+  --url "$URL" --pages 1 --out /out/girls_clothing
+```
+
+Install exactly **one** engine extra (`playwright`, `selenium` or
+`puppeteer`): the three pin mutually unsatisfiable versions of `pyee` and
+`urllib3`, so pip resolves a conflict by quietly downgrading one of them. The
+commands for the engines you did not install say so and name the extra, rather
+than failing with an import traceback.
+
 Output shape: [`sample_output.json`](sample_output.json) /
 [`sample_output.csv`](sample_output.csv) — three rows cut from a real run, so you
 can see the exact fields before installing anything.

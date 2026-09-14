@@ -1,0 +1,108 @@
+name: release
+
+# Fires only on a version tag. Nothing here runs on a push or a PR, so this
+# workflow cannot publish anything by accident.
+#
+# Two artefacts, and neither is reachable without the repo owner pushing a
+# tag:
+#
+#   the container image -> ghcr.io/<owner>/farfetch-scraper:<tag> and :latest
+#   the Python package  -> built and CHECKED, and uploaded to the GitHub
+#                          release. NOT pushed to PyPI.
+#
+# The PyPI step is deliberately absent rather than commented out. Publishing
+# to PyPI claims a name in a global namespace on behalf of an organisation and
+# needs a token this repo does not have; a commented-out step is the shape
+# that cost this repo a real defect before (the canary's `--proxy` line, which
+# would have put a credential in argv the moment anyone uncommented it). When
+# the owner wants PyPI, the honest addition is a trusted-publisher
+# configuration, which is one job and no stored token — not an edit to a
+# comment.
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  packages: write
+
+jobs:
+  image:
+    name: publish the container image to GHCR
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Derive the tags
+        id: tags
+        # Lowercased: a GHCR repository path must be lowercase, and an
+        # organisation name that is not would fail the push with a message
+        # about an invalid reference rather than about its case.
+        run: |
+          owner=$(echo "${{ github.repository_owner }}" | tr '[:upper:]' '[:lower:]')
+          version="${GITHUB_REF_NAME#v}"
+          echo "image=ghcr.io/$owner/farfetch-scraper" >> "$GITHUB_OUTPUT"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          tags: |
+            ${{ steps.tags.outputs.image }}:${{ steps.tags.outputs.version }}
+            ${{ steps.tags.outputs.image }}:latest
+
+      - name: The published image actually runs
+        # Pulled back and invoked rather than trusted because it built. The
+        # same check tests.yml runs on every PR, now against the artefact
+        # people will actually pull.
+        run: |
+          docker run --rm ${{ steps.tags.outputs.image }}:${{ steps.tags.outputs.version }} | head -5
+
+  package:
+    name: build and check the Python package
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Build
+        run: |
+          pip install --upgrade pip build twine
+          python -m build
+
+      - name: twine check
+        # Catches the metadata problems that make a package unusable AFTER it
+        # is published and the version number is burned: an unreadable long
+        # description, a malformed classifier, a missing license file.
+        run: twine check dist/*
+
+      - name: The wheel installs and its console scripts resolve
+        # A [project.scripts] entry naming a missing target installs happily
+        # and fails only when someone runs it. Installing the built wheel — not
+        # the source tree — is the only thing that proves otherwise for the
+        # artefact being released.
+        run: |
+          python -m venv /tmp/relcheck
+          /tmp/relcheck/bin/pip install "$(ls dist/*.whl)[playwright]"
+          for c in farfetch-scraper farfetch-scraper-api farfetch-scraper-diff \
+                   farfetch-scraper-env farfetch-scraper-fingerprint; do
+            /tmp/relcheck/bin/$c --help > /dev/null
+            echo "$c ok"
+          done
+
+      - name: Attach the artefacts to the release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
