@@ -29,6 +29,7 @@ import tempfile
 import ast as _ast
 
 import captcha_solver as _cs
+from bs4 import BeautifulSoup
 from product_parser import parse_products, category_from_url, detect_bot_challenge
 from output_writer import (save, dedupe_by_sku, Product, finish_run,
                            stop_reason_for, new_run_id, quality_metrics,
@@ -262,6 +263,319 @@ SAMPLE_FARFETCH_JSONLD_HTML = """
 </script>
 </body></html>
 """
+
+
+# Cut from real pages captured 2026-09-15 through a DE exit. Only what the
+# parser reads was kept — the two JSON-LD blocks and the composition markup —
+# which is also the scrub: the uuids these pages carry live in their
+# analytics and config scripts and are not part of what was cut. `hasVariant`
+# is trimmed to two sizes so the fixture stays readable; every value is
+# otherwise verbatim, down to the build-hash class names on the composition
+# block, which are exactly what a parser must NOT anchor on.
+#
+# Verified before committing: the trimmed fixture parses to the SAME value
+# for every field of every retained row as the untrimmed 260 KB original. A
+# fixture that does not is pinning something the site never sent.
+#
+# A DETAIL page publishes ProductGroup; a LISTING page publishes
+# ItemList/Product. That is the difference that makes a second parser
+# necessary, and porting the listing parser here would return zero products
+# in silence.
+SAMPLE_DETAIL_FULL_PRICE_HTML = r"""<html><body>
+<script type="application/ld+json">
+{
+ "@context": "https://schema.org",
+ "@type": "ProductGroup",
+ "name": "Baumwoll-T-Shirt mit Ami de Coeur",
+ "image": [
+  {
+   "@type": "ImageObject",
+   "contentUrl": "https://cdn-images.farfetch-contents.com/36/89/92/89/36899289_69172521_1000.jpg?ov=true",
+   "description": "AMI Paris Baumwoll-T-Shirt mit Ami de Coeur | Weiß"
+  },
+  {
+   "@type": "ImageObject",
+   "contentUrl": "https://cdn-images.farfetch-contents.com/36/89/92/89/36899289_69623678_1000.jpg?ov=true",
+   "description": "AMI Paris Baumwoll-T-Shirt mit Ami de Coeur | Klassisches T-Shirt"
+  }
+ ],
+ "description": "AMI Paris Baumwoll-T-Shirt mit Ami de Coeur | Weiß | kastiger Schnitt | runder Kragen | Ami de Coeur Prägung und Zierstich auf der Brust | farblich abgestimmte AMI-Stickerei hinten | Bio-Baumwolle | Bio-Baumwolle | T-Shirts für Teen Girls | Tops für Teen Girls | Kleidung für Teen Girls | T-Shirts für Teen Boys | Tops | Teen Boys | Klassisches T-Shirt | Tops | Kleidung für Mädchen | Klassisches T-Shirt | Tops | Kleidung für Jungen | Kinder",
+ "productGroupID": "36899289",
+ "color": "Weiß",
+ "brand": {
+  "@type": "Brand",
+  "name": "AMI Paris"
+ },
+ "itemCondition": "https://schema.org/NewCondition",
+ "variesBy": [
+  "https://schema.org/size"
+ ],
+ "hasVariant": [
+  {
+   "@type": "Product",
+   "sku": "36899289-19",
+   "name": "AMI Paris Baumwoll-T-Shirt mit Ami de Coeur | 4 Jahre",
+   "size": "4 Jahre",
+   "image": "https://cdn-images.farfetch-contents.com/36/89/92/89/36899289_69172521_1000.jpg?ov=true",
+   "offers": {
+    "@type": "Offer",
+    "url": "https://www.farfetch.com/de/shopping/kids/ami-paris-baumwoll-t-shirt-mit-ami-de-coeur-item-36899289.aspx?lang=de-DE&size=19",
+    "availability": "https://schema.org/InStock",
+    "hasMerchantReturnPolicy": {
+     "@type": "MerchantReturnPolicy",
+     "returnPolicyCategory": "https://schema.org/MerchantReturnFiniteReturnWindow",
+     "merchantReturnDays": 30,
+     "returnMethod": "https://schema.org/ReturnByMail",
+     "returnFees": "https://schema.org/FreeReturn",
+     "applicableCountry": [
+      "DE"
+     ]
+    },
+    "priceSpecification": [
+     {
+      "@type": "UnitPriceSpecification",
+      "price": 60,
+      "priceCurrency": "EUR"
+     }
+    ]
+   }
+  },
+  {
+   "@type": "Product",
+   "sku": "36899289-21",
+   "name": "AMI Paris Baumwoll-T-Shirt mit Ami de Coeur | 6 Jahre",
+   "size": "6 Jahre",
+   "image": "https://cdn-images.farfetch-contents.com/36/89/92/89/36899289_69172521_1000.jpg?ov=true",
+   "offers": {
+    "@type": "Offer",
+    "url": "https://www.farfetch.com/de/shopping/kids/ami-paris-baumwoll-t-shirt-mit-ami-de-coeur-item-36899289.aspx?lang=de-DE&size=21",
+    "availability": "https://schema.org/InStock",
+    "hasMerchantReturnPolicy": {
+     "@type": "MerchantReturnPolicy",
+     "returnPolicyCategory": "https://schema.org/MerchantReturnFiniteReturnWindow",
+     "merchantReturnDays": 30,
+     "returnMethod": "https://schema.org/ReturnByMail",
+     "returnFees": "https://schema.org/FreeReturn",
+     "applicableCountry": [
+      "DE"
+     ]
+    },
+    "priceSpecification": [
+     {
+      "@type": "UnitPriceSpecification",
+      "price": 60,
+      "priceCurrency": "EUR"
+     }
+    ]
+   }
+  }
+ ],
+ "url": "https://www.farfetch.com/de/shopping/kids/ami-paris-baumwoll-t-shirt-mit-ami-de-coeur-item-36899289.aspx"
+}
+</script>
+<script type="application/ld+json">
+{
+ "@context": "https://schema.org",
+ "@type": "BreadcrumbList",
+ "itemListElement": [
+  {
+   "@type": "ListItem",
+   "position": 1,
+   "item": {
+    "@id": "/de/shopping/kids/items.aspx",
+    "name": "Kids"
+   }
+  },
+  {
+   "@type": "ListItem",
+   "position": 2,
+   "item": {
+    "@id": "/de/shopping/kids/designer-ami-paris/items.aspx",
+    "name": "AMI Paris"
+   }
+  },
+  {
+   "@type": "ListItem",
+   "position": 3,
+   "item": {
+    "@id": "/de/shopping/kids/designer-ami-paris/boys-clothing-3/items.aspx",
+    "name": "Kleidung für Jungen"
+   }
+  },
+  {
+   "@type": "ListItem",
+   "position": 4,
+   "item": {
+    "@id": "/de/shopping/kids/designer-ami-paris/t-shirts-3/items.aspx",
+    "name": "Klassisches T-Shirt"
+   }
+  }
+ ]
+}
+</script>
+<h4 class="ltr-2pfgen-Body-BodyBold" data-component="BodyBold">Zusammensetzung</h4><p class="ltr-4y8w0i-Body" data-component="Body"><span class="ltr-4y8w0i-Body" data-component="Body">Bio-Baumwolle 100%</span></p>
+</body></html>"""
+
+# The same shape, discounted. Two UnitPriceSpecification entries per variant:
+# the one without a priceType is what is paid, the StrikethroughPrice one is
+# what it was. 45 against 90 — the whole chain, published, which is why this
+# parser needs no DOM price overlay.
+SAMPLE_DETAIL_SALE_HTML = r"""<html><body>
+<script type="application/ld+json">
+{
+ "@context": "https://schema.org",
+ "@type": "ProductGroup",
+ "name": "Pullover mit Logo-Stickerei",
+ "image": [
+  {
+   "@type": "ImageObject",
+   "contentUrl": "https://cdn-images.farfetch-contents.com/32/48/54/56/32485456_62556294_1000.jpg?ov=true",
+   "description": "Marni Kids Pullover mit Logo-Stickerei | Grau"
+  },
+  {
+   "@type": "ImageObject",
+   "contentUrl": "https://cdn-images.farfetch-contents.com/32/48/54/56/32485456_62556268_1000.jpg?ov=true",
+   "description": "Marni Kids Pullover mit Logo-Stickerei | Gestricktes Top"
+  },
+  {
+   "@type": "ImageObject",
+   "contentUrl": "https://cdn-images.farfetch-contents.com/32/48/54/56/32485456_62571423_1000.jpg?ov=true",
+   "description": "Marni Kids Pullover mit Logo-Stickerei | Tops"
+  },
+  {
+   "@type": "ImageObject",
+   "contentUrl": "https://cdn-images.farfetch-contents.com/32/48/54/56/32485456_62556313_1000.jpg?ov=true",
+   "description": "Marni Kids Pullover mit Logo-Stickerei | Kleidung für Baby Boys"
+  }
+ ],
+ "description": "Marni Kids Pullover mit Logo-Stickerei | Grau | Grau | Logo-Stickerei | runder Ausschnitt | lange Ärmel | Baumwolle | Gestricktes Top | Tops | Kleidung für Baby Girls | Gestricktes Top | Tops | Kleidung für Baby Boys | Kinder",
+ "productGroupID": "32485456",
+ "color": "Grau",
+ "brand": {
+  "@type": "Brand",
+  "name": "Marni Kids"
+ },
+ "itemCondition": "https://schema.org/NewCondition",
+ "variesBy": [
+  "https://schema.org/size"
+ ],
+ "hasVariant": [
+  {
+   "@type": "Product",
+   "sku": "32485456-19",
+   "name": "Marni Kids Pullover mit Logo-Stickerei | 3-6 M.",
+   "size": "3-6 M.",
+   "image": "https://cdn-images.farfetch-contents.com/32/48/54/56/32485456_62556294_1000.jpg?ov=true",
+   "offers": {
+    "@type": "Offer",
+    "url": "https://www.farfetch.com/de/shopping/kids/marni-kids-pullover-mit-logo-stickerei-item-32485456.aspx?lang=de-DE&size=19",
+    "availability": "https://schema.org/InStock",
+    "hasMerchantReturnPolicy": {
+     "@type": "MerchantReturnPolicy",
+     "returnPolicyCategory": "https://schema.org/MerchantReturnFiniteReturnWindow",
+     "merchantReturnDays": 30,
+     "returnMethod": "https://schema.org/ReturnByMail",
+     "returnFees": "https://schema.org/FreeReturn",
+     "applicableCountry": [
+      "DE"
+     ]
+    },
+    "priceSpecification": [
+     {
+      "@type": "UnitPriceSpecification",
+      "price": 45,
+      "priceCurrency": "EUR"
+     },
+     {
+      "@type": "UnitPriceSpecification",
+      "price": 90,
+      "priceCurrency": "EUR",
+      "priceType": "https://schema.org/StrikethroughPrice"
+     }
+    ]
+   }
+  },
+  {
+   "@type": "Product",
+   "sku": "32485456-20",
+   "name": "Marni Kids Pullover mit Logo-Stickerei | 6-9 M.",
+   "size": "6-9 M.",
+   "image": "https://cdn-images.farfetch-contents.com/32/48/54/56/32485456_62556294_1000.jpg?ov=true",
+   "offers": {
+    "@type": "Offer",
+    "url": "https://www.farfetch.com/de/shopping/kids/marni-kids-pullover-mit-logo-stickerei-item-32485456.aspx?lang=de-DE&size=20",
+    "availability": "https://schema.org/InStock",
+    "hasMerchantReturnPolicy": {
+     "@type": "MerchantReturnPolicy",
+     "returnPolicyCategory": "https://schema.org/MerchantReturnFiniteReturnWindow",
+     "merchantReturnDays": 30,
+     "returnMethod": "https://schema.org/ReturnByMail",
+     "returnFees": "https://schema.org/FreeReturn",
+     "applicableCountry": [
+      "DE"
+     ]
+    },
+    "priceSpecification": [
+     {
+      "@type": "UnitPriceSpecification",
+      "price": 45,
+      "priceCurrency": "EUR"
+     },
+     {
+      "@type": "UnitPriceSpecification",
+      "price": 90,
+      "priceCurrency": "EUR",
+      "priceType": "https://schema.org/StrikethroughPrice"
+     }
+    ]
+   }
+  }
+ ],
+ "url": "https://www.farfetch.com/de/shopping/kids/marni-kids-pullover-mit-logo-stickerei-item-32485456.aspx"
+}
+</script>
+<script type="application/ld+json">
+{
+ "@context": "https://schema.org",
+ "@type": "BreadcrumbList",
+ "itemListElement": [
+  {
+   "@type": "ListItem",
+   "position": 1,
+   "item": {
+    "@id": "/de/shopping/kids/items.aspx",
+    "name": "Kids"
+   }
+  },
+  {
+   "@type": "ListItem",
+   "position": 2,
+   "item": {
+    "@id": "/de/shopping/kids/marni-kids/items.aspx",
+    "name": "Marni Kids"
+   }
+  },
+  {
+   "@type": "ListItem",
+   "position": 3,
+   "item": {
+    "@id": "/de/shopping/kids/marni-kids/baby-boy-clothing-5/items.aspx",
+    "name": "Kleidung für Baby Boys"
+   }
+  },
+  {
+   "@type": "ListItem",
+   "position": 4,
+   "item": {
+    "@id": "/de/shopping/kids/marni-kids/knitwear-5/items.aspx",
+    "name": "Gestricktes Top"
+   }
+  }
+ ]
+}
+</script>
+<h4 class="ltr-2pfgen-Body-BodyBold" data-component="BodyBold">Zusammensetzung</h4><p class="ltr-4y8w0i-Body" data-component="Body"><span class="ltr-4y8w0i-Body" data-component="Body">Baumwolle 100%</span></p>
+</body></html>"""
 
 
 def check(label, condition):
@@ -2459,6 +2773,192 @@ def check_proxy_pool_and_rotation(ok: bool) -> bool:
     return ok
 
 
+def check_product_detail_pages(ok: bool) -> bool:
+    """product detail pages: one row per size"""
+    from product_detail_parser import (parse_product_detail, composition,
+                                       labelled_blocks, discount_pct)
+    from output_writer import ProductVariant
+
+    full = parse_product_detail(SAMPLE_DETAIL_FULL_PRICE_HTML, "https://x/")
+    sale = parse_product_detail(SAMPLE_DETAIL_SALE_HTML, "https://x/")
+
+    # THE finding this parser exists for. A detail page publishes
+    # ProductGroup where a listing publishes ItemList/Product, so the listing
+    # parser returns zero here — silently, which is the dangerous part.
+    listing_on_detail = parse_products(SAMPLE_DETAIL_FULL_PRICE_HTML,
+                                       "https://x/")
+    ok &= check("the LISTING parser finds nothing on a detail page — it reads "
+                "ItemList/Product and a detail page publishes ProductGroup, "
+                "which is why this is a second parser and not a flag",
+                listing_on_detail == [])
+    ok &= check("...and the detail parser does find it",
+                len(full) == 2 and len(sale) == 2)
+
+    ok &= check("one row per SIZE, keyed on the variant sku — the id that is "
+                "actually unique; product_id groups them",
+                [r.sku for r in full] == ["36899289-19", "36899289-21"]
+                and {r.product_id for r in full} == {"36899289"})
+    ok &= check("sizes are read as the site states them, localised and in "
+                "more than one convention on a single locale",
+                [r.size for r in full] == ["4 Jahre", "6 Jahre"]
+                and [r.size for r in sale] == ["3-6 M.", "6-9 M."])
+
+    # Values, not coverage: a column can be 100% populated and wrong.
+    r = full[0]
+    ok &= check("title, brand and colour come off the group, not the variant",
+                r.title == "Baumwoll-T-Shirt mit Ami de Coeur"
+                and r.brand == "AMI Paris" and r.color == "Weiß")
+    ok &= check("the category is the breadcrumb PATH — the names are nested "
+                "under `item`, and reading element['name'] gives None on "
+                "every entry, which looks like 'no breadcrumbs'",
+                r.category == "Kids > AMI Paris > Kleidung für Jungen > "
+                              "Klassisches T-Shirt")
+    ok &= check("the row's url is the VARIANT's offer url, which carries the "
+                "size — not the product url shared by every size",
+                r.url.endswith("size=19") and full[1].url.endswith("size=21"))
+
+    # The price chain, which is the reason no DOM overlay is ported here.
+    s = sale[0]
+    ok &= check("a discounted variant reads price AND original price as "
+                "facts: the spec without a priceType is what is paid, the "
+                "StrikethroughPrice one is what it was",
+                s.price == 45.0 and s.original_price == 90.0
+                and s.currency == "EUR")
+    ok &= check("...and the discount is arithmetic from those two",
+                s.discount_pct == 50.0)
+    ok &= check("a FULL-PRICE variant has no original_price and no discount — "
+                "None, not 0, which would read as 'measured, and it is zero'",
+                r.original_price is None and r.discount_pct is None)
+    ok &= check("discount_pct refuses a negative: an 'original' at or below "
+                "the price means the two figures are not what they were "
+                "taken for",
+                discount_pct(100.0, 90.0) is None
+                and discount_pct(100.0, 100.0) is None
+                and discount_pct(90.0, 100.0) == 10.0)
+
+    ok &= check("price_source says the figure came from the VARIANT's own "
+                "chain, so diff_runs cannot compare a detail row with a "
+                "listing row as though they were alike",
+                {x.price_source for x in full + sale} == {"jsonld-variant"})
+
+    # Composition is a labelled DOM block, and the label is localised while
+    # the classes are build hashes.
+    ok &= check("composition is read from the labelled block, not guessed out "
+                "of the JSON-LD description blurb",
+                r.composition == "Bio-Baumwolle 100%"
+                and sale[0].composition == "Baumwolle 100%")
+    # Checked over the parser's STRING LITERALS, docstrings excluded. The
+    # docstring names this class precisely to say "do not anchor on it", and
+    # a line-based grep flags that as a violation of the rule it states. What
+    # matters is whether a class name is ever used to MATCH something.
+    _pdp_src = open(os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                 "product_detail_parser.py"),
+                    encoding="utf-8").read()
+    _pdp_tree = _ast.parse(_pdp_src)
+    _docstrings = set()
+    for _n in _ast.walk(_pdp_tree):
+        if isinstance(_n, (_ast.Module, _ast.FunctionDef, _ast.AsyncFunctionDef,
+                           _ast.ClassDef)):
+            _d = _ast.get_docstring(_n, clean=False)
+            if _d:
+                _docstrings.add(_d)
+    _literals = [n.value for n in _ast.walk(_pdp_tree)
+                 if isinstance(n, _ast.Constant) and isinstance(n.value, str)
+                 and n.value not in _docstrings]
+    ok &= check("...by its heading text, so a renamed build-hash class cannot "
+                "break it — the fixture carries the real class names and no "
+                "string the parser MATCHES on contains one",
+                "ltr-2pfgen" in SAMPLE_DETAIL_FULL_PRICE_HTML
+                and not any("ltr-" in lit for lit in _literals))
+    ok &= check("an unlabelled page leaves composition empty rather than "
+                "picking up the wrong block",
+                composition(BeautifulSoup(
+                    "<html><h4>Versand</h4><p>3 Tage</p></html>",
+                    "html.parser")) is None)
+    ok &= check("labelled_blocks returns every label->value pair, so the next "
+                "field somebody wants is already there",
+                labelled_blocks(BeautifulSoup(
+                    "<html><h4>Versand</h4><p>3 Tage</p></html>",
+                    "html.parser")) == {"versand": "3 Tage"})
+
+    ok &= check("images: the group's full set on every row, primary first",
+                r.image_url.endswith("36899289_69172521_1000.jpg?ov=true")
+                and len(r.image_urls.split(" | ")) == 2)
+
+    # The JSON-LD shapes that are legal and have broken a naive parser here
+    # before. Each is the real failure, not a hypothetical.
+    ok &= check("a page with no ProductGroup returns [] and says so, rather "
+                "than raising — but the CALLER must treat that as a failure",
+                parse_product_detail("<html><body>nothing</body></html>",
+                                     "https://x/") == [])
+    ok &= check("'offers': null is handled — an explicit null is not a "
+                "missing key, so a .get() default never applies to it",
+                parse_product_detail(
+                    '<html><script type="application/ld+json">'
+                    '{"@type":"ProductGroup","name":"n","productGroupID":"1",'
+                    '"hasVariant":[{"@type":"Product","sku":"1-1",'
+                    '"size":"S","offers":null}]}</script></html>',
+                    "https://x/")[0].price is None)
+    ok &= check("a ProductGroup nested in @graph is found, not reported as an "
+                "empty product",
+                len(parse_product_detail(
+                    '<html><script type="application/ld+json">'
+                    '{"@graph":[{"@type":"ProductGroup","name":"n",'
+                    '"productGroupID":"1","hasVariant":[{"@type":"Product",'
+                    '"sku":"1-1","size":"S"}]}]}</script></html>',
+                    "https://x/")) == 1)
+    ok &= check("a product with NO size axis still emits a row rather than "
+                "being dropped",
+                len(parse_product_detail(
+                    '<html><script type="application/ld+json">'
+                    '{"@type":"ProductGroup","name":"n","productGroupID":"7"}'
+                    '</script></html>', "https://x/")) == 1)
+    ok &= check("one unparseable ld+json block does not cost the other one",
+                len(parse_product_detail(
+                    '<html><script type="application/ld+json">{oh no</script>'
+                    '<script type="application/ld+json">'
+                    '{"@type":"ProductGroup","name":"n","productGroupID":"1",'
+                    '"hasVariant":[{"@type":"Product","sku":"1-1"}]}'
+                    '</script></html>', "https://x/")) == 1)
+
+    # KNOWN LIMITATION, pinned rather than half-guarded: all 38 variants
+    # captured were InStock, so the negative case has never been seen on a
+    # real page. The mapping is asserted on synthetic values so that a future
+    # change to it is a decision.
+    def _stock(value):
+        return parse_product_detail(
+            '<html><script type="application/ld+json">'
+            '{"@type":"ProductGroup","name":"n","productGroupID":"1",'
+            '"hasVariant":[{"@type":"Product","sku":"1-1","offers":'
+            '{"availability":"https://schema.org/' + value + '"}}]}'
+            '</script></html>', "https://x/")[0].in_stock
+
+    ok &= check("in_stock: an unanticipated availability value reads as NOT "
+                "available rather than silently as yes — allowlisted, not "
+                "`!= OutOfStock`. NOTE: no real out-of-stock variant has been "
+                "captured yet, so a False is less proven than a True",
+                _stock("InStock") is True and _stock("OutOfStock") is False
+                and _stock("SomethingNewSchemaOrgAdded") is False)
+
+    # Columns that do NOT exist, each because it was looked for and not found.
+    fields = set(ProductVariant().__dict__)
+    ok &= check("no rating/review_count column: 0 occurrences of "
+                "aggregateRating or ratingValue across seven captured detail "
+                "pages, so they would be null on every row of every run",
+                not fields & {"rating", "review_count"})
+    ok &= check("no merchant or shipping column either — absent on 7 of 7 "
+                "pages; and no return-policy column, which IS present but "
+                "identical on all 38 variants, making it a line in the README",
+                not fields & {"merchant", "boutique", "seller",
+                              "shipping", "delivery", "return_days"})
+    ok &= check("ProductVariant keeps Product's shared prefix, in order, so "
+                "one column name means one thing across the family",
+                [f for f in fields if f in set(Product().__dict__)]
+                and list(ProductVariant().__dict__)[:4]
+                == list(Product().__dict__)[:4])
+    return ok
+
+
 def check_the_suite_s_own_shape(ok: bool) -> bool:
     """the suite's own shape"""
     # main() was one 2,650-line function. The 2026-09-11 audit called that
@@ -3173,6 +3673,7 @@ def main() -> int:
     ok = check_json_ld_shapes_that_are_legal_but_were_not_handl(ok)
     ok = check_proxy_credentials_must_not_reach_a_browser_comma(ok)
     ok = check_proxy_pool_and_rotation(ok)
+    ok = check_product_detail_pages(ok)
     ok = check_the_suite_s_own_shape(ok)
     ok = check_naming_and_dead_feature_guards(ok)
     ok = check_canary_yml_the_exit_code_table_it_prints_must_be(ok)

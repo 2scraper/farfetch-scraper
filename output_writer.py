@@ -49,6 +49,58 @@ class Product:
     price_source: Optional[str] = None
 
 
+@dataclass
+class ProductVariant:
+    """One SIZE of one product, from a detail page.
+
+    A second row type rather than more columns on Product, because it is a
+    different KIND of thing: a listing row is a product, this is a product in
+    one size, and the two have different unique keys. The family rule for
+    that case is followed here — the shared prefix keeps Product's field
+    names and order, site-specific fields go at the end, `sku` still means
+    "the id", and the run's `mode` goes in the sidecar because the repo no
+    longer implies which kind of row a file holds.
+
+    `sku` is the VARIANT sku ("36899289-19"), which is what is actually
+    unique; `product_id` ("36899289") is what groups a product's sizes.
+    Deduping on product_id would throw away every size but one.
+
+    Two of Product's columns are deliberately absent, and the reason is a
+    measurement rather than a preference: across seven captured detail pages
+    there is no `aggregateRating` and no `ratingValue` anywhere in the
+    markup — 0 occurrences — so `rating` and `review_count` would be null on
+    every row of every run.
+
+    See product_detail_parser.py for what else was looked for and not found
+    (merchant, shipping), and for the one field that is present but
+    identical on all 38 variants seen (the return policy), which makes it a
+    line in the README rather than a column.
+    """
+    source: str = "farfetch.com"
+    scraped_at: str = field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
+    url: str = ""
+    sku: Optional[str] = None
+    title: Optional[str] = None
+    brand: Optional[str] = None
+    price: Optional[float] = None
+    currency: Optional[str] = None
+    original_price: Optional[float] = None
+    discount_pct: Optional[float] = None
+    in_stock: Optional[bool] = None
+    image_url: Optional[str] = None
+    category: Optional[str] = None
+    price_source: Optional[str] = None
+    # --- detail-page specific, from here down ---
+    product_id: Optional[str] = None
+    size: Optional[str] = None
+    color: Optional[str] = None
+    composition: Optional[str] = None
+    # All distinct photos of the product, "|"-joined so the column stays flat
+    # in CSV. Measured: JSON-LD carries the complete set (2-4 per product);
+    # the extra image URLs in the page are the same shots at a smaller width.
+    image_urls: Optional[str] = None
+
+
 def dedupe_by_sku(products: List[Product], seen: Set[str]) -> List[Product]:
     """Drop products whose sku already appeared earlier in this same run.
 
