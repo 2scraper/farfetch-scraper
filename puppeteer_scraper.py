@@ -31,7 +31,7 @@ from captcha_solver import (detect_recaptcha_v3, detect_recaptcha_in_page,
                             reconcile_detections, solve_recaptcha,
                             INJECT_TOKEN_JS, RECAPTCHA_DISCOVERY_JS)
 from product_parser import (parse_products, SELECTORS, detect_bot_challenge,
-                            page_url)
+                            describe_block, page_url)
 from output_writer import dedupe_by_sku, finish_run
 from proxy_pool import mask as mask_proxy
 import env_config
@@ -267,9 +267,9 @@ async def scrape(args) -> None:
                     await page.screenshot({"path": f"{args.out}_page{page_num}_debug.png", "fullPage": True})
                 except Exception as e:
                     logger.warning("Could not capture screenshot: %s", e)
-                logger.error("Blocked by a %s challenge page before parsing (%d bytes) — "
+                logger.error("Blocked by %s before parsing (%d bytes) — "
                              "saved to %s. This is exit 3, distinct from a genuinely "
-                             "empty category (exit 4).", vendor, len(html), debug_html)
+                             "empty category (exit 4).", describe_block(html, vendor), len(html), debug_html)
                 blocked = True
                 stop_reason = f"blocked_{vendor}"
                 break

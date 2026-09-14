@@ -105,6 +105,62 @@ EXIT_BLOCKED = 3
 # that disappeared from the catalogue. See write_run_meta.
 EXIT_PARTIAL = 6
 
+# Exit code for a run that never GOT the page: a navigation timeout, a dead
+# or unauthenticated proxy, a DNS failure, or an edge answering 4xx/5xx with
+# something that is not the listing.
+#
+# This is the gap the 2026-09-11 audit found, and it is the same bug class as
+# the one above it: every one of those used to return EXIT_NO_PRODUCTS, so a
+# dead proxy, a network flap and a genuinely empty category were one value to
+# an automated caller. Those want three different responses — retry the same
+# exit, change exit, accept the answer — and the caller had no way to choose.
+#
+# 5 rather than a new number: the family exit-code contract already reserves
+# it for "the transport failed" (scraper_api_client has used it for a Scraper
+# API error since it was written), and the browser engines simply had no way
+# to say the same thing. Widening it from "remote API error" to "the fetch
+# failed" keeps ONE meaning per code across the family — see CHANGELOG.
+#
+# Deliberately NOT applied when products were gathered: a timeout on page 7
+# of 10 is a PARTIAL run (exit 6, output written), which is already right.
+# This only decides what a run holding nothing reports.
+EXIT_FETCH_FAILED = 5
+
+
+# Stop reasons that mean the run never obtained the page, as opposed to
+# obtaining it and finding nothing on it. Kept as data next to the exit code
+# they map to, so an engine cannot invent a reason that silently falls
+# through to "no products" — the failure this list exists to prevent.
+FETCH_FAILURE_STOP_REASONS = ("page_load_timeout", "proxy_unusable",
+                              "http_error")
+
+
+def stop_reason_for(*, load_failed: bool, blocked_by: Optional[str],
+                    http_status: Optional[int] = None,
+                    proxy_failure: Optional[str] = None) -> str:
+    """The one place that names why a page did not yield content.
+
+    Shared by the engines for the same reason finish_run() is: three copies
+    of this triage drift, and the drift is silent — one engine reporting a
+    dead proxy as a timeout while its twin calls it a block, on the same
+    page. Keyword-only so adding a signal later cannot silently re-bind an
+    existing caller's positional argument.
+
+    Ordered by how much each signal PROVES, not by how cheap it is to test
+    (CLAUDE.md §17): naming the vendor that refused us is a stronger
+    statement than "the status was 403", which is stronger than "it timed
+    out", so the specific reason wins over the general one.
+    """
+    if blocked_by:
+        return f"blocked_{blocked_by}"
+    if proxy_failure:
+        return "proxy_unusable"
+    if http_status is not None and http_status >= 400:
+        return "http_error"
+    if load_failed:
+        return "page_load_timeout"
+    return "completed"
+
 
 def write_run_meta(out_prefix: str, meta: dict) -> str:
     """Write a run-metadata sidecar next to the output, return its path.
@@ -233,9 +289,19 @@ def finish_run(products: List[Product], out_prefix: str, fmt: str,
             start_url=start_url, final_url=final_url, products=len(products)))
 
     if not products:
-        # Nothing gathered at all: a challenge outranks "empty category",
-        # because it says something stood between the run and the content.
-        return EXIT_BLOCKED if blocked else rc
+        # Nothing gathered at all, and the three reasons are not the same
+        # answer. Ordered by how much each proves: a named vendor outranks a
+        # transport failure, which outranks "we got the page and it was
+        # empty" — the only one of the three that is really EXIT_NO_PRODUCTS.
+        if blocked:
+            return EXIT_BLOCKED
+        if stop_reason in FETCH_FAILURE_STOP_REASONS:
+            print(f"[!] The page was never fetched ({stop_reason}) — this is "
+                  f"exit {EXIT_FETCH_FAILED}, NOT an empty category "
+                  f"(exit {EXIT_NO_PRODUCTS}). Nothing can be concluded about "
+                  f"the catalogue from this run.")
+            return EXIT_FETCH_FAILED
+        return rc
     if not complete:
         print(f"[!] Partial run: stopped after {pages_completed} of "
               f"{pages_requested} page(s) ({stop_reason}). The output holds "

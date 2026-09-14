@@ -163,6 +163,47 @@ SAMPLE_FARFETCH_CAPTCHA_WIDGET_HTML = """
 <captcha-widget data-captcha-type="recaptcha" data-widget-id="0" data-version="v3" data-sitekey="6LeifPcbAAAAAJaiPe_xgLTfnbdpEMAYJAAnVFJT" data-action="null" data-callback="reCaptchaWidgetCallback0" data-enterprise="false" data-container-id="register-captcha" data-binded-button-id="null" data-reset="true"></captcha-widget>
 """
 
+# Captured live from www.farfetch.com on 2026-09-14, from a datacentre
+# address the site refuses. This is the ENTIRE response body under HTTP 403 —
+# 318 bytes as the browser serialises it, 406 as the wire delivers it. Not a
+# challenge: there is no widget, no sitekey and nothing to solve, which is
+# why every marker in BOT_CHALLENGE_MARKERS missed it and a blocked run
+# reported "0 products" (exit 4) instead of "blocked" (exit 3).
+#
+# Only the Akamai reference id is edited (it is issued per request, so a real
+# one would pin nothing and go stale immediately). Everything else — the
+# casing, the stray space after the <h1>, the entity escaping in the raw
+# form, the blank lines before </body> — is verbatim, because the whole point
+# of a capture is that it is not what someone would have written by hand.
+
+# As the three BROWSER engines see it: page.content() serialises the parsed
+# DOM, so the entities come back out as ordinary punctuation.
+SAMPLE_AKAMAI_DENIED_DOM_HTML = """<html><head>
+<title>Access Denied</title>
+</head><body>
+<h1>Access Denied</h1>
+
+You don't have permission to access "http://www.farfetch.com/shopping/kids/items.aspx" on this server.<p>
+Reference #18.11111111.1111111111.11111111
+</p><p>https://errors.edgesuite.net/18.11111111.1111111111.11111111</p>
+
+
+</body></html>"""
+
+# As scraper_api_client (and any plain HTTP client) sees it: Akamai escapes
+# the punctuation, so "errors.edgesuite.net" and "Reference #" are simply not
+# present as strings. Both of those were the audit's suggested markers.
+SAMPLE_AKAMAI_DENIED_RAW_HTML = """<HTML><HEAD>
+<TITLE>Access Denied</TITLE>
+</HEAD><BODY>
+<H1>Access Denied</H1>
+
+You don't have permission to access "http&#58;&#47;&#47;www&#46;farfetch&#46;com&#47;shopping&#47;kids&#47;items&#46;aspx" on this server.<P>
+Reference&#32;&#35;18&#46;11111111&#46;1111111111&#46;11111111
+<P>https&#58;&#47;&#47;errors&#46;edgesuite&#46;net&#47;18&#46;11111111&#46;1111111111&#46;11111111</P>
+</BODY>
+</HTML>"""
+
 # Confirmed live from farfetch.com on 2026-08-12: the product URL lives
 # under offers.url, NOT directly on the Product node. An earlier version
 # of _parse_jsonld only checked node["url"], which is absent here, and
@@ -216,6 +257,21 @@ def check(label, condition):
     status = "PASS" if condition else "FAIL"
     print(f"[{status}] {label}")
     return condition
+
+
+def _kwonly_only(fn) -> bool:
+    """True if `fn` takes no positional parameters at all.
+
+    A shared helper called from three engines is exactly where a positional
+    argument goes wrong quietly: tokopedia-scraper's classify(html, status,
+    url) was called as classify(html, url=...) by two of its three engines
+    and both crashed on their FIRST fetch, invisible to import, --help,
+    compileall and 400+ green assertions (CLAUDE.md §17). Keyword-only
+    parameters make that shape impossible to write.
+    """
+    import inspect
+    return all(p.kind is inspect.Parameter.KEYWORD_ONLY
+               for p in inspect.signature(fn).parameters.values())
 
 
 def main() -> int:
@@ -1108,6 +1164,64 @@ def main() -> int:
                 "a second copy that can drift out of sync",
                 _sac.BOT_CHALLENGE_MARKERS is BOT_CHALLENGE_MARKERS)
 
+    # --- Akamai's REFUSAL page (the 2026-09-11 audit's P0) ------------------
+    # Both fixtures below are the real thing, captured 2026-09-14 from a
+    # datacentre address that farfetch.com refuses: the reference id is the
+    # only thing edited (it is per-request, so pinning a real one would be
+    # noise). The page is 318-426 bytes, carries HTTP 403, and contains NONE
+    # of the challenge markers above — so detect_bot_challenge returned None,
+    # and a plainly blocked run reported exit 4, "this category is empty".
+    #
+    # The TWO fixtures are the point, not duplication. The same page reaches
+    # the parser in two different spellings depending on transport, and a
+    # marker can pass one while silently missing the other:
+    from product_parser import detect_access_denied, describe_block
+
+    ok &= check("detect_access_denied: the browser-DOM form of the refusal "
+                "page is recognised",
+                detect_access_denied(SAMPLE_AKAMAI_DENIED_DOM_HTML))
+    ok &= check("detect_access_denied: the RAW-TRANSPORT form is recognised "
+                "too — Akamai entity-escapes the punctuation, so a literal "
+                "'errors.edgesuite.net' marker matches the browser engines "
+                "and misses scraper_api_client entirely",
+                detect_access_denied(SAMPLE_AKAMAI_DENIED_RAW_HTML))
+    ok &= check("...and the raw form really is escaped, so that check is not "
+                "quietly testing the same string twice",
+                "errors.edgesuite.net" not in SAMPLE_AKAMAI_DENIED_RAW_HTML
+                and "errors&#46;edgesuite&#46;net" in SAMPLE_AKAMAI_DENIED_RAW_HTML)
+    ok &= check("detect_bot_challenge reports the refusal page as akamai, so "
+                "it reaches EXIT_BLOCKED like any other block",
+                detect_bot_challenge(SAMPLE_AKAMAI_DENIED_DOM_HTML) == "akamai"
+                and detect_bot_challenge(SAMPLE_AKAMAI_DENIED_RAW_HTML) == "akamai")
+    ok &= check("describe_block calls a refusal a refusal, not a challenge — "
+                "a log naming a widget that is not there sends the reader "
+                "looking for one",
+                "refusal" in describe_block(SAMPLE_AKAMAI_DENIED_DOM_HTML, "akamai")
+                and "challenge" in describe_block('<div class="cf-challenge">',
+                                                  "cloudflare"))
+
+    # The negative half, and the half that matters more: a marker that fires
+    # on a good page is worse than no marker at all (CLAUDE.md §18, where a
+    # bare "akamai" marker made tokopedia-scraper report every served page as
+    # blocked). Every real-capture fixture in this suite is checked, not just
+    # the one listing sample.
+    for _name, _html in sorted((n, v) for n, v in list(globals().items())
+                               if n.startswith("SAMPLE_") and n.endswith("HTML")
+                               and "DENIED" not in n and isinstance(v, str)):
+        ok &= check(f"detect_access_denied does NOT fire on {_name}",
+                    not detect_access_denied(_html))
+
+    # "edgesuite" on its own is an ordinary Akamai ASSET domain. Matching it
+    # bare would report a site serving its own images from one as blocked on
+    # every page — the exact shape of the §18 trap. Pinned so a future
+    # broadening of the marker is a decision rather than a surprise.
+    ok &= check("a page merely SERVED from an edgesuite asset host is not a "
+                "refusal — only errors.edgesuite.net is",
+                not detect_access_denied(
+                    '<html><head><title>Kids</title></head><body>'
+                    '<img src="https://cdn.a1937.edgesuite.net/x.jpg">'
+                    '</body></html>'))
+
     # --- page.content() mid-navigation --------------------------------------
     # Playwright raises when the document swaps under the snapshot, which
     # farfetch.com's client-side geo-redirect makes routine.
@@ -1766,7 +1880,8 @@ def main() -> int:
     # `removed` — indistinguishable from "these products were delisted".
     # finish_run writes a sidecar recording that, and diff_runs refuses.
     from output_writer import (finish_run, run_meta, EXIT_PARTIAL,
-                               COMPLETE_STOP_REASONS)
+                               EXIT_FETCH_FAILED, COMPLETE_STOP_REASONS,
+                               FETCH_FAILURE_STOP_REASONS, stop_reason_for)
     import diff_runs as _dr
 
     ok &= check("EXIT_PARTIAL (6) is distinct from 0, EXIT_BLOCKED and "
@@ -1813,6 +1928,46 @@ def main() -> int:
                     "still-intact output, which save() deliberately keeps",
                     rc_b == EXIT_BLOCKED and not os.path.exists(_b + ".meta.json"))
 
+        # --- the 2026-09-11 audit's second P0 ----------------------------
+        # A run that never GOT the page used to report EXIT_NO_PRODUCTS, so
+        # a dead proxy, a network flap and a genuinely empty category were
+        # one value to an automated caller — three situations wanting three
+        # different responses (retry this exit / change exit / accept the
+        # answer). Measured on the day of the audit: the .env proxy was dead
+        # (curl: "Proxy CONNECT aborted" against any host), and the run
+        # reported exit 4, "no products".
+        for _reason in FETCH_FAILURE_STOP_REASONS:
+            _f = os.path.join(tmp, f"fetchfail_{_reason}")
+            rc_f = finish_run([], _f, "json", False, blocked=False,
+                              stop_reason=_reason, pages_requested=1,
+                              pages_completed=0, start_url="u", final_url="u")
+            ok &= check(f"finish_run: '{_reason}' with nothing gathered exits "
+                        f"EXIT_FETCH_FAILED (5), not EXIT_NO_PRODUCTS (4) — "
+                        f"nothing can be concluded about the catalogue",
+                        rc_f == EXIT_FETCH_FAILED)
+
+        _e = os.path.join(tmp, "genuinely_empty")
+        rc_e = finish_run([], _e, "json", False, blocked=False,
+                          stop_reason="completed", pages_requested=1,
+                          pages_completed=1, start_url="u", final_url="u")
+        ok &= check("finish_run: a page that WAS fetched and held nothing is "
+                    "still EXIT_NO_PRODUCTS — widening 5 must not swallow "
+                    "the one case 4 is actually for",
+                    rc_e == EXIT_NO_PRODUCTS)
+
+        # A fetch failure that still gathered pages is a PARTIAL run, not a
+        # fetch failure: the output is written and exit 6 already says so.
+        # This is the ordering inside finish_run, pinned.
+        _fp = os.path.join(tmp, "partial_not_fetchfail")
+        rc_fp = finish_run(_two, _fp, "json", False, blocked=False,
+                           stop_reason="page_load_timeout", pages_requested=10,
+                           pages_completed=2, start_url="u", final_url="u")
+        ok &= check("finish_run: a timeout that still gathered products stays "
+                    "EXIT_PARTIAL — exit 5 means 'we have nothing', and two "
+                    "good pages is not nothing",
+                    rc_fp == EXIT_PARTIAL)
+
+
         # diff_runs must refuse a comparison involving the partial run.
         class _A:
             def __init__(self, old, new, force=False):
@@ -1826,6 +1981,46 @@ def main() -> int:
                     "(files written before run metadata existed)",
                     _dr._check_comparable(_A(os.path.join(tmp, "nope.json"),
                                              os.path.join(tmp, "nope2.json"))) is True)
+
+    ok &= check("EXIT_FETCH_FAILED (5) is distinct from every other code in "
+                "the contract",
+                EXIT_FETCH_FAILED == 5
+                and EXIT_FETCH_FAILED not in (0, 1, 2, EXIT_BLOCKED,
+                                              EXIT_NO_PRODUCTS, EXIT_PARTIAL))
+    ok &= check("scraper_api_client's EXIT_API_ERROR is the SAME code, not a "
+                "second 5 that can drift — one meaning per exit code across "
+                "the family",
+                _sac.EXIT_API_ERROR == EXIT_FETCH_FAILED)
+    ok &= check("no fetch-failure stop reason is also a COMPLETE one — a run "
+                "cannot both have failed to fetch and have seen everything",
+                not set(FETCH_FAILURE_STOP_REASONS) & set(COMPLETE_STOP_REASONS))
+
+    # stop_reason_for is the one place that names why a page yielded nothing.
+    # Ordered by how much each signal PROVES (CLAUDE.md §17's
+    # classification-order trap), so the specific reason outranks the general.
+    ok &= check("stop_reason_for: a named vendor outranks a bare status — "
+                "'blocked_akamai' says more than 'http_error'",
+                stop_reason_for(load_failed=False, blocked_by="akamai",
+                                http_status=403) == "blocked_akamai")
+    ok &= check("stop_reason_for: a dead exit is reported as such, not as a "
+                "timeout — they want opposite responses",
+                stop_reason_for(load_failed=True, blocked_by=None,
+                                proxy_failure="ERR_PROXY_CONNECTION_FAILED")
+                == "proxy_unusable")
+    ok &= check("stop_reason_for: an error status with no recognised marker "
+                "is still not the listing",
+                stop_reason_for(load_failed=False, blocked_by=None,
+                                http_status=503) == "http_error")
+    ok &= check("stop_reason_for: a plain timeout stays a timeout",
+                stop_reason_for(load_failed=True, blocked_by=None) ==
+                "page_load_timeout")
+    ok &= check("stop_reason_for: a 200 that loaded fine is 'completed' — the "
+                "helper must not invent a failure",
+                stop_reason_for(load_failed=False, blocked_by=None,
+                                http_status=200) == "completed")
+    ok &= check("stop_reason_for is keyword-only, so adding a signal later "
+                "cannot silently re-bind an existing caller's argument",
+                _kwonly_only(stop_reason_for))
 
     # ---- JSON-LD shapes that are legal but were not handled ----------------
     # All of these are valid schema.org and all were reproduced against the

@@ -84,6 +84,7 @@ below).
 import json
 import logging
 import re
+from html import unescape
 from typing import List, Optional
 from urllib.parse import urljoin, urlparse, urlunparse, parse_qsl, urlencode
 
@@ -189,13 +190,101 @@ BOT_CHALLENGE_MARKERS = {
 }
 
 
+# An Akamai REFUSAL is not an Akamai CHALLENGE, and the markers above only
+# know the second. A challenge ships a widget and an invitation to prove
+# yourself; a refusal is the edge declining to proxy the request at all —
+# 318 bytes under HTTP 403, no widget, nothing to solve. Measured live on
+# 2026-09-14 from a datacentre address, which is what every request to
+# farfetch.com from this address now returns:
+#
+#     <title>Access Denied</title>
+#     <h1>Access Denied</h1>
+#     You don't have permission to access "http://www.farfetch.com/..."
+#     Reference #18.222c1102.1789401082.23f65d48
+#     https://errors.edgesuite.net/18.222c1102.1789401082.23f65d48
+#
+# Nothing in BOT_CHALLENGE_MARKERS appears on it, so detect_bot_challenge
+# returned None and a plainly blocked run exited 4 ("no products") — telling
+# the caller the category was empty. That is this codebase's worst bug class
+# (doing less than it says while reporting success), and it is what the
+# 2026-09-11 audit found and what the live canary had been hitting.
+#
+# TWO ENCODINGS, and this is the part that is easy to get wrong. The SAME
+# page reaches the parser spelled two different ways depending on transport:
+#
+#   raw bytes (requests/curl → scraper_api_client):
+#       https&#58;&#47;&#47;errors&#46;edgesuite&#46;net&#47;18&#46;222c...
+#   browser DOM (page.content() → the three browser engines):
+#       https://errors.edgesuite.net/18.222c1102...
+#
+# Akamai entity-escapes the punctuation; a browser parses it and serialises
+# it back out plain. So a literal "errors.edgesuite.net" marker matches the
+# browser engines and SILENTLY MISSES the API client — measured: 0
+# occurrences in the raw form. Normalise the entities before matching rather
+# than listing both spellings, or the next marker added here has the same
+# hole. (The audit's own suggested markers, "errors.edgesuite.net" and
+# "Reference #", are both in exactly this trap: 0 matches on the raw page.)
+_DENY_TITLE_RE = re.compile(r"<title[^>]*>\s*Access Denied\s*</title>", re.I)
+
+# Akamai's ERROR-reporting host, and only that host. Deliberately NOT the
+# bare string "edgesuite": edgesuite.net is also an ordinary Akamai asset
+# domain, so a site whose own images are served from it would report every
+# page as blocked. That is the trap tokopedia-scraper fell into with a bare
+# "akamai" marker (see CLAUDE.md §18) — a marker that matches a good page is
+# worse than no marker. "errors.edgesuite.net" appears only on the error page.
+_DENY_ERROR_HOST = "errors.edgesuite.net"
+
+# Only the head of the document is normalised and searched. The refusal page
+# is 318-426 bytes in full, so its markers are always inside this window;
+# bounding it keeps a 1.8MB listing page from being unescaped on every fetch,
+# and keeps a product title that happens to read "Access Denied" deep in the
+# grid from being mistaken for one.
+_DENY_SCAN_BYTES = 4096
+
+
+def detect_access_denied(html: str) -> bool:
+    """True if `html` is an edge REFUSAL page rather than site content.
+
+    Separate from the challenge markers because the correct response differs:
+    a challenge may be solvable where a refusal never is — only a different
+    exit address changes a refusal's outcome.
+    """
+    if not html:
+        return False
+    head = unescape(html[:_DENY_SCAN_BYTES])
+    return bool(_DENY_TITLE_RE.search(head)) or _DENY_ERROR_HOST in head
+
+
 def detect_bot_challenge(html: str) -> Optional[str]:
     """Return the vendor name if `html` looks like a bot-challenge
-    interstitial rather than real content, else None."""
+    interstitial or an edge refusal rather than real content, else None."""
     for vendor, markers in BOT_CHALLENGE_MARKERS.items():
         if any(marker in html for marker in markers):
             return vendor
+    # Checked last, and reported under the same vendor name: the response an
+    # engine takes is identical (rotate to another exit), so this refines the
+    # REASON without changing the decision. Last, because a page carrying a
+    # real challenge widget should be named for that widget.
+    if detect_access_denied(html):
+        return "akamai"
     return None
+
+
+def describe_block(html: str, vendor: str) -> str:
+    """One human-readable phrase for WHY a page counts as blocked.
+
+    Shared by the three engines so they cannot describe the same page
+    differently — the same argument that puts finish_run() in output_writer.
+    A refusal and a challenge both exit 3, but they suggest different next
+    steps, and a log that calls a refusal a "challenge" sends the reader
+    looking for a widget that is not there.
+    """
+    name = vendor.capitalize()
+    if detect_access_denied(html):
+        return (f"{name}'s refusal page (\"Access Denied\" — the edge "
+                f"declined the request outright; there is no challenge to "
+                f"solve, so only a different exit address changes this)")
+    return f"{name}'s challenge page"
 
 
 def _sku_from_url(url: Optional[str]) -> Optional[str]:

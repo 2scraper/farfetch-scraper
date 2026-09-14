@@ -79,7 +79,7 @@ from typing import Optional
 import requests
 
 from product_parser import parse_products, detect_bot_challenge, BOT_CHALLENGE_MARKERS
-from output_writer import save
+from output_writer import save, EXIT_FETCH_FAILED
 import env_config
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
@@ -95,7 +95,12 @@ MAX_API_TIMEOUT = 120
 # is not the operator passing wrong arguments, and a harness that lumps them
 # together sends you looking in the wrong place. Run 7 reported `exit=2` for an
 # HTTP 422 from the API — which reads as "you called it wrong".
-EXIT_API_ERROR = 5
+#
+# Aliased to the shared constant rather than spelled 5 a second time: the
+# browser engines now report the same code when THEY never get the page (a
+# navigation timeout, a dead proxy, a 4xx body), and one meaning per exit
+# code across the family is only true if there is one definition of it.
+EXIT_API_ERROR = EXIT_FETCH_FAILED
 
 def _mask_credentials(url: str) -> str:
     """Never print a username:password embedded in a ws://... or http://... URL."""

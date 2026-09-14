@@ -57,8 +57,8 @@ from captcha_solver import (detect_recaptcha_v3, detect_recaptcha_in_page,
                             reconcile_detections, solve_recaptcha,
                             INJECT_TOKEN_JS, RECAPTCHA_DISCOVERY_JS)
 from product_parser import (parse_products, SELECTORS, detect_bot_challenge,
-                            page_url)
-from output_writer import dedupe_by_sku, finish_run
+                            describe_block, page_url)
+from output_writer import dedupe_by_sku, finish_run, stop_reason_for
 from proxy_pool import (from_args as proxy_pool_from_args, to_playwright, mask,
                         ROTATE_MODES, ProxyError, ProxyPool)
 import env_config
@@ -97,10 +97,30 @@ class PageOutcome:
     products: List = field(default_factory=list)
     blocked_by: Optional[str] = None
     load_failed: bool = False
+    # The response status for the document itself, where the driver exposes
+    # one (Playwright and pyppeteer return a Response from goto(); Selenium
+    # has no equivalent without a CDP session, so it stays None there and the
+    # HTML markers carry the whole job — see CLAUDE.md §8 on needing a
+    # STRUCTURAL secondary signal for exactly that case).
+    http_status: Optional[int] = None
+    # Chromium's own error text when the EXIT was unusable
+    # (ERR_PROXY_CONNECTION_FAILED and friends), as opposed to the site being
+    # slow. Recorded rather than folded into load_failed because the two want
+    # opposite responses — another try at the same exit vs. a different exit —
+    # and the run metadata should say which one happened.
+    proxy_failure: Optional[str] = None
+
+    @property
+    def http_error(self) -> bool:
+        """The edge answered, with an error. Whatever came back is not the
+        listing, even when no vendor marker names who refused us — an
+        unrecognised 403 body is still a 403."""
+        return self.http_status is not None and self.http_status >= 400
 
     @property
     def ok(self) -> bool:
-        return not self.load_failed and self.blocked_by is None
+        return (not self.load_failed and self.blocked_by is None
+                and not self.http_error)
 
 
 def _plan_page_urls(page, args, page_one_url: str) -> Optional[List[str]]:
@@ -506,6 +526,7 @@ def _fetch_one_page(session, args, pool, page_num: int, url: str) -> PageOutcome
     # the same address just burns it further.
     block_retries = args.proxy_block_retries if (pool and len(pool) > 1) else 0
     html, vendor, load_failed = None, None, False
+    http_status = None
 
     for block_attempt in range(block_retries + 1):
         logger.info("Fetching page %d/%d: %s", page_num, args.pages, url)
@@ -516,7 +537,15 @@ def _fetch_one_page(session, args, pool, page_num: int, url: str) -> PageOutcome
         load_failed, exit_failed = False, None
         for attempt in range(1, args.retries + 1):
             try:
-                session.page.goto(url, wait_until="domcontentloaded", timeout=60000)
+                # goto() hands back the Response for the document itself.
+                # It was being discarded, and with it the single most
+                # reliable signal a refusing edge gives us: Farfetch's
+                # "Access Denied" page arrives under HTTP 403 (measured
+                # 2026-09-14), while every marker on it was unknown to the
+                # parser. Taking the status first is CLAUDE.md §8.
+                resp = session.page.goto(url, wait_until="domcontentloaded",
+                                         timeout=60000)
+                http_status = resp.status if resp else None
                 load_failed = False
                 break
             except (PWTimeout, PWError) as e:
@@ -550,18 +579,28 @@ def _fetch_one_page(session, args, pool, page_num: int, url: str) -> PageOutcome
 
         handle_captcha_if_present(session.page, args)
 
-        # Don't wait for network idle (retail sites never go fully
-        # quiet) and don't accept a single selector match as "ready"
-        # (see MIN_CARD_MATCHES comment above).
-        try:
-            session.page.wait_for_function(
-                f"document.querySelectorAll({ITEM_LINK_SELECTOR!r}).length > {MIN_CARD_MATCHES}",
-                timeout=20000,
-            )
-            session.page.wait_for_timeout(1000)
-        except PWTimeout:
-            logger.warning("No product markers appeared within 20s — "
-                            "parsing whatever loaded (may be a bot-check/consent page).")
+        if http_status is not None and http_status >= 400:
+            # An error status is not a page that has yet to paint, so the
+            # readiness wait below can only expire. Skipping it is worth
+            # doing rather than tidy: the wait is 20s, and it was being
+            # spent on every attempt of every page of a blocked run —
+            # 20s x --retries x --proxy-block-retries x --pages of nothing.
+            logger.warning("HTTP %d for %s — the edge answered with an error, "
+                           "so this is not the listing. Not waiting for "
+                           "products to paint.", http_status, url)
+        else:
+            # Don't wait for network idle (retail sites never go fully
+            # quiet) and don't accept a single selector match as "ready"
+            # (see MIN_CARD_MATCHES comment above).
+            try:
+                session.page.wait_for_function(
+                    f"document.querySelectorAll({ITEM_LINK_SELECTOR!r}).length > {MIN_CARD_MATCHES}",
+                    timeout=20000,
+                )
+                session.page.wait_for_timeout(1000)
+            except PWTimeout:
+                logger.warning("No product markers appeared within 20s — "
+                                "parsing whatever loaded (may be a bot-check/consent page).")
 
         html = session.page.content()
         vendor = detect_bot_challenge(html)
@@ -578,8 +617,16 @@ def _fetch_one_page(session, args, pool, page_num: int, url: str) -> PageOutcome
             pool.advance(f"blocked by {vendor} on page {page_num}")
             session.relaunch()
 
+    outcome.http_status = http_status
+    outcome.proxy_failure = exit_failed
+
     if load_failed:
-        logger.error("Gave up loading %s after %d attempt(s).", url, args.retries)
+        if exit_failed:
+            logger.error("Gave up loading %s: the exit is unusable (%s). That "
+                         "is a dead proxy, not a slow site — another try at "
+                         "the same address cannot help.", url, exit_failed)
+        else:
+            logger.error("Gave up loading %s after %d attempt(s).", url, args.retries)
         outcome.load_failed = True
         return outcome
 
@@ -604,11 +651,26 @@ def _fetch_one_page(session, args, pool, page_num: int, url: str) -> PageOutcome
                                     full_page=True)
         except Exception as e:
             logger.warning("Could not capture screenshot: %s", e)
-        logger.error("Blocked by a %s challenge page before parsing (%d bytes) — "
+        logger.error("Blocked by %s before parsing (%d bytes) — "
                      "saved to %s%s. This is exit 3, distinct from a genuinely "
-                     "empty category (exit 4).", vendor, len(html), debug_html,
+                     "empty category (exit 4).", describe_block(html, vendor), len(html), debug_html,
                      f" (tried {block_retries + 1} exit(s))" if block_retries else "")
         outcome.blocked_by = vendor
+        return outcome
+
+    if outcome.http_error:
+        # An error status whose body carries no marker we recognise. We still
+        # know this is not the listing, and saying "0 products" about it
+        # would be a claim about the catalogue that this run cannot support.
+        # Reported separately from `blocked` precisely because we CANNOT name
+        # who refused us — "never present a guess as a fact" (CLAUDE.md §8).
+        debug_html = f"{args.out}_page{page_num}_debug.html"
+        with open(debug_html, "w", encoding="utf-8") as f:
+            f.write(html)
+        logger.error("HTTP %d for %s and nothing on the page names a known "
+                     "bot-check vendor — saved %d bytes to %s. Reported as a "
+                     "fetch failure, not an empty category.",
+                     outcome.http_status, url, len(html), debug_html)
         return outcome
 
     products = parse_products(html, session.page.url, category=args.category)
@@ -785,8 +847,11 @@ def scrape(args) -> None:
             outcomes.append(first)
 
             if not first.ok:
-                stop_reason = ("page_load_timeout" if first.load_failed
-                               else f"blocked_{first.blocked_by}")
+                stop_reason = stop_reason_for(
+                    load_failed=first.load_failed,
+                    blocked_by=first.blocked_by,
+                    http_status=first.http_status,
+                    proxy_failure=first.proxy_failure)
                 blocked = first.blocked_by is not None
             else:
                 seen_skus.update(p.sku for p in first.products if p.sku is not None)
@@ -815,8 +880,11 @@ def scrape(args) -> None:
                     failed = [o for o in rest if not o.ok]
                     if failed:
                         worst = min(failed, key=lambda o: o.page_num)
-                        stop_reason = ("page_load_timeout" if worst.load_failed
-                                       else f"blocked_{worst.blocked_by}")
+                        stop_reason = stop_reason_for(
+                            load_failed=worst.load_failed,
+                            blocked_by=worst.blocked_by,
+                            http_status=worst.http_status,
+                            proxy_failure=worst.proxy_failure)
                         blocked = any(o.blocked_by for o in rest)
                     elif exhausted:
                         stop_reason = "no_new_products"
@@ -840,8 +908,11 @@ def scrape(args) -> None:
                         outcome = _fetch_one_page(session, args, pool, page_num, url)
                         outcomes.append(outcome)
                         if not outcome.ok:
-                            stop_reason = ("page_load_timeout" if outcome.load_failed
-                                           else f"blocked_{outcome.blocked_by}")
+                            stop_reason = stop_reason_for(
+                                load_failed=outcome.load_failed,
+                                blocked_by=outcome.blocked_by,
+                                http_status=outcome.http_status,
+                                proxy_failure=outcome.proxy_failure)
                             blocked = outcome.blocked_by is not None
                             break
 
