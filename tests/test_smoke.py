@@ -79,12 +79,22 @@ def test_suite_exit_code():
     assert _RETURNCODE == 0, _OUTPUT
 
 
+# A floor, not a target. The real count VARIES with how many engine libraries
+# are installed, because the engine-guarded groups skip when their driver is
+# absent: 232 with no engine (the offline CI job, deliberately), ~290 with all
+# three. So the floor has to sit below the legitimate minimum, or it fails on
+# a correct run — which it did, on the first CI run after it was written, at
+# `> 250`. Its job is only to catch a suite that died during its first import
+# and therefore collected nothing at all.
+MIN_CHECKS = 200
+
+
 def test_suite_actually_ran_its_checks():
     """A floor on the number of checks collected.
 
     Without it, a suite that died during its very first import would collect
     zero checks, report zero failures, and read as a green run.
     """
-    assert len(_RESULTS) > 250, (
+    assert len(_RESULTS) > MIN_CHECKS, (
         f"only {len(_RESULTS)} checks were collected from smoke_test.py — it "
         f"probably exited early.\n{_OUTPUT}")
