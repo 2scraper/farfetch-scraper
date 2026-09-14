@@ -105,6 +105,11 @@ a promise that every flag and exit code is contractually frozen.
   exactly those three — and the Scraper API's `--timeout` is bounded to the
   1-120 the API documents.
 
+- **A missing chromedriver exited 1 (crash) rather than 2 (setup).** It is
+  something the operator fixes in one command, and `cli_entry.py` answers the
+  equivalent question — an engine's driver library absent — with 2. The two
+  should not disagree about the same kind of problem.
+
 - **Three engines declared `def scrape(args) -> None`** while returning an
   exit code that `main()` passes straight to `sys.exit`. Harmless at runtime,
   and an annotation a reader would have trusted. Found by mypy, which is now
@@ -164,7 +169,7 @@ a promise that every flag and exit code is contractually frozen.
 
 ### Testing
 
-- Offline suite: **289 checks**, up from 232. New coverage includes the
+- Offline suite: **290 checks**, up from 232; `pytest` reports 292 results. New coverage includes the
   Dockerfile's COPY list against the entrypoint's import graph — a check
   CLAUDE.md §10 calls for after every repo in this family shipped an image
   that died on every invocation, and which did not exist here. It failed on

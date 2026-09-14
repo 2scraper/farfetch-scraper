@@ -1666,6 +1666,28 @@ def main() -> int:
                       "(selenium not installed)")
         _skipped_engines.add("selenium")
 
+    # A missing chromedriver is a SETUP problem, not a crash. It used to be
+    # `raise SystemExit("...")`, which prints the message and exits 1 — the
+    # code the contract reserves for "this program fell over". Confirmed live
+    # on 2026-09-14: a machine with neither chromedriver nor webdriver-manager
+    # got exit 1 for something the operator can fix in one command.
+    #
+    # Checked at the source level: reaching the real branch needs a machine
+    # with no chromedriver, which is exactly the environment this suite cannot
+    # assume. cli_entry answers the equivalent question (an engine's driver
+    # LIBRARY absent) with 2 as well, and the two must not disagree about the
+    # same kind of problem.
+    _sel_src = open(os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                 "selenium_scraper.py"),
+                    encoding="utf-8").read()
+    _driver_msg = "Launching a local Chrome needs a chromedriver"
+    ok &= check("a missing chromedriver exits 2 (setup problem), not 1 "
+                "(crash) — the same answer cli_entry gives for a missing "
+                "driver library",
+                _driver_msg in _sel_src
+                and "raise SystemExit(2) from None" in _sel_src
+                and f'raise SystemExit(\n                "{_driver_msg}' not in _sel_src)
+
     # ---- Selenium: two live local failures, turned into tests -------------
     # A local run spent 60 seconds and then printed a message about `debuggerAddress`
     # on a run that never used --cdp-endpoint. Two separate defects: no version

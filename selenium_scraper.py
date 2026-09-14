@@ -603,14 +603,22 @@ def build_driver(args) -> webdriver.Chrome:
             # `from None`: the message below IS the diagnosis, and chaining the
             # raw ImportError under it buries it in a traceback about a package
             # the user has never heard of.
-            raise SystemExit(
+            #
+            # Exit 2, not 1. `SystemExit("...")` prints the string and exits 1,
+            # which the contract reserves for a CRASH — and a missing
+            # chromedriver is a setup problem the operator can fix, not this
+            # code falling over. cli_entry.py answers the equivalent question
+            # (an engine's driver library absent) with 2 as well; the two
+            # should not disagree about the same kind of problem.
+            print(
                 "Launching a local Chrome needs a chromedriver. Either pass one you\n"
                 "already have:\n"
                 "    --chromedriver /path/to/chromedriver\n"
                 "or install webdriver-manager so it can fetch a matching one:\n"
                 "    pip install webdriver-manager\n"
                 "(Neither is needed with --cdp-endpoint — that attaches to a browser\n"
-                "that's already running.)") from None
+                "that's already running.)", file=sys.stderr)
+            raise SystemExit(2) from None
         service = Service(ChromeDriverManager().install())
     driver = webdriver.Chrome(service=service, options=options)
 
