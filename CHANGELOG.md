@@ -208,9 +208,31 @@ a promise that every flag and exit code is contractually frozen.
   what lets each matrix leg assert that ITS engine ran rather than grepping
   prose.
 
+- **`smoke_test.py`'s `main()` was one 2,650-line function.** It is now a
+  preamble plus 27 section functions, one per the banner comments already in
+  the file. `python3 smoke_test.py` and `pytest` behave identically; the file
+  count, the runner and the no-pytest-required property are unchanged.
+
+  Splitting into separate pytest modules — the other half of what the audit
+  proposed — is still not done, and the reason is now measured rather than
+  asserted. The attempt showed the sections are not independent: 133 names
+  leaked across the boundaries. Most were things that belonged at module
+  scope anyway, but a real remainder was one fixture built once and asserted
+  across three sections, so those were merged back rather than forced apart.
+  A module split would need either a second copy of the checks or the loss of
+  `python3 smoke_test.py` — which runs with no pytest installed, and pytest
+  is not in `requirements.txt`.
+
+  The split is verified behaviour-preserving by diffing every check LABEL
+  before and after: 315 before, 315 after, none lost, none added. That
+  mattered — the first attempt left a `return ok` in the middle of a merged
+  body, which made 7 checks dead code and passed as 308 of 315. Four new
+  checks guard the shape: a floor on section count, a ceiling on `main()`,
+  every section called exactly once, and no section returning before its end.
+
 ### Testing
 
-- Offline suite: **290 checks**, up from 232; `pytest` reports 292 results. New coverage includes the
+- Offline suite: **319 checks**, up from 232; `pytest` reports 321 results. New coverage includes the
   Dockerfile's COPY list against the entrypoint's import graph — a check
   CLAUDE.md §10 calls for after every repo in this family shipped an image
   that died on every invocation, and which did not exist here. It failed on

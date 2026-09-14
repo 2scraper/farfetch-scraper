@@ -52,6 +52,13 @@ output when a run finds nothing.
 file of plain functions with inline HTML/JSON fixtures — no pytest, no
 conftest, no fixtures directory. Copy the nearest existing check and edit it.
 
+Inside it, one function per section (`check_price_source`,
+`check_the_webhook`, …) and a `main()` that calls them in order. Each takes
+the running verdict and returns it. Add a section by writing the function and
+adding one call — the suite checks that every section function is called
+exactly once, because a section nobody calls is a test suite quietly
+shrinking.
+
 Run it either way; both execute the same code:
 
 ```bash
