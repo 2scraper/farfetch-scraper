@@ -55,7 +55,7 @@ from playwright.sync_api import (sync_playwright, Error as PWError,
 
 from captcha_solver import (detect_recaptcha_v3, detect_recaptcha_in_page,
                             reconcile_detections, solve_recaptcha,
-                            INJECT_TOKEN_JS, RECAPTCHA_DISCOVERY_JS)
+                            INJECT_TOKEN_JS)
 from product_parser import (parse_products, SELECTORS, detect_bot_challenge,
                             describe_block, page_url)
 from output_writer import dedupe_by_sku, finish_run, stop_reason_for
@@ -794,7 +794,7 @@ def _fetch_pages_concurrently(args, pool, specs, concurrency: int):
     return results, sorted(unattempted), exhausted.is_set()
 
 
-def scrape(args) -> None:
+def scrape(args) -> int:
     # One entry per page attempted, merged after the loop rather than folded
     # into shared state during it — see PageOutcome for why that ordering
     # matters more than it looks.

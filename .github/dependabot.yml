@@ -1,0 +1,44 @@
+# Dependabot: proposed bumps as reviewable PRs.
+#
+# The audit noted this repo had no dependency updates and no security alerts
+# wired up. Both ecosystems here are worth watching for different reasons:
+#
+#   pip — the engine libraries are the fastest-moving dependency this project
+#   has, and the one most likely to break it. The engine-smoke matrix in
+#   tests.yml installs each engine from its own requirements file and asserts
+#   the installed version satisfies the pin, so a Dependabot PR that raises a
+#   floor is actually tested rather than merely proposed.
+#
+#   github-actions — a pinned action that stops being maintained is invisible
+#   until it fails, and this repo has a daily canary that would then go red
+#   for a reason having nothing to do with Farfetch.
+#
+# Weekly, not daily: this is a small repo with two workflows, and a PR every
+# morning is how people start ignoring them.
+version: 2
+updates:
+  - package-ecosystem: "pip"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+    open-pull-requests-limit: 5
+    labels: ["dependencies"]
+    groups:
+      # One PR for the linters rather than two: they are checked together and
+      # a bump to either has the same review question ("did this add findings
+      # nobody introduced?").
+      linters:
+        patterns: ["ruff", "mypy"]
+    commit-message:
+      prefix: "deps"
+
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+    open-pull-requests-limit: 5
+    labels: ["dependencies", "ci"]
+    commit-message:
+      prefix: "ci"

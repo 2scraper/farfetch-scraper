@@ -59,7 +59,7 @@ from selenium.webdriver.support.ui import WebDriverWait
 
 from captcha_solver import (detect_recaptcha_v3, detect_recaptcha_in_page,
                             reconcile_detections, solve_recaptcha,
-                            INJECT_TOKEN_JS, RECAPTCHA_DISCOVERY_JS)
+                            INJECT_TOKEN_JS)
 from product_parser import (parse_products, SELECTORS, detect_bot_challenge,
                             describe_block, page_url)
 from output_writer import (dedupe_by_sku, finish_run,
@@ -600,6 +600,9 @@ def build_driver(args) -> webdriver.Chrome:
         try:
             from webdriver_manager.chrome import ChromeDriverManager
         except ImportError:
+            # `from None`: the message below IS the diagnosis, and chaining the
+            # raw ImportError under it buries it in a traceback about a package
+            # the user has never heard of.
             raise SystemExit(
                 "Launching a local Chrome needs a chromedriver. Either pass one you\n"
                 "already have:\n"
@@ -607,7 +610,7 @@ def build_driver(args) -> webdriver.Chrome:
                 "or install webdriver-manager so it can fetch a matching one:\n"
                 "    pip install webdriver-manager\n"
                 "(Neither is needed with --cdp-endpoint — that attaches to a browser\n"
-                "that's already running.)")
+                "that's already running.)") from None
         service = Service(ChromeDriverManager().install())
     driver = webdriver.Chrome(service=service, options=options)
 
@@ -677,7 +680,7 @@ def handle_captcha_if_present(driver, args) -> None:
     driver.refresh()
 
 
-def scrape(args) -> None:
+def scrape(args) -> int:
     all_products = []
     seen_skus = set()
     blocked = False

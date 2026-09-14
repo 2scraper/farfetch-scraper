@@ -150,7 +150,7 @@ async def handle_captcha_if_present(page, args) -> None:
     await page.reload({"waitUntil": "domcontentloaded", "timeout": 60000})
 
 
-async def scrape(args) -> None:
+async def scrape(args) -> int:
     all_products = []
     seen_skus = set()
     blocked = False

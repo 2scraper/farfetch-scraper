@@ -89,9 +89,86 @@ a promise that every flag and exit code is contractually frozen.
   so a refusal is no longer logged as a "challenge page" — wording that sends
   the reader looking for a widget that is not there.
 
+- **Every numeric CLI flag is range-checked**, and one of them was doing real
+  damage. `--retries 0` was accepted by all three browser engines, and the
+  attempt loop is `range(1, retries + 1)` — so zero attempts means
+  `page.goto()` is never called. The run parsed `about:blank` (39 bytes,
+  against 559 for the same URL with `--retries 1`) and exited 4: "the page
+  was fetched and held nothing". A wrong answer about the catalogue, reached
+  by typing a number.
+
+  Validators live in `arg_types.py` as argparse `type=` callables, so argparse
+  produces the usage message and exit 2 itself, before a browser launches.
+  Zero stays allowed where it names a real behaviour (`--delay 0`,
+  `--retry-delay 0`, `--proxy-block-retries 0`) and is refused where it names
+  none. `--min-score` becomes `choices=[0.3, 0.7, 0.9]` — the API accepts
+  exactly those three — and the Scraper API's `--timeout` is bounded to the
+  1-120 the API documents.
+
+- **Three engines declared `def scrape(args) -> None`** while returning an
+  exit code that `main()` passes straight to `sys.exit`. Harmless at runtime,
+  and an annotation a reader would have trusted. Found by mypy, which is now
+  part of CI.
+
+### Added
+
+- **Console scripts.** `pip install .[playwright]` now produces
+  `farfetch-scraper`, `farfetch-scraper-playwright`, `-selenium`,
+  `-puppeteer`, `-api`, `-diff`, `-fingerprint` and `-env`.
+  `python3 playwright_scraper.py ...` keeps working unchanged.
+
+  Installing one engine still puts all three engine commands on PATH, so the
+  other two now exit 2 with the pip line to run, via `cli_entry.py`. They used
+  to print a `ModuleNotFoundError` traceback for a command the install itself
+  had just created. The engines still import their drivers at module level —
+  that is how the offline suite detects an absent engine, and moving those
+  imports is how a sibling repo let CI run against a stub version.
+
+- **Ruff and mypy in CI**, both narrowly configured, with the boundaries
+  argued in `pyproject.toml`. Ruff is `F`/`E9`/`B`; its broader defaults
+  produce 205-311 findings here and the largest groups demand Python 3.10+
+  annotation syntax from a package that supports and tests 3.9 — advice that
+  would break a supported version. mypy gates the six shared-core modules,
+  which were already clean; the engines' 26/7/6 findings are pinned as a
+  measured known limitation rather than half-guarded.
+
+- **Dependabot**, weekly, for pip and github-actions. Linter pins moved into
+  `requirements-dev.txt` so they are visible to it — a pin written inline in a
+  workflow `run:` step is invisible to Dependabot and rots quietly.
+
+### Changed
+
+- **`engine-smoke` is a matrix of one venv per engine**, each installed from
+  its own requirements files, with `pip check` as a real gate and an assertion
+  that the installed version satisfies the pin. It used to be
+  `pip install playwright pyppeteer selenium` into a single environment, with
+  a comment saying `pip check` would complain and that this was "expected and
+  harmless". It is not: the three pin mutually unsatisfiable versions of
+  `pyee` and `urllib3`, so pip resolves the conflict by reaching for whatever
+  it can — on a sibling repo that meant pyppeteer 0.0.25, a stub, against a
+  requirements file asking for >=1.0.2, with CI green throughout.
+
+  Each leg also installs the package and checks the console scripts, including
+  that the two engines it did NOT install explain themselves.
+
+- **`pytest` reports 291 results instead of 1.** `tests/test_smoke.py` runs
+  the suite once and turns each `[PASS]`/`[FAIL]` line into its own pytest
+  result, so `-k` selects a check and a failure names it. Splitting
+  `smoke_test.py` itself into thematic pytest modules was deliberately not
+  done: the single-file design is an explicit invariant, and a second copy of
+  the checks is what this wrapper exists to avoid.
+
+- `smoke_test.py` prints a machine-readable `SKIPPED_ENGINES:` line, which is
+  what lets each matrix leg assert that ITS engine ran rather than grepping
+  prose.
+
 ### Testing
 
-- Offline suite: **274 checks**, up from 232.
+- Offline suite: **289 checks**, up from 232. New coverage includes the
+  Dockerfile's COPY list against the entrypoint's import graph — a check
+  CLAUDE.md §10 calls for after every repo in this family shipped an image
+  that died on every invocation, and which did not exist here. It failed on
+  its first run, catching a module added in this same batch.
 
 ## [0.4.3] — 2026-09-11
 

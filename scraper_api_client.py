@@ -78,7 +78,11 @@ from typing import Optional
 
 import requests
 
-from product_parser import parse_products, detect_bot_challenge, BOT_CHALLENGE_MARKERS
+from product_parser import (parse_products, detect_bot_challenge,
+                            # Re-exported, not unused: smoke_test asserts
+                            # this is the SAME object product_parser holds,
+                            # so the two cannot drift into two marker sets.
+                            BOT_CHALLENGE_MARKERS)  # noqa: F401
 from output_writer import save, EXIT_FETCH_FAILED
 import env_config
 from arg_types import positive_int, nonneg_int, bounded_int

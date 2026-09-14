@@ -285,6 +285,11 @@ def main() -> int:
     # says "all passed" is the same defect as code that reports success without
     # checking that what it wanted actually happened.
     _skips = []
+    # Which engine LIBRARIES were absent, as names rather than prose. The
+    # engine-smoke CI job runs one venv per engine and has to assert that THIS
+    # engine did not skip while the other two did — which a free-text line
+    # cannot answer. Printed as one machine-readable line at the end.
+    _skipped_engines = set()
 
     products = parse_products(SAMPLE_LISTING_HTML, "https://www.farfetch.com/shopping/kids/items.aspx", category="Kids")
     ok &= check("parser extracts exactly 2 real products (junk link excluded)", len(products) == 2)
@@ -1240,6 +1245,7 @@ def main() -> int:
         _ps = None
         _skips.append(f"page.content() navigation-race checks "
                       f"(playwright not installed: {exc.name})")
+        _skipped_engines.add("playwright")
     if _ps is not None:
 
         ok &= check("playwright_scraper._chrome_ua names the browser's REAL version, "
@@ -1568,6 +1574,7 @@ def main() -> int:
     except ImportError as exc:
         _pup = None
         _skips.append(f"puppeteer_scraper UA checks (pyppeteer not installed: {exc.name})")
+        _skipped_engines.add("pyppeteer")
     if _pup is not None:
         ok &= check("puppeteer_scraper._chrome_ua names the browser's REAL version, "
                     "not a hardcoded one that only ever drifts out of date",
@@ -1657,6 +1664,7 @@ def main() -> int:
     except ImportError:
         _skips.append("selenium --chromedriver local-path checks "
                       "(selenium not installed)")
+        _skipped_engines.add("selenium")
 
     # ---- Selenium: two live local failures, turned into tests -------------
     # A local run spent 60 seconds and then printed a message about `debuggerAddress`
@@ -1783,6 +1791,7 @@ def main() -> int:
                     "debuggerAddress" in remote_msg)
     except ImportError:
         _skips.append("selenium version-guard checks (selenium not installed)")
+        _skipped_engines.add("selenium")
 
     # ---- cross-page dedup + cross-run diff --------------------------------
     # Pins the pagination bug the three browser engines all shared until this
@@ -1882,7 +1891,7 @@ def main() -> int:
     # 4-10. Diffed against yesterday's full run, all of them came back as
     # `removed` — indistinguishable from "these products were delisted".
     # finish_run writes a sidecar recording that, and diff_runs refuses.
-    from output_writer import (finish_run, run_meta, EXIT_PARTIAL,
+    from output_writer import (finish_run, EXIT_PARTIAL,
                                EXIT_FETCH_FAILED, COMPLETE_STOP_REASONS,
                                FETCH_FAILURE_STOP_REASONS, stop_reason_for)
     import diff_runs as _dr
@@ -2659,9 +2668,13 @@ def main() -> int:
               f"library is not installed here:")
         for line in _skips:
             print(f"  - {line}")
-        print("Expected in CI, which installs no engine on purpose. Install one "
-              "to exercise them.")
+        print("Expected in the offline CI job, which installs no engine on "
+              "purpose. Install one to exercise them.")
         print()
+    # Always printed, including when empty, so a CI job can tell "no engine
+    # skipped" from "this line was never reached".
+    print(f"SKIPPED_ENGINES: {','.join(sorted(_skipped_engines))}")
+    print()
 
     if ok:
         print("All smoke tests passed. Core logic is sound — safe to move on to a real browser run.")

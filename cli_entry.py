@@ -64,10 +64,10 @@ def _run(module_name: str) -> int:
               file=sys.stderr)
         if extra == "playwright":
             print("Then: playwright install chromium\n", file=sys.stderr)
-        print(f"Install exactly ONE engine per environment: the three pin "
-              f"mutually unsatisfiable versions of pyee and urllib3, so pip "
-              f"may resolve a conflict by quietly downgrading one of them. "
-              f"Use a separate virtualenv if you need more than one.",
+        print("Install exactly ONE engine per environment: the three pin "
+              "mutually unsatisfiable versions of pyee and urllib3, so pip "
+              "may resolve a conflict by quietly downgrading one of them. "
+              "Use a separate virtualenv if you need more than one.",
               file=sys.stderr)
         return 2
     return module.main()

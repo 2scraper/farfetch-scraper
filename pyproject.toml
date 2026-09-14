@@ -58,7 +58,8 @@ farfetch-scraper-env = "env_config:main"
 playwright = ["playwright>=1.40.0"]
 puppeteer = ["pyppeteer>=1.0.2"]
 selenium = ["selenium>=4.15.0"]
-dev = ["pytest>=7.0"]
+# Mirrors requirements-dev.txt, by hand, like the rest of this file.
+dev = ["pytest>=7.0", "ruff~=0.14", "mypy~=1.18"]
 
 [tool.setuptools]
 # This repo is a flat collection of standalone scripts, not a package
@@ -83,6 +84,83 @@ py-modules = [
     "selenium_scraper",
 ]
 license-files = ["LICENSE"]
+
+[tool.ruff]
+# Ruff is here to catch DEFECTS, not to have opinions about this codebase's
+# style. The selection below is narrow on purpose, and the reason is measured:
+# Ruff's broader rule sets produce 205-311 findings here, and the largest
+# groups are advice this project must not take.
+#
+#   FA100/UP006/UP045/UP035 (41+27+14+8 findings) want PEP 585/604 annotation
+#   syntax — `list[str]`, `X | None`, `collections.abc` imports. This package
+#   declares requires-python = ">=3.9" and tests 3.9 in CI. Taking that advice
+#   would break a version this repo promises to support: the linter's defaults
+#   contradict the project's own stated constraint.
+#
+#   E501 line-too-long (232) would fight the long explanatory comments that
+#   are the most valuable thing in these files.
+#
+#   BLE001 blind-except (16) and SIM115 (22) flag patterns that are
+#   deliberate and already carry a comment saying why.
+#
+# A check that reports 300 findings nobody intends to act on is a check
+# everyone learns to scroll past — the same failure mode as a canary that is
+# red every morning. So: pyflakes (undefined names, unused imports), the
+# runtime-error rules, and bugbear. Fifteen findings when this was added, all
+# real, all now fixed or given a `# noqa` naming the reason.
+target-version = "py39"
+line-length = 100
+exclude = [".venv*", "build", "dist", "*.egg-info"]
+
+[tool.ruff.lint]
+select = ["F", "E9", "B"]
+
+[tool.ruff.lint.per-file-ignores]
+# The suite imports things purely to prove they can be imported, and pokes at
+# private helpers on purpose.
+"smoke_test.py" = ["F401"]
+
+[tool.mypy]
+# Gated on the SHARED CORE only, and the boundary is measured rather than
+# aspirational. Under `--ignore-missing-imports`, per module:
+#
+#   arg_types 0 · cli_entry 0 · output_writer 0 · product_parser 0
+#   proxy_pool 0 · env_config 0          <- gated, and already clean
+#
+#   scraper_api_client 1 · diff_runs 2 · captcha_solver 5
+#   fingerprint_client 6 · puppeteer_scraper 6 · selenium_scraper 7
+#   playwright_scraper 26                <- not gated yet
+#
+# The gated six are the site-independent core other repos in this family copy
+# verbatim, which makes them the ones worth holding to a stricter standard;
+# they cost nothing to keep clean because they already are.
+#
+# The engines are mostly one shape repeated: `html` starts as None and flows
+# into functions annotated `str`, so mypy is right that the Optional is not
+# narrowed. Fixing it is real work on code that demonstrably runs, and doing
+# it under a deadline is how churn gets introduced into three near-identical
+# files at once. Pinned as a known limitation with its measurement rather
+# than half-guarded (CLAUDE.md §10), so widening the gate is a decision
+# someone makes deliberately.
+#
+# smoke_test.py is excluded entirely: it is one long function that rebinds
+# loop variables on purpose, and §10 says not to restructure it.
+files = [
+    "arg_types.py",
+    "cli_entry.py",
+    "output_writer.py",
+    "product_parser.py",
+    "proxy_pool.py",
+    "env_config.py",
+]
+ignore_missing_imports = true
+# Not `strict`: this is a scripts collection, and demanding annotations
+# everywhere would mean annotating argparse Namespaces for no benefit. The
+# value here is catching a type that CONTRADICTS the code, which is what
+# found `def scrape(args) -> None` on three engines that all return an exit
+# code — an annotation a reader would have trusted.
+warn_no_return = true
+warn_redundant_casts = true
 
 [tool.pytest.ini_options]
 # smoke_test.py is a self-contained runner, not a pytest suite (see

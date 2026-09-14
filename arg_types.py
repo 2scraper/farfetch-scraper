@@ -52,7 +52,8 @@ def positive_int(raw: str) -> int:
     try:
         value = int(raw)
     except ValueError:
-        raise argparse.ArgumentTypeError(f"{raw!r} is not a whole number")
+        raise argparse.ArgumentTypeError(
+            f"{raw!r} is not a whole number") from None
     if value < 1:
         raise argparse.ArgumentTypeError(
             f"must be 1 or more, not {value} (zero or negative would mean the "
@@ -66,7 +67,8 @@ def nonneg_int(raw: str) -> int:
     try:
         value = int(raw)
     except ValueError:
-        raise argparse.ArgumentTypeError(f"{raw!r} is not a whole number")
+        raise argparse.ArgumentTypeError(
+            f"{raw!r} is not a whole number") from None
     if value < 0:
         raise argparse.ArgumentTypeError(f"cannot be negative, got {value}")
     return value
@@ -83,7 +85,8 @@ def nonneg_float(raw: str) -> float:
     try:
         value = float(raw)
     except ValueError:
-        raise argparse.ArgumentTypeError(f"{raw!r} is not a number")
+        raise argparse.ArgumentTypeError(
+            f"{raw!r} is not a number") from None
     if value < 0:
         raise argparse.ArgumentTypeError(
             f"is a number of seconds and cannot be negative, got {value}")
@@ -101,7 +104,8 @@ def bounded_int(low: int, high: int):
         try:
             value = int(raw)
         except ValueError:
-            raise argparse.ArgumentTypeError(f"{raw!r} is not a whole number")
+            raise argparse.ArgumentTypeError(
+                f"{raw!r} is not a whole number") from None
         if not low <= value <= high:
             raise argparse.ArgumentTypeError(
                 f"must be between {low} and {high}, got {value}")

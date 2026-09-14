@@ -143,16 +143,17 @@ jobs:
         # one.
         run: python3 .github/ci_checks.py --secret-check
 
-  engine-smoke:
-    # The offline job above installs NO engine library on purpose (that's
-    # what makes it offline), which means smoke_test.py's own
-    # playwright_scraper/puppeteer_scraper-guarded checks (UA built from the
-    # real launched browser version, the content() navigation-race retry,
-    # fingerprint glue) silently skip in every CI run — "skipped, engine not
-    # installed" reads the same in the log whether that's expected or a real
-    # import regression. This job installs the packages (not the browser
-    # binaries — the offline suite never launches one) so those checks
-    # actually execute at least once, and fails if they report skipped anyway.
+  lint:
+    # Ruff and mypy, both gated on a deliberately NARROW configuration whose
+    # boundaries are argued in pyproject.toml. The short version: Ruff's
+    # broader rule sets produce 205-311 findings here and the largest groups
+    # tell this package to use Python 3.10+ annotation syntax, which would
+    # break the 3.9 the matrix above tests; mypy is clean on the shared core
+    # and has 26 findings on the primary engine that are one repeated shape.
+    #
+    # Both are therefore gates that pass today and mean something when they
+    # fail, rather than a wall of advice nobody intends to take — which is the
+    # same standard this repo applies to its canary.
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -161,35 +162,146 @@ jobs:
         with:
           python-version: "3.12"
 
-      - name: Install core + engine packages (no browser binaries needed)
-        # ALL THREE engines, including selenium. It was missing here at first,
-        # and the selenium-guarded checks therefore skipped in every CI run —
-        # which hid a crash in one of them (a mock that had gone stale against
-        # the code it stands in for) until someone happened to install selenium
-        # locally. `pip check` will complain about the pins these three
-        # disagree on; that is expected and harmless here, because the offline
-        # suite only ever imports them, never launches a browser.
-        run: |
-          python -m pip install --upgrade pip
-          pip install -r requirements.txt
-          pip install playwright pyppeteer selenium
+      - name: Install the linters
+        # From the requirements file, not inline: a pin written in a `run:`
+        # step is invisible to Dependabot, so it would never be proposed for
+        # a bump and would quietly rot. The pins and the reason for them live
+        # in requirements-dev.txt.
+        run: pip install -r requirements-dev.txt
 
-      - name: Offline test suite, with engines actually importable
-        # The suite prints "N group(s) of checks SKIPPED" whenever an engine
-        # import fails. In THIS job every engine is installed, so any skip at
-        # all means a real import error rather than an expected absence —
-        # matching on the generic line rather than per-library names so a
-        # newly added engine-guarded group cannot quietly skip either.
+      - name: ruff
+        run: ruff check . --output-format=github
+
+      - name: mypy
+        # No file list here: pyproject's [tool.mypy] `files` is the single
+        # source of truth, so the gate cannot widen or narrow by editing the
+        # workflow and leaving the config behind.
+        run: mypy
+
+  engine-smoke:
+    # The offline job above installs NO engine library on purpose (that's what
+    # makes it offline), so smoke_test.py's engine-guarded checks (the UA built
+    # from the real launched browser version, the content() navigation-race
+    # retry, the fingerprint glue, the selenium version guards) silently skip in
+    # every run of it — and "skipped, engine not installed" reads identically to
+    # a real import regression. This job is what makes them execute.
+    #
+    # ONE VENV PER ENGINE, and that is the whole point of the rewrite. The
+    # previous recipe was `pip install playwright pyppeteer selenium` into a
+    # single environment, with a comment saying `pip check` would complain and
+    # that this was "expected and harmless". It is not harmless: the three
+    # engines pin mutually unsatisfiable versions (playwright wants pyee >=13,
+    # pyppeteer wants <12; pyppeteer wants urllib3 <2, selenium wants >=2), so
+    # pip resolves the conflict by reaching for whatever it can. On a sibling
+    # repo that installed pyppeteer 0.0.25 — a stub, not the >=1.0.2 the
+    # requirements file asks for — and CI was green against a version the repo
+    # does not support.
+    #
+    # A matrix over the three, each built from its OWN requirements files,
+    # tests the versions users actually get, lets `pip check` pass per venv
+    # (which proves each requirements file is self-consistent, a thing nothing
+    # checked before), and is exactly what the README tells users to do.
+    #
+    # Browser BINARIES are still not installed: the offline suite imports the
+    # libraries and never launches one.
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - engine: playwright
+            # The name the suite reports as skipped, which is the import name
+            # and not always the extra's name — pyppeteer is the odd one.
+            library: playwright
+          - engine: puppeteer
+            library: pyppeteer
+          - engine: selenium
+            library: selenium
+    name: engine-smoke (${{ matrix.engine }})
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install core + ${{ matrix.engine }} in a clean venv
         run: |
-          python smoke_test.py | tee smoke.log
-          if grep -q "group(s) of checks SKIPPED" smoke.log; then
-            echo "FAILED: engine-guarded checks skipped even though every engine"
-            echo "        package is installed in this job — likely a real import error."
+          python -m venv .venv-${{ matrix.engine }}
+          .venv-${{ matrix.engine }}/bin/python -m pip install --upgrade pip
+          .venv-${{ matrix.engine }}/bin/pip install \
+            -r requirements.txt -r requirements-${{ matrix.engine }}.txt
+
+      - name: pip check
+        # A real gate, not a noisy one. In a single-engine environment there
+        # is nothing for it to complain about, so a failure here means this
+        # engine's own requirements file is internally inconsistent — which is
+        # a thing a user would hit on install and nothing previously caught.
+        run: .venv-${{ matrix.engine }}/bin/pip check
+
+      - name: The installed version is the one the requirements file asks for
+        # Guards the exact failure above: pip resolving a conflict by
+        # installing something far older than the pin. `pip install -r` would
+        # have errored on an unsatisfiable pin, but only in a venv that has
+        # nothing else pulling the other way, which is what this job now is.
+        run: |
+          .venv-${{ matrix.engine }}/bin/python - <<'PY'
+          import re, sys
+          from importlib.metadata import version
+          lib = "${{ matrix.library }}"
+          req = open("requirements-${{ matrix.engine }}.txt").read()
+          want = re.search(rf"{lib}>=([0-9.]+)", req).group(1)
+          got = version(lib)
+          def parts(v): return tuple(int(x) for x in v.split(".")[:3])
+          print(f"{lib}: installed {got}, requirements asks >= {want}")
+          sys.exit(0 if parts(got) >= parts(want) else 1)
+          PY
+
+      - name: Offline test suite, with ${{ matrix.engine }} importable
+        # The suite prints one machine-readable line naming every engine
+        # library it could not import. THIS engine must not be on it: if it
+        # is, the library is installed and the module still failed to import,
+        # which is a real regression wearing the same words as an expected
+        # absence. The other two are absent by design and are not checked here
+        # — the sibling matrix legs cover them.
+        run: |
+          .venv-${{ matrix.engine }}/bin/python smoke_test.py | tee smoke.log
+          skipped=$(grep '^SKIPPED_ENGINES:' smoke.log | cut -d: -f2- | tr -d ' ')
+          echo "suite reported skipped engines: [$skipped]"
+          if echo ",$skipped," | grep -q ",${{ matrix.library }},"; then
+            echo "FAILED: ${{ matrix.library }} is installed in this job, and the"
+            echo "        suite still reported its checks as skipped — that is an"
+            echo "        import error, not an expected absence."
             exit 1
           fi
 
-      - name: Every engine CLI answers --help
+      - name: This engine's CLI answers --help
+        run: .venv-${{ matrix.engine }}/bin/python ${{ matrix.engine }}_scraper.py --help
+
+      - name: The console scripts install and resolve
+        # A [project.scripts] entry naming a missing target installs happily
+        # and fails only when a user runs it. Installing the package and
+        # running the command is the only thing that proves otherwise.
         run: |
-          python playwright_scraper.py --help >/dev/null
-          python puppeteer_scraper.py --help >/dev/null
-          python selenium_scraper.py --help >/dev/null
+          .venv-${{ matrix.engine }}/bin/pip install --no-deps .
+          .venv-${{ matrix.engine }}/bin/farfetch-scraper-${{ matrix.engine }} --help >/dev/null
+          echo "farfetch-scraper-${{ matrix.engine }} runs"
+
+      - name: ...and a command for an engine that is NOT installed explains itself
+        # Installing one extra still puts all three commands on PATH. The other
+        # two must exit 2 with the pip line, not a ModuleNotFoundError
+        # traceback for a command the install itself created.
+        run: |
+          set +e
+          for other in playwright puppeteer selenium; do
+            [ "$other" = "${{ matrix.engine }}" ] && continue
+            out=$(.venv-${{ matrix.engine }}/bin/farfetch-scraper-$other --help 2>&1)
+            code=$?
+            if [ "$code" != "2" ] || ! echo "$out" | grep -q "pip install"; then
+              echo "FAILED: farfetch-scraper-$other exited $code without naming"
+              echo "        the extra to install:"
+              echo "$out" | tail -5
+              exit 1
+            fi
+            echo "farfetch-scraper-$other: exit 2, names the extra"
+          done
