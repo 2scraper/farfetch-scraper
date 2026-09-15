@@ -146,6 +146,16 @@ def check_data(prefix: str) -> int:
     if meta.get("status") != "complete":
         fail.append(f"run status is {meta.get('status')!r}, not 'complete'")
 
+    # Named separately from the status check because it is the one stop reason
+    # that means THIS REPO is broken rather than the run being short: the page
+    # was served, it linked to products, and the parser returned none of them.
+    # A multi-page run can drift on one page and still look healthy on totals.
+    if meta.get("stop_reason") == "parse_drift":
+        fail.append("stop_reason is 'parse_drift' — a page that linked to "
+                    "products parsed to zero. That is a parser break, not a "
+                    "thin category: check the JSON-LD shape and the tile "
+                    "scoping before suspecting the site's stock.")
+
     dom_confirmed = sum(1 for r in rows if r.get("price_source") == "jsonld+dom")
     if rows and dom_confirmed / len(rows) < MIN_DOM_CONFIRMED_SHARE:
         fail.append(f"only {dom_confirmed}/{len(rows)} rows had their price "

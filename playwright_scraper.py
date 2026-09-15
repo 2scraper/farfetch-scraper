@@ -58,7 +58,8 @@ from captcha_solver import (detect_recaptcha_v3, detect_recaptcha_in_page,
                             reconcile_detections, solve_recaptcha,
                             INJECT_TOKEN_JS)
 from product_parser import (parse_products, SELECTORS, detect_bot_challenge,
-                            describe_block, page_url)
+                            describe_block, page_url,
+                            count_product_links)
 from product_detail_parser import parse_product_detail
 from output_writer import (dedupe_by_sku, finish_run, stop_reason_for,
                            COMPLETE_STOP_REASONS, new_run_id,
@@ -115,6 +116,10 @@ class PageOutcome:
     # opposite responses — another try at the same exit vs. a different exit —
     # and the run metadata should say which one happened.
     proxy_failure: Optional[str] = None
+    # The page was served, carried product links, and the parser still
+    # returned nothing. That is not an empty category — it is this repo's
+    # bug, and the two deserve opposite responses from whoever reads the run.
+    parse_drift: bool = False
 
     @property
     def http_error(self) -> bool:
@@ -700,8 +705,24 @@ def _fetch_one_page(session, args, pool, page_num: int, url: str) -> PageOutcome
             session.page.screenshot(path=debug_png, full_page=True)
         except Exception as e:
             logger.warning("Could not capture screenshot: %s", e)
-        logger.warning("0 products parsed — saved what the browser actually saw to "
-                        "%s and %s. Open the .png to see it.", debug_html, debug_png)
+        linked = count_product_links(html)
+        if linked >= MIN_CARD_MATCHES:
+            # The distinction the audit asked for. A page that LINKS to 18
+            # products and parses to 0 is a broken parser, not an empty
+            # category, and reporting it as "no products" sends the reader to
+            # check the URL instead of the JSON-LD.
+            outcome.parse_drift = True
+            logger.error("PARSER DRIFT: the page links to %d product(s) and "
+                         "the parser extracted 0. This is not an empty "
+                         "category — the markup or the JSON-LD shape has "
+                         "changed. Saved what the browser saw to %s and %s.",
+                         linked, debug_html, debug_png)
+        else:
+            logger.warning("0 products parsed, and the page links to %d "
+                           "product(s) — consistent with an empty or filtered "
+                           "category, or a hub URL. Saved what the browser "
+                           "actually saw to %s and %s. Open the .png to see "
+                           "it.", linked, debug_html, debug_png)
 
     outcome.products = products
     outcome.final_url = session.page.url
@@ -964,7 +985,8 @@ def scrape(args) -> int:
                     load_failed=first.load_failed,
                     blocked_by=first.blocked_by,
                     http_status=first.http_status,
-                    proxy_failure=first.proxy_failure)
+                    proxy_failure=first.proxy_failure,
+                    parse_drift=first.parse_drift)
                 blocked = first.blocked_by is not None
             else:
                 seen_skus.update(p.sku for p in first.products if p.sku is not None)
@@ -1022,7 +1044,8 @@ def scrape(args) -> int:
                             load_failed=worst.load_failed,
                             blocked_by=worst.blocked_by,
                             http_status=worst.http_status,
-                            proxy_failure=worst.proxy_failure)
+                            proxy_failure=worst.proxy_failure,
+                    parse_drift=worst.parse_drift)
                         blocked = any(o.blocked_by for o in rest)
                     elif exhausted:
                         stop_reason = "no_new_products"
@@ -1059,7 +1082,8 @@ def scrape(args) -> int:
                                 load_failed=outcome.load_failed,
                                 blocked_by=outcome.blocked_by,
                                 http_status=outcome.http_status,
-                                proxy_failure=outcome.proxy_failure)
+                                proxy_failure=outcome.proxy_failure,
+                    parse_drift=outcome.parse_drift)
                             blocked = outcome.blocked_by is not None
                             break
 

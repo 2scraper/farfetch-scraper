@@ -2550,6 +2550,55 @@ def check_the_webhook(ok: bool) -> bool:
     ok &= check("stop_reason_for: a plain timeout stays a timeout",
                 stop_reason_for(load_failed=True, blocked_by=None) ==
                 "page_load_timeout")
+    # PARSER DRIFT, the last piece of the audit's P0 item 3. A page that
+    # LINKS to eighteen products and parses to zero is this repo's bug, not an
+    # empty category, and the two send a reader to opposite places. The
+    # scenario is real: the CSS fallback drops a product link whose tile
+    # yields no price text, so a scoping failure turns a full page into no
+    # rows — the "junk-link data theft" shape seen from the other side.
+    from product_parser import count_product_links
+
+    _full_unparseable = "<html><body>" + "".join(
+        f'<a href="/shopping/kids/b-item-{1000 + i}.aspx">Item {i}</a>'
+        for i in range(8)) + "</body></html>"
+    _genuinely_empty = '<html><body><div class="grid"></div></body></html>'
+    _parses_fine = "<html><body>" + "".join(
+        f'<a href="/shopping/kids/b-item-{2000 + i}.aspx">'
+        f'<span>Brand</span><span>Item {i}</span><span>${10 + i}</span></a>'
+        for i in range(8)) + "</body></html>"
+
+    ok &= check("count_product_links counts DISTINCT products by id, not "
+                "anchors — a tile links to its product twice, so counting "
+                "anchors makes a threshold mean half what it says",
+                count_product_links(
+                    '<a href="/x-item-1.aspx"><img></a>'
+                    '<a href="/x-item-1.aspx">t</a>'
+                    '<a href="/y-item-2.aspx">o</a>') == 2)
+    ok &= check("parse drift is a REAL case, not a hypothetical: a page full "
+                "of product links with no parseable price yields 0 rows, "
+                "because the fallback drops a tile it can find no price in",
+                count_product_links(_full_unparseable) == 8
+                and parse_products(_full_unparseable, "https://x/") == [])
+    ok &= check("...and it is distinguishable: an empty category has no "
+                "product links at all",
+                count_product_links(_genuinely_empty) == 0)
+    ok &= check("...and the signal is not always on — a page that parses "
+                "fine has links AND rows",
+                count_product_links(_parses_fine) == 8
+                and len(parse_products(_parses_fine, "https://x/")) == 8)
+    ok &= check("stop_reason_for names it, and ranks it LAST: everything "
+                "above says the page never arrived, this one says it arrived "
+                "and we failed to read it",
+                stop_reason_for(load_failed=False, blocked_by=None,
+                                parse_drift=True) == "parse_drift"
+                and stop_reason_for(load_failed=True, blocked_by=None,
+                                    parse_drift=True) == "page_load_timeout")
+    ok &= check("parse_drift is NOT a fetch failure — the catalogue question "
+                "really was answered, so the exit code stays 4; what changes "
+                "is that the sidecar names it as OUR bug",
+                "parse_drift" not in FETCH_FAILURE_STOP_REASONS
+                and "parse_drift" not in COMPLETE_STOP_REASONS)
+
     ok &= check("stop_reason_for: a 200 that loaded fine is 'completed' — the "
                 "helper must not invent a failure",
                 stop_reason_for(load_failed=False, blocked_by=None,

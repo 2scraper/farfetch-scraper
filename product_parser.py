@@ -568,6 +568,26 @@ def _parse_css_fallback(html: str, base_url: str, category: Optional[str]) -> Li
 _NOT_A_CATEGORY = {"shopping", "sets", "items.aspx", "all"}
 
 
+def count_product_links(html: str) -> int:
+    """How many DISTINCT products the page links to, by id.
+
+    Counts ids rather than anchors because a tile links to its product twice,
+    from the image and from the title — counting anchors would double every
+    figure and make a threshold mean half what it says.
+
+    Used to tell "this category is empty" from "the parser returned nothing
+    from a page that is full of products", which are opposite answers: the
+    first is a fact about the catalogue, the second is a bug in here.
+    """
+    soup = BeautifulSoup(html, "html.parser")
+    ids = set()
+    for a in soup.select(SELECTORS["item_link"]):
+        item_id = _sku_from_url(a.get("href") or "")
+        if item_id:
+            ids.add(item_id)
+    return len(ids)
+
+
 def page_url(url: str, page_num: int) -> str:
     """Return `url` with Farfetch's own `?page=` parameter set to `page_num`.
 

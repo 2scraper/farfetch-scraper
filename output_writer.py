@@ -210,7 +210,8 @@ FETCH_FAILURE_STOP_REASONS = ("page_load_timeout", "proxy_unusable",
 
 def stop_reason_for(*, load_failed: bool, blocked_by: Optional[str],
                     http_status: Optional[int] = None,
-                    proxy_failure: Optional[str] = None) -> str:
+                    proxy_failure: Optional[str] = None,
+                    parse_drift: bool = False) -> str:
     """The one place that names why a page did not yield content.
 
     Shared by the engines for the same reason finish_run() is: three copies
@@ -232,6 +233,15 @@ def stop_reason_for(*, load_failed: bool, blocked_by: Optional[str],
         return "http_error"
     if load_failed:
         return "page_load_timeout"
+    if parse_drift:
+        # Last, because everything above says the page never arrived while
+        # this one says it arrived and we failed to read it. Not a fetch
+        # failure — the run's exit code stays EXIT_NO_PRODUCTS, since the
+        # catalogue question genuinely was answered with "nothing" — but the
+        # sidecar and the log name it as OUR bug rather than the site's
+        # answer, which is the thing a reader needs in order to look in the
+        # right place.
+        return "parse_drift"
     return "completed"
 
 

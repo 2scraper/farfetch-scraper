@@ -50,6 +50,24 @@ a promise that every flag and exit code is contractually frozen.
   `scraper_api_client`'s `EXIT_API_ERROR` is now an alias of the shared
   constant, so there is one definition of 5 instead of two that can drift.
 
+- **A broken parser reported itself as an empty category.** A page that was
+  served, that links to eighteen products, and that parses to zero rows is
+  this repo's bug — but it exited 4 with the same message as a genuinely thin
+  category, which sends the reader to check the URL instead of the JSON-LD.
+
+  `stop_reason` is now `parse_drift` in that case, the log says so in as many
+  words, and the canary fails on it by name. The exit code deliberately stays
+  4: the catalogue question really was answered, and inventing a seventh code
+  would diverge from the family contract. What changes is that the run says
+  WHOSE fault it is.
+
+  Not a hypothetical — the CSS fallback drops a product link whose tile
+  yields no price text, so a tile-scoping failure turns a full page into no
+  rows. That is the "junk-link data theft" shape this family has hit before,
+  seen from the other side. Both directions are pinned: a full-but-unparseable
+  page sets the flag, an empty one does not, and a page that parses fine does
+  not either.
+
 - **The canary interpreted exit codes it no longer matched.** Its table had
   no entry for 5 or 6, so a fetch failure was announced as an unknown code,
   and it explained 124 as "the page never became ready" — which is wrong
