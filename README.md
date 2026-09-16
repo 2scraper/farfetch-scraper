@@ -139,8 +139,10 @@ what is being requested and how the data is derived, this is that.
 
 ## Engines
 
-Same CLI, same parsing core, same output. Pick by how you want to reach a
-browser.
+Same parsing core, same output schema, same exit codes. The CLI is shared but
+**not identical** — see the table below the engine list.
+
+Pick by how you want to reach a browser.
 
 | Script | Engine | Own browser | Remote browser over CDP |
 |---|---|---|---|
@@ -148,6 +150,22 @@ browser.
 | `puppeteer_scraper.py` | pyppeteer | ✅ | ✅ |
 | `selenium_scraper.py` | Selenium | ✅ | ❌ see below |
 | `scraper_api_client.py` | HTTP API, no local browser | — | ✅ via `--cdp-url` |
+
+**Eighteen flags are shared by all three.** These are not:
+
+| Flag | Where | Why |
+|---|---|---|
+| `--concurrency` | Playwright only | The sync API ties a browser to its creating thread, so the worker model is not portable as it stands |
+| `--mode detail`, `--max-products` | Playwright only | The detail crawl was written for the primary engine and not yet ported |
+| `--resume` | Playwright only | Same — the checkpoint itself is engine-agnostic, only the wiring is missing |
+| `--dump-html`, `--fingerprint`, `--fp-tags`, `--fp-country` | Playwright only | Not yet ported |
+| `--proxy-file`, `--proxy-rotate`, `--proxy-shuffle`, `--proxy-block-retries` | Playwright only | The pool and rotation live in the Playwright loop; the others take a single `--proxy` |
+| `--chromedriver`, `--chrome-binary`, `--disable-build-check`, `--driver-timeout` | Selenium only | It launches a separate chromedriver process; the other two do not |
+
+The list is asserted in the offline suite **in both directions**: a new
+unshared flag fails the build, and so does closing a difference this table
+documents. A table nobody executes is how a README comes to describe
+something that stopped being true.
 
 **Selenium cannot use an authenticated remote CDP endpoint.** Playwright's
 `connect_over_cdp` and Puppeteer's `browserWSEndpoint` take a full

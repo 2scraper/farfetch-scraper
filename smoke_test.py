@@ -3270,6 +3270,108 @@ def check_product_detail_pages(ok: bool) -> bool:
     return ok
 
 
+def check_engine_flag_parity(ok: bool) -> bool:
+    """the three engines' flag sets, against each other"""
+    # The README used to say "Same CLI, same parsing core, same output" with
+    # no qualification, and that was false: measured, Playwright carries 12
+    # flags the others do not. Nine of those predate this batch
+    # (--concurrency, --dump-html, --fingerprint, --fp-*, --proxy-*) and
+    # three came with detail mode. Nobody noticed because nothing compared
+    # them.
+    #
+    # Asserted in BOTH directions, which is the half that is usually missed:
+    # a NEW unshared flag fails, and so does CLOSING a difference that the
+    # README documents. The second matters because the exception list is the
+    # documentation — a flag quietly gaining parity would leave the README
+    # describing a limitation that no longer exists.
+    import ast as _a
+
+    # argparse receivers only. Counting every `.add_argument` catches Chrome
+    # switches too — `options.add_argument("--no-sandbox")` is the same method
+    # name on a different object — and inventing nine Selenium-only CLI flags
+    # that do not exist is exactly the kind of wrong number this check is for.
+    _parsers = {"p", "parser", "ap"}
+
+    def _flags(name):
+        src = open(os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                name), encoding="utf-8").read()
+        found = set()
+        for node in _a.walk(_a.parse(src)):
+            if (isinstance(node, _a.Call)
+                    and isinstance(node.func, _a.Attribute)
+                    and node.func.attr == "add_argument"
+                    and isinstance(node.func.value, _a.Name)
+                    and node.func.value.id in _parsers):
+                for arg in node.args:
+                    if (isinstance(arg, _a.Constant)
+                            and str(arg.value).startswith("--")):
+                        found.add(arg.value)
+        return found
+
+    _sets = {name: _flags(name) for name in
+             ("playwright_scraper.py", "selenium_scraper.py",
+              "puppeteer_scraper.py")}
+    _shared = set.intersection(*_sets.values())
+
+    # The documented exceptions, and why each one is not a bug. A flag that
+    # is not here and not shared IS a bug.
+    ENGINE_SPECIFIC = {
+        "playwright_scraper.py": {
+            # Playwright-only by design: the sync API ties a browser to its
+            # creating thread, so the worker model is not portable as-is.
+            "--concurrency",
+            # Written for the primary engine and not yet ported. Named here
+            # so the gap is a decision rather than an accident.
+            "--dump-html", "--fingerprint", "--fp-tags", "--fp-country",
+            "--proxy-file", "--proxy-rotate", "--proxy-shuffle",
+            "--proxy-block-retries",
+            "--mode", "--max-products", "--resume",
+        },
+        "selenium_scraper.py": {
+            # Driver plumbing that only Selenium has: it launches a separate
+            # chromedriver process, and the other two do not.
+            "--chromedriver", "--chrome-binary", "--disable-build-check",
+            "--driver-timeout",
+        },
+        "puppeteer_scraper.py": set(),
+    }
+
+    ok &= check(f"the three engines share a common flag set ({len(_shared)} "
+                f"flags) — the CLI contract the README describes",
+                len(_shared) >= 15 and "--url" in _shared
+                and "--pages" in _shared and "--out" in _shared
+                and "--webhook" in _shared)
+
+    _undocumented = {}
+    _closed = {}
+    for name, flags in _sets.items():
+        unshared = flags - _shared
+        _undocumented[name] = sorted(unshared - ENGINE_SPECIFIC[name])
+        _closed[name] = sorted(ENGINE_SPECIFIC[name] - unshared)
+
+    ok &= check(f"...and every flag that is NOT shared is a documented "
+                f"exception (undocumented: "
+                f"{ {k: v for k, v in _undocumented.items() if v} or 'none'})",
+                not any(_undocumented.values()))
+    ok &= check(f"...in both directions: a flag that gained parity must be "
+                f"removed from the exception list, or the README keeps "
+                f"describing a limitation that is gone (stale: "
+                f"{ {k: v for k, v in _closed.items() if v} or 'none'})",
+                not any(_closed.values()))
+
+    # And the README must not claim a parity that does not exist. It said
+    # "Same CLI, same parsing core, same output" flat out.
+    _readme = open(os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                "README.md"), encoding="utf-8").read()
+    ok &= check("the README does not claim an unqualified identical CLI, "
+                "because three flags are Playwright-only",
+                "Same CLI, same parsing core, same output. Pick by" not in _readme)
+    ok &= check("...and it names the engine-specific flags, so a reader "
+                "picking an engine learns what they give up",
+                "--mode" in _readme and "Playwright only" in _readme)
+    return ok
+
+
 def check_the_suite_s_own_shape(ok: bool) -> bool:
     """the suite's own shape"""
     # main() was one 2,650-line function. The 2026-09-11 audit called that
@@ -3985,6 +4087,7 @@ def main() -> int:
     ok = check_proxy_credentials_must_not_reach_a_browser_comma(ok)
     ok = check_proxy_pool_and_rotation(ok)
     ok = check_product_detail_pages(ok)
+    ok = check_engine_flag_parity(ok)
     ok = check_the_suite_s_own_shape(ok)
     ok = check_naming_and_dead_feature_guards(ok)
     ok = check_canary_yml_the_exit_code_table_it_prints_must_be(ok)
