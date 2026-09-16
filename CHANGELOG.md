@@ -6,13 +6,30 @@ All notable changes to this project are documented here. Format follows
 library with a stable API) reasonably can — a patch bump means "fixes", not
 a promise that every flag and exit code is contractually frozen.
 
-## [Unreleased]
+## [0.5.0] — 2026-09-15
 
-> **Behaviour change for existing callers.** A run that gathered nothing and
-> was never able to fetch the page now exits **5**, where it used to exit 4.
-> If your automation branches on 4 meaning "anything went wrong", it needs
-> the new row. The reason for the change is that 4 was never able to mean
-> what it said: read the exit-code table in the README.
+> **Read this before upgrading.** Two things change for an existing caller.
+>
+> **A run that gathered nothing and never got the page now exits 5**, where
+> it used to exit 4. If your automation branches on 4 meaning "anything went
+> wrong", it needs the new row — 4 now means only "the page was fetched and
+> held nothing", which is the one case that says something about the
+> catalogue. See the exit-code table in the README.
+>
+> **A blocked run now exits 3 where many of them used to exit 4.** Akamai's
+> refusal page was not recognised as a block, so every run refused by the
+> edge reported an empty category. Nothing about your setup changed; the
+> reports were wrong before.
+>
+> Everything else is additive: `--mode detail`, `--resume`, `--webhook`,
+> console scripts, and a container image on GHCR.
+
+This release is the work from a third-party audit taken on v0.4.2, plus what
+running the code against the live site turned up while working through it.
+The audit's own P0 was five items; all five are done, and two of its
+suggested fixes turned out not to work as written (see the first entry
+below). Of P1, four of six are done and two are declined with reasons in the
+PR. Of P2, three of four.
 
 ### Fixed
 
