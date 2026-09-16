@@ -37,6 +37,16 @@ a promise that every flag and exit code is contractually frozen.
   Verified by control: reintroducing the phrase into an engine — in a
   capitalisation the old list would have missed — turns the suite red.
 
+### CI
+
+- **The two Claude workflows are guarded on their token.** Neither tested
+  whether `CLAUDE_CODE_OAUTH_TOKEN` is set, so a copy of this repo without
+  the secret fails the job on the action's own environment validation — a
+  permanently red check on every PR, and a check that is always red teaches
+  everyone to ignore checks. `secrets` is not available in a job-level `if`,
+  so presence is tested through the job `env` and read in each step's `if`,
+  which is the shape the rest of this family uses.
+
 ## [0.5.0] — 2026-09-15
 
 > **Read this before upgrading.** Two things change for an existing caller.
