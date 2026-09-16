@@ -3479,51 +3479,66 @@ def check_naming_and_dead_feature_guards(ok: bool) -> bool:
     # into naming the products correctly and removing a flag that could not
     # work, and every one of those is a string an editor can reintroduce without
     # anything failing. So fail here instead.
-    import glob as _glob
-
-    SHIPPED = sorted(set(_glob.glob("*.py")) | set(_glob.glob("*.sh"))
-                     | set(_glob.glob("*.md")) | set(_glob.glob("*.txt"))
-                     | set(_glob.glob("*.html")))
+    # Three holes were closed here on 2026-09-16, and the third is why the
+    # first two survived:
+    #
+    #   * the list carried the two COMPOUND forms of the banned product
+    #     name (the "2scraper ..." one and the "proprietary ..." one) but not
+    #     the bare two-word phrase, which every sibling repo in this family
+    #     bans. Eight occurrences of it shipped in the three engines through
+    #     that gap, including in the --cdp-endpoint help text a user reads;
+    #   * matching was case-sensitive, patched by listing one capitalised
+    #     variant by hand beside its lowercase twin -- which works for
+    #     exactly the casings someone thought of;
+    #   * smoke_test.py was excluded from the scan WHOLESALE, so the file
+    #     most likely to acquire a stray phrase by copy-paste was the one
+    #     file nobody checked.
+    #
+    # All three are fixed the way woolworths-scraper does it: the phrases are
+    # ASSEMBLED from pieces, so this file does not contain the literals it
+    # forbids and can therefore be scanned like any other; matching is
+    # case-insensitive; and the scan is anchored to this file's directory
+    # with a floor on how many files it saw, because a check that can quietly
+    # scan zero files is not a check.
+    _ad = "anti" + "detect"
     BANNED = [
-        # invented product names
-        ("2scraper Antidetect Browser", "a product that does not exist under that name"),
-        ("proprietary antidetect browser", "same — the browser is the Scraping Browser API"),
-        # superseded product naming (Petr, 2026-08-26: it is the
-        # "2Captcha Scraping Browser API"; there is no separate brand yet)
-        ("cloud browser", "call it the Scraping Browser API"),
-        ("Cloud browser", "call it the Scraping Browser API"),
-        # a gateway host that was never real; 2prx.com is a synonym of
-        # 2captcha.com/proxy, not a separate service with its own hostnames
-        ("gate.2prx.com", "not a real gateway host"),
-        # the removed flag
-        ("--antidetect", "the flag was removed: its endpoint was a placeholder"),
-        ("ANTIDETECT_LOCAL_API", "removed with the flag"),
+        (f"2scraper {_ad} browser", "a product that does not exist under that name"),
+        (f"proprietary {_ad} browser", "the browser is the Scraping Browser API"),
+        (f"{_ad} browser", "call it the Scraping Browser API"),
+        (" ".join(["cloud", "browser"]), "call it the Scraping Browser API"),
+        ("gate.2prx" + ".com", "not a real gateway host; 2prx.com is a synonym "
+                               "of 2captcha.com/proxy"),
+        (f"--{_ad}", "the flag was removed: its endpoint was a placeholder"),
+        (f"{_ad.upper()}_LOCAL_API", "removed with the flag"),
     ]
+    _root = os.path.dirname(os.path.abspath(__file__))
+    SHIPPED = sorted(
+        os.path.join(_root, n) for n in os.listdir(_root)
+        if n.endswith((".py", ".sh", ".md", ".txt", ".html", ".yml", ".yaml",
+                       ".toml", ".example")))
+    ok &= check(f"the wording scan actually scanned something ({len(SHIPPED)} "
+                f"files)", len(SHIPPED) > 20)
     offenders = []
     for f in SHIPPED:
         try:
-            body = open(f, encoding="utf-8").read()
-        except Exception:
+            body = open(f, encoding="utf-8", errors="replace").read()
+        except OSError:
             continue
-        for phrase, why in BANNED:
-            for n, line in enumerate(body.splitlines(), 1):
-                if phrase in line:
-                    # This test names the phrases, so skip its own listing.
-                    if f == "smoke_test.py" and "BANNED" in body[:body.index(line)][-2000:]:
-                        continue
-                    offenders.append(f"{f}:{n} {phrase!r} — {why}")
-    # smoke_test.py holds the list itself; exclude it wholesale rather than
-    # guessing which line is the data.
-    offenders = [o for o in offenders if not o.startswith("smoke_test.py")]
+        rel = os.path.relpath(f, _root)
+        for n, line in enumerate(body.splitlines(), 1):
+            low = line.lower()
+            for phrase, why in BANNED:
+                if phrase.lower() in low:
+                    offenders.append(f"{rel}:{n} {phrase!r} - {why}")
     ok &= check("no shipped file names a product that does not exist, or the "
-                "removed --antidetect flag"
+                f"removed --{_ad} flag"
                 + ("" if not offenders else " -> " + "; ".join(offenders[:4])),
                 not offenders)
 
     ok &= check("solve_recaptcha no longer takes use_antidetect",
                 "use_antidetect" not in inspect.signature(_cs.solve_recaptcha).parameters)
-    ok &= check("the placeholder antidetect endpoint constant is gone",
-                not hasattr(_cs, "ANTIDETECT_LOCAL_API"))
+    ok &= check("the placeholder local-API endpoint constant is gone",
+                not hasattr(_cs, f"{_ad.upper()}_LOCAL_API"))
 
     # THE SHIPPED CI CHECKS RUN, AND PASS ON THIS REPO.
     #

@@ -331,7 +331,7 @@ async def scrape(args) -> int:
                 await asyncio.sleep(args.delay)
     finally:
         if args.cdp_endpoint:
-            await page.close()  # leave the remote/antidetect browser running
+            await page.close()  # leave the remote browser running
             await browser.disconnect()
         else:
             await browser.close()
