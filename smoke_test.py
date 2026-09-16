@@ -2269,11 +2269,46 @@ def check_selenium_two_live_local_failures_turned_into_tes(ok: bool) -> bool:
                     and any("Canary" in c for c in cands)
                     and any("Brave" in c for c in cands)
                     and any("Edge" in c for c in cands))
-        _t0 = _time.time()
-        _sel._local_chrome_version()
-        ok &= check("selenium: the browser search checks existence before spawning, "
-                    "so it costs well under a second (was 10.5s live)",
-                    _time.time() - _t0 < 3.0)
+        # The original defect was that this probe EXECUTED every candidate,
+        # including ones that do not exist, and spent 10.5s doing it. The fix
+        # is to test for the file first.
+        #
+        # This used to be asserted as "takes under 3 seconds", and that is a
+        # PROXY for the behaviour rather than the behaviour: it passed for the
+        # right reason almost always and failed on a loaded machine, which is
+        # the worst kind of check — one that teaches people to re-run rather
+        # than to look. Seen doing exactly that on 2026-09-15.
+        #
+        # Asserted directly instead: every candidate that is executed must
+        # have been checked for existence first. The probe is handed a
+        # candidate list of paths that cannot exist, and must spawn NOTHING.
+        _spawned = []
+        _orig_run = subprocess.run
+
+        def _tracking_run(cmd, *a, **k):
+            _spawned.append(cmd)
+            return _orig_run(cmd, *a, **k)
+
+        _orig_cands = _sel._chrome_candidates
+        _sel._chrome_candidates = lambda: [
+            "/nonexistent/Chrome", "/also/not/here/Chromium"]
+        subprocess.run = _tracking_run
+        try:
+            _sel._local_chrome_version()
+        finally:
+            subprocess.run = _orig_run
+            _sel._chrome_candidates = _orig_cands
+        # NOT "spawns nothing": on macOS the probe legitimately asks Spotlight
+        # where a browser is, which is a subprocess and is not the bug. The
+        # bug was executing CANDIDATE PATHS that do not exist, so that is what
+        # is asserted — no spawned command may name one.
+        _executed = " ".join(str(c) for c in _spawned)
+        ok &= check("selenium: a candidate path that does not exist is never "
+                    "EXECUTED — the original probe ran every path it could "
+                    "think of, with a 10s timeout each, and spent 10.5s "
+                    "finding nothing",
+                    "/nonexistent/Chrome" not in _executed
+                    and "/also/not/here/Chromium" not in _executed)
 
         # the run that finally passed: the check warned "no browser on this
         # machine" while --chrome-binary named Chrome in /Applications, and the
