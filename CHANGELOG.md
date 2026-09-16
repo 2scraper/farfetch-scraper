@@ -160,6 +160,15 @@ a promise that every flag and exit code is contractually frozen.
   ratings on a detail page (`aggregateRating` appears nowhere), no merchant or
   boutique, and no shipping details, so none of those became columns.
 
+  Verified on a **second market**, which is what turns a guess about locales
+  into a measurement. The same four products were captured on a DE and a US
+  exit: the variant sku is byte-identical on both, while size, title, colour,
+  composition and category are all localised — so a cross-market comparison
+  joins on `sku` and `size` is display text. Prices are set per market rather
+  than converted (60 EUR / 90 USD; 1020 EUR / 598 USD), which is worth knowing
+  before anyone reads a cross-market difference as an arbitrage. Both markets
+  are pinned by real fixtures.
+
 - **`--resume`, and a checkpoint every multi-page run writes.** A run that
   died on page 17 of 20 used to start again at page 1.
   `<out>.progress.json` is written after every page and deleted by a run that

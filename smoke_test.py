@@ -581,6 +581,150 @@ SAMPLE_DETAIL_SALE_HTML = r"""<html><body>
 </body></html>"""
 
 
+# The SAME product as SAMPLE_DETAIL_FULL_PRICE_HTML (item 36899289), captured
+# on a US exit rather than a DE one, so the cross-locale claims are pinned
+# against real bytes from both markets rather than against one market and an
+# assumption about the other.
+#
+# What this fixture is FOR: the variant sku is identical across markets while
+# every human-readable field is not. A cross-market comparison therefore joins
+# on sku, and `size` is display text.
+SAMPLE_DETAIL_US_HTML = r"""<html><body>
+<script type="application/ld+json">
+{
+ "@context": "https://schema.org",
+ "@type": "ProductGroup",
+ "name": "cotton t-shirt with Ami de Coeur",
+ "image": [
+  {
+   "@type": "ImageObject",
+   "contentUrl": "https://cdn-images.farfetch-contents.com/36/89/92/89/36899289_69172521_1000.jpg",
+   "description": "AMI Paris cotton t-shirt with Ami de Coeur | White"
+  },
+  {
+   "@type": "ImageObject",
+   "contentUrl": "https://cdn-images.farfetch-contents.com/36/89/92/89/36899289_69623678_1000.jpg",
+   "description": "AMI Paris cotton t-shirt with Ami de Coeur | Boys T-Shirts"
+  }
+ ],
+ "description": "AMI Paris cotton t-shirt with Ami de Coeur | White | boxy fit | round collar | Ami de Coeur embossed and topstitched on chest | tonal Ami embroidery under back neckline | organic cotton | Organic Cotton | Teen T-Shirts | Teen Tops | Teen Girl Clothing | Teen T-shirts | Tops | Teen Boy Clothing | Girls T-Shirts | Tops | Girls Clothing | Boys T-Shirts | Boys Tops | Boys Clothing | Kids",
+ "productGroupID": "36899289",
+ "color": "White",
+ "brand": {
+  "@type": "Brand",
+  "name": "AMI Paris"
+ },
+ "itemCondition": "https://schema.org/NewCondition",
+ "variesBy": [
+  "https://schema.org/size"
+ ],
+ "hasVariant": [
+  {
+   "@type": "Product",
+   "sku": "36899289-19",
+   "name": "AMI Paris cotton t-shirt with Ami de Coeur | 4 yrs",
+   "size": "4 yrs",
+   "image": "https://cdn-images.farfetch-contents.com/36/89/92/89/36899289_69172521_1000.jpg",
+   "offers": {
+    "@type": "Offer",
+    "url": "https://www.farfetch.com//shopping/kids/ami-paris-cotton-t-shirt-with-ami-de-coeur-item-36899289.aspx?lang=en-US&size=19",
+    "availability": "https://schema.org/InStock",
+    "hasMerchantReturnPolicy": {
+     "@type": "MerchantReturnPolicy",
+     "returnPolicyCategory": "https://schema.org/MerchantReturnFiniteReturnWindow",
+     "merchantReturnDays": 30,
+     "returnMethod": "https://schema.org/ReturnByMail",
+     "returnFees": "https://schema.org/FreeReturn",
+     "applicableCountry": [
+      "US"
+     ]
+    },
+    "priceSpecification": [
+     {
+      "@type": "UnitPriceSpecification",
+      "price": 90,
+      "priceCurrency": "USD"
+     }
+    ]
+   }
+  },
+  {
+   "@type": "Product",
+   "sku": "36899289-21",
+   "name": "AMI Paris cotton t-shirt with Ami de Coeur | 6 yrs",
+   "size": "6 yrs",
+   "image": "https://cdn-images.farfetch-contents.com/36/89/92/89/36899289_69172521_1000.jpg",
+   "offers": {
+    "@type": "Offer",
+    "url": "https://www.farfetch.com//shopping/kids/ami-paris-cotton-t-shirt-with-ami-de-coeur-item-36899289.aspx?lang=en-US&size=21",
+    "availability": "https://schema.org/InStock",
+    "hasMerchantReturnPolicy": {
+     "@type": "MerchantReturnPolicy",
+     "returnPolicyCategory": "https://schema.org/MerchantReturnFiniteReturnWindow",
+     "merchantReturnDays": 30,
+     "returnMethod": "https://schema.org/ReturnByMail",
+     "returnFees": "https://schema.org/FreeReturn",
+     "applicableCountry": [
+      "US"
+     ]
+    },
+    "priceSpecification": [
+     {
+      "@type": "UnitPriceSpecification",
+      "price": 90,
+      "priceCurrency": "USD"
+     }
+    ]
+   }
+  }
+ ],
+ "url": "https://www.farfetch.com//shopping/kids/ami-paris-cotton-t-shirt-with-ami-de-coeur-item-36899289.aspx"
+}
+</script>
+<script type="application/ld+json">
+{
+ "@context": "https://schema.org",
+ "@type": "BreadcrumbList",
+ "itemListElement": [
+  {
+   "@type": "ListItem",
+   "position": 1,
+   "item": {
+    "@id": "/shopping/kids/items.aspx",
+    "name": "Kids Home"
+   }
+  },
+  {
+   "@type": "ListItem",
+   "position": 2,
+   "item": {
+    "@id": "/shopping/kids/designer-ami-paris/items.aspx",
+    "name": "AMI Paris"
+   }
+  },
+  {
+   "@type": "ListItem",
+   "position": 3,
+   "item": {
+    "@id": "/shopping/kids/designer-ami-paris/boys-clothing-3/items.aspx",
+    "name": "Boys Clothing"
+   }
+  },
+  {
+   "@type": "ListItem",
+   "position": 4,
+   "item": {
+    "@id": "/shopping/kids/designer-ami-paris/t-shirts-3/items.aspx",
+    "name": "Boys T-Shirts"
+   }
+  }
+ ]
+}
+</script>
+<h4 class="ltr-2pfgen-Body-BodyBold" data-component="BodyBold">Composition</h4><p class="ltr-4y8w0i-Body" data-component="Body"><span class="ltr-4y8w0i-Body" data-component="Body">Organic Cotton 100%</span></p>
+</body></html>"""
+
+
 def check(label, condition):
     status = "PASS" if condition else "FAIL"
     print(f"[{status}] {label}")
@@ -2931,6 +3075,32 @@ def check_product_detail_pages(ok: bool) -> bool:
                 labelled_blocks(BeautifulSoup(
                     "<html><h4>Versand</h4><p>3 Tage</p></html>",
                     "html.parser")) == {"versand": "3 Tage"})
+
+    # --- the same product on a second market -------------------------
+    us = parse_product_detail(SAMPLE_DETAIL_US_HTML, "https://x/")
+    ok &= check("the variant SKU is identical across markets — which is what "
+                "a cross-market comparison can join on",
+                [x.sku for x in us] == [x.sku for x in full]
+                == ["36899289-19", "36899289-21"])
+    ok &= check("...while the size LABEL is translated, so it is display text "
+                "and not a key: the DE '4 Jahre' is the US '4 yrs'",
+                [x.size for x in full] == ["4 Jahre", "6 Jahre"]
+                and [x.size for x in us] == ["4 yrs", "6 yrs"])
+    ok &= check("title, colour, composition and category are all localised "
+                "too — none of them identifies a product across markets",
+                us[0].title != r.title and us[0].color != r.color
+                and us[0].composition != r.composition
+                and us[0].category != r.category)
+    ok &= check("...and the composition label differs per locale, which is "
+                "why it is matched from a SET of headings rather than one "
+                "string ('Zusammensetzung' vs 'Composition')",
+                r.composition == "Bio-Baumwolle 100%"
+                and us[0].composition == "Organic Cotton 100%")
+    ok &= check("prices are set per market, not converted — the same product "
+                "is 60 EUR and 90 USD, so a cross-market difference is "
+                "pricing rather than arbitrage",
+                r.price == 60.0 and r.currency == "EUR"
+                and us[0].price == 90.0 and us[0].currency == "USD")
 
     ok &= check("images: the group's full set on every row, primary first",
                 r.image_url.endswith("36899289_69172521_1000.jpg?ov=true")

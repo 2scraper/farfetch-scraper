@@ -54,10 +54,42 @@ across seven product pages:
                             (30 days, free, by mail) — a constant is a line
                             in the README, not a column
 
-KNOWN LIMITATION, pinned rather than half-guarded: all 38 variants captured
-were InStock. `in_stock` maps schema.org/InStock and its documented siblings,
-but the negative case has never been seen on a real page, so treat a False
-with more suspicion than a True until one is captured.
+LOCALE: THE SKU IS STABLE, THE SIZE LABEL IS NOT. Measured by capturing the
+same four product ids on DE and on US:
+
+    sku          36899289-19   identical on both markets
+    size         "4 Jahre"  ->  "4 yrs"
+                 "3-6 M."   ->  "3-6 mth"
+                 "10"       ->  "10"        (nothing to translate)
+    title, color, composition, category   all translated
+    color        "Nude"     ->  "Neutrals"  (a different taxonomy value,
+                                             not a translation)
+    price        60 EUR     ->  90 USD
+                 1020 EUR   ->  598 USD
+
+So a cross-market comparison joins on `sku`, and `size` is display text. The
+prices are set per market rather than converted — 1020 EUR is about 1100 USD
+and the US price is 598 — which is worth knowing before anyone reads a
+cross-market difference as an arbitrage.
+
+KNOWN LIMITATION, pinned rather than half-guarded: `in_stock` has never been
+observed False on a real page. 100 variants across 19 products and two
+markets, including an entire sale section, every one InStock. The size picker
+was also opened in a live browser on one product: it showed exactly the sizes
+the JSON-LD carried, no more.
+
+Two explanations remain open, and they mean different things:
+
+  a) everything happened to be in stock, or
+  b) `hasVariant` lists only AVAILABLE sizes and a sold-out one is omitted
+     rather than marked — which would make this column constant.
+
+The page's own analytics event names include Product_OutOfStock_ClickNotifyMe,
+so the UI plainly has a sold-out state; whether the structured data expresses
+it is unresolved. The mapping is therefore an ALLOWLIST rather than
+`!= OutOfStock`: a value nobody anticipated reads as not available rather
+than silently as yes. Treat a False with more suspicion than a True until one
+is captured.
 """
 
 import json

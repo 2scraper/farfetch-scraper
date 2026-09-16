@@ -424,6 +424,25 @@ than assumed: no ratings (`aggregateRating` appears nowhere), no merchant or
 boutique, and no shipping details. Those are not columns, because a column
 that is null on every row of every run is worse than a missing one.
 
+**Across markets, join on `sku`.** The same four products were captured on a
+DE and a US exit. The variant sku is byte-identical on both (`36899289-19`);
+everything readable is not — `4 Jahre` becomes `4 yrs`, `3-6 M.` becomes
+`3-6 mth`, `Bio-Baumwolle 100%` becomes `Organic Cotton 100%`, and the colour
+`Nude` becomes `Neutrals`, which is a different taxonomy value rather than a
+translation. A bare numeric size scale (`5`, `10`, `12`) is identical, having
+nothing to translate.
+
+Prices are **set per market, not converted**: the same t-shirt is 60 EUR and
+90 USD, and one dress is 1020 EUR against 598 USD. Read a cross-market
+difference as pricing, not as arbitrage.
+
+**`in_stock` has never been observed False.** 100 variants, 19 products, two
+markets, including an entire sale section — every one in stock. The size
+picker was also opened in a live browser on one product and showed exactly the
+sizes the structured data carried. Either everything was genuinely in stock,
+or `hasVariant` lists only available sizes and omits sold-out ones; that is
+unresolved, so treat a `false` with more suspicion than a `true`.
+
 ### Resuming a run that stopped early
 
 Every multi-page run writes `<out>.progress.json` after each page, and a run
