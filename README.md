@@ -616,6 +616,13 @@ Runs after **every** navigation, on any page — not scoped to one URL. Both
 detectors always run: one over the static HTML, one in the live page over
 `___grecaptcha_cfg`, and the results are reconciled.
 
+Both API versions were exercised against a live reCAPTCHA on 2026-09-15 —
+2Captcha's own demo page, sitekey read off it rather than pinned. `v2`
+(`createTask`/`getTaskResult`) returned a 2,510-character token in 44s; `v1`
+(`in.php`/`res.php`) returned a 2,574-character token in 6s. Both work; the
+times are one sample each and solve time varies with queue depth, so read
+them as "both paths are alive", not as a benchmark.
+
 **Detected is not the same as blocking, and that distinction costs money.**
 This site carries a reCAPTCHA in its sign-up modal that has nothing to do with
 the catalogue, so a detection on a page whose products are already rendered is
