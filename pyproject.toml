@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "farfetch-scraper"
-version = "0.4.3"
+version = "0.5.0"
 description = "A working scraper for farfetch.com listing pages — category, hub, search and brand."
 readme = "README.md"
 license = "MIT"
@@ -23,6 +23,32 @@ dependencies = [
 [project.urls]
 Homepage = "https://github.com/2scraper/farfetch-scraper"
 
+# Console scripts, so `pip install .[playwright]` produces a real command
+# instead of a directory you have to cd into and invoke with `python3`.
+#
+# The prefix is the repo name, not a bare `scrape`: these install onto a PATH
+# shared with everything else the user has, and a generic name there is worse
+# than a long one. Each engine gets its own command rather than one command
+# with an --engine flag, because the engines have DIFFERENT dependencies and
+# only one of them is expected to be installed (see the extras above) — a
+# dispatcher would import a driver that is deliberately absent.
+#
+# `python3 playwright_scraper.py ...` keeps working exactly as before and is
+# still what the README documents; this is an addition, not a replacement.
+# The module layout is unchanged too: this is a flat collection of scripts,
+# and turning it into a package namespace would rewrite every documented
+# invocation, every import, the Dockerfile and both workflows, to move a
+# prefix around. The console scripts are the part that was actually missing.
+[project.scripts]
+farfetch-scraper = "cli_entry:playwright"
+farfetch-scraper-playwright = "cli_entry:playwright"
+farfetch-scraper-selenium = "cli_entry:selenium"
+farfetch-scraper-puppeteer = "cli_entry:puppeteer"
+farfetch-scraper-api = "scraper_api_client:main"
+farfetch-scraper-diff = "diff_runs:main"
+farfetch-scraper-fingerprint = "fingerprint_client:main"
+farfetch-scraper-env = "env_config:main"
+
 # Mirrors requirements-playwright.txt / requirements-puppeteer.txt /
 # requirements-selenium.txt. Install exactly one — see those files for why:
 # playwright and pyppeteer pin incompatible pyee versions, pyppeteer and
@@ -32,7 +58,8 @@ Homepage = "https://github.com/2scraper/farfetch-scraper"
 playwright = ["playwright>=1.40.0"]
 puppeteer = ["pyppeteer>=1.0.2"]
 selenium = ["selenium>=4.15.0"]
-dev = ["pytest>=7.0"]
+# Mirrors requirements-dev.txt, by hand, like the rest of this file.
+dev = ["pytest>=7.0", "ruff~=0.14", "mypy~=1.18", "types-requests~=2.32"]
 
 [tool.setuptools]
 # This repo is a flat collection of standalone scripts, not a package
@@ -42,19 +69,104 @@ dev = ["pytest>=7.0"]
 # invoked as a script (see CONTRIBUTING.md), not a module an installed
 # dependency would import.
 py-modules = [
+    "arg_types",
     "captcha_solver",
+    "cli_entry",
     "diff_runs",
     "env_config",
     "fingerprint_client",
+    "notify",
     "output_writer",
     "playwright_scraper",
+    "product_detail_parser",
     "product_parser",
     "proxy_pool",
     "puppeteer_scraper",
+    "run_state",
     "scraper_api_client",
     "selenium_scraper",
 ]
 license-files = ["LICENSE"]
+
+[tool.ruff]
+# Ruff is here to catch DEFECTS, not to have opinions about this codebase's
+# style. The selection below is narrow on purpose, and the reason is measured:
+# Ruff's broader rule sets produce 205-311 findings here, and the largest
+# groups are advice this project must not take.
+#
+#   FA100/UP006/UP045/UP035 (41+27+14+8 findings) want PEP 585/604 annotation
+#   syntax — `list[str]`, `X | None`, `collections.abc` imports. This package
+#   declares requires-python = ">=3.9" and tests 3.9 in CI. Taking that advice
+#   would break a version this repo promises to support: the linter's defaults
+#   contradict the project's own stated constraint.
+#
+#   E501 line-too-long (232) would fight the long explanatory comments that
+#   are the most valuable thing in these files.
+#
+#   BLE001 blind-except (16) and SIM115 (22) flag patterns that are
+#   deliberate and already carry a comment saying why.
+#
+# A check that reports 300 findings nobody intends to act on is a check
+# everyone learns to scroll past — the same failure mode as a canary that is
+# red every morning. So: pyflakes (undefined names, unused imports), the
+# runtime-error rules, and bugbear. Fifteen findings when this was added, all
+# real, all now fixed or given a `# noqa` naming the reason.
+target-version = "py39"
+line-length = 100
+exclude = [".venv*", "build", "dist", "*.egg-info"]
+
+[tool.ruff.lint]
+select = ["F", "E9", "B"]
+
+[tool.ruff.lint.per-file-ignores]
+# The suite imports things purely to prove they can be imported, and pokes at
+# private helpers on purpose.
+"smoke_test.py" = ["F401"]
+
+[tool.mypy]
+# Gated on the SHARED CORE only, and the boundary is measured rather than
+# aspirational. Under `--ignore-missing-imports`, per module:
+#
+#   arg_types 0 · cli_entry 0 · output_writer 0 · product_parser 0
+#   proxy_pool 0 · env_config 0          <- gated, and already clean
+#
+#   scraper_api_client 1 · diff_runs 2 · captcha_solver 5
+#   fingerprint_client 6 · puppeteer_scraper 6 · selenium_scraper 7
+#   playwright_scraper 26                <- not gated yet
+#
+# The gated six are the site-independent core other repos in this family copy
+# verbatim, which makes them the ones worth holding to a stricter standard;
+# they cost nothing to keep clean because they already are.
+#
+# The engines are mostly one shape repeated: `html` starts as None and flows
+# into functions annotated `str`, so mypy is right that the Optional is not
+# narrowed. Fixing it is real work on code that demonstrably runs, and doing
+# it under a deadline is how churn gets introduced into three near-identical
+# files at once. Pinned as a known limitation with its measurement rather
+# than half-guarded (CLAUDE.md §10), so widening the gate is a decision
+# someone makes deliberately.
+#
+# smoke_test.py is excluded entirely: it is one long function that rebinds
+# loop variables on purpose, and §10 says not to restructure it.
+files = [
+    "arg_types.py",
+    "cli_entry.py",
+    "output_writer.py",
+    "product_detail_parser.py",
+    "product_parser.py",
+    "proxy_pool.py",
+    "env_config.py",
+    "notify.py",
+    "run_state.py",
+]
+ignore_missing_imports = true
+# Not `strict`: this is a scripts collection, and demanding annotations
+# everywhere would mean annotating argparse Namespaces for no benefit. The
+# value here is catching a type that CONTRADICTS the code, which is what
+# found `def scrape(args) -> None` on three engines that all return an exit
+# code — an annotation a reader would have trusted.
+warn_no_return = true
+warn_redundant_casts = true
 
 [tool.pytest.ini_options]
 # smoke_test.py is a self-contained runner, not a pytest suite (see

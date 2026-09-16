@@ -13,7 +13,11 @@ your Python environment and the parsing/output logic are working:
 Exits non-zero on any failure so it's CI-friendly.
 """
 
+import argparse
+import contextlib
+import io
 import json
+import logging
 import os
 import re
 import builtins
@@ -22,8 +26,19 @@ import subprocess
 import sys
 import tempfile
 
-from product_parser import parse_products, category_from_url
-from output_writer import save, dedupe_by_sku, Product
+import ast as _ast
+
+import captcha_solver as _cs
+from bs4 import BeautifulSoup
+from product_parser import parse_products, category_from_url, detect_bot_challenge
+import csv
+
+from output_writer import (save, dedupe_by_sku, Product, finish_run, run_meta,
+                           write_csv, ProductVariant,
+                           stop_reason_for, new_run_id, quality_metrics,
+                           EXIT_NO_PRODUCTS, EXIT_BLOCKED, EXIT_PARTIAL,
+                           EXIT_FETCH_FAILED, EXIT_DRIVER_TIMEOUT,
+                           COMPLETE_STOP_REASONS, FETCH_FAILURE_STOP_REASONS)
 from captcha_solver import (detect_recaptcha_v3, detect_recaptcha_in_page,
                             reconcile_detections)
 from diff_runs import diff_products
@@ -163,6 +178,47 @@ SAMPLE_FARFETCH_CAPTCHA_WIDGET_HTML = """
 <captcha-widget data-captcha-type="recaptcha" data-widget-id="0" data-version="v3" data-sitekey="6LeifPcbAAAAAJaiPe_xgLTfnbdpEMAYJAAnVFJT" data-action="null" data-callback="reCaptchaWidgetCallback0" data-enterprise="false" data-container-id="register-captcha" data-binded-button-id="null" data-reset="true"></captcha-widget>
 """
 
+# Captured live from www.farfetch.com on 2026-09-14, from a datacentre
+# address the site refuses. This is the ENTIRE response body under HTTP 403 —
+# 318 bytes as the browser serialises it, 406 as the wire delivers it. Not a
+# challenge: there is no widget, no sitekey and nothing to solve, which is
+# why every marker in BOT_CHALLENGE_MARKERS missed it and a blocked run
+# reported "0 products" (exit 4) instead of "blocked" (exit 3).
+#
+# Only the Akamai reference id is edited (it is issued per request, so a real
+# one would pin nothing and go stale immediately). Everything else — the
+# casing, the stray space after the <h1>, the entity escaping in the raw
+# form, the blank lines before </body> — is verbatim, because the whole point
+# of a capture is that it is not what someone would have written by hand.
+
+# As the three BROWSER engines see it: page.content() serialises the parsed
+# DOM, so the entities come back out as ordinary punctuation.
+SAMPLE_AKAMAI_DENIED_DOM_HTML = """<html><head>
+<title>Access Denied</title>
+</head><body>
+<h1>Access Denied</h1>
+
+You don't have permission to access "http://www.farfetch.com/shopping/kids/items.aspx" on this server.<p>
+Reference #18.11111111.1111111111.11111111
+</p><p>https://errors.edgesuite.net/18.11111111.1111111111.11111111</p>
+
+
+</body></html>"""
+
+# As scraper_api_client (and any plain HTTP client) sees it: Akamai escapes
+# the punctuation, so "errors.edgesuite.net" and "Reference #" are simply not
+# present as strings. Both of those were the audit's suggested markers.
+SAMPLE_AKAMAI_DENIED_RAW_HTML = """<HTML><HEAD>
+<TITLE>Access Denied</TITLE>
+</HEAD><BODY>
+<H1>Access Denied</H1>
+
+You don't have permission to access "http&#58;&#47;&#47;www&#46;farfetch&#46;com&#47;shopping&#47;kids&#47;items&#46;aspx" on this server.<P>
+Reference&#32;&#35;18&#46;11111111&#46;1111111111&#46;11111111
+<P>https&#58;&#47;&#47;errors&#46;edgesuite&#46;net&#47;18&#46;11111111&#46;1111111111&#46;11111111</P>
+</BODY>
+</HTML>"""
+
 # Confirmed live from farfetch.com on 2026-08-12: the product URL lives
 # under offers.url, NOT directly on the Product node. An earlier version
 # of _parse_jsonld only checked node["url"], which is absent here, and
@@ -212,183 +268,523 @@ SAMPLE_FARFETCH_JSONLD_HTML = """
 """
 
 
+# Cut from real pages captured 2026-09-15 through a DE exit. Only what the
+# parser reads was kept — the two JSON-LD blocks and the composition markup —
+# which is also the scrub: the uuids these pages carry live in their
+# analytics and config scripts and are not part of what was cut. `hasVariant`
+# is trimmed to two sizes so the fixture stays readable; every value is
+# otherwise verbatim, down to the build-hash class names on the composition
+# block, which are exactly what a parser must NOT anchor on.
+#
+# Verified before committing: the trimmed fixture parses to the SAME value
+# for every field of every retained row as the untrimmed 260 KB original. A
+# fixture that does not is pinning something the site never sent.
+#
+# A DETAIL page publishes ProductGroup; a LISTING page publishes
+# ItemList/Product. That is the difference that makes a second parser
+# necessary, and porting the listing parser here would return zero products
+# in silence.
+SAMPLE_DETAIL_FULL_PRICE_HTML = r"""<html><body>
+<script type="application/ld+json">
+{
+ "@context": "https://schema.org",
+ "@type": "ProductGroup",
+ "name": "Baumwoll-T-Shirt mit Ami de Coeur",
+ "image": [
+  {
+   "@type": "ImageObject",
+   "contentUrl": "https://cdn-images.farfetch-contents.com/36/89/92/89/36899289_69172521_1000.jpg?ov=true",
+   "description": "AMI Paris Baumwoll-T-Shirt mit Ami de Coeur | Weiß"
+  },
+  {
+   "@type": "ImageObject",
+   "contentUrl": "https://cdn-images.farfetch-contents.com/36/89/92/89/36899289_69623678_1000.jpg?ov=true",
+   "description": "AMI Paris Baumwoll-T-Shirt mit Ami de Coeur | Klassisches T-Shirt"
+  }
+ ],
+ "description": "AMI Paris Baumwoll-T-Shirt mit Ami de Coeur | Weiß | kastiger Schnitt | runder Kragen | Ami de Coeur Prägung und Zierstich auf der Brust | farblich abgestimmte AMI-Stickerei hinten | Bio-Baumwolle | Bio-Baumwolle | T-Shirts für Teen Girls | Tops für Teen Girls | Kleidung für Teen Girls | T-Shirts für Teen Boys | Tops | Teen Boys | Klassisches T-Shirt | Tops | Kleidung für Mädchen | Klassisches T-Shirt | Tops | Kleidung für Jungen | Kinder",
+ "productGroupID": "36899289",
+ "color": "Weiß",
+ "brand": {
+  "@type": "Brand",
+  "name": "AMI Paris"
+ },
+ "itemCondition": "https://schema.org/NewCondition",
+ "variesBy": [
+  "https://schema.org/size"
+ ],
+ "hasVariant": [
+  {
+   "@type": "Product",
+   "sku": "36899289-19",
+   "name": "AMI Paris Baumwoll-T-Shirt mit Ami de Coeur | 4 Jahre",
+   "size": "4 Jahre",
+   "image": "https://cdn-images.farfetch-contents.com/36/89/92/89/36899289_69172521_1000.jpg?ov=true",
+   "offers": {
+    "@type": "Offer",
+    "url": "https://www.farfetch.com/de/shopping/kids/ami-paris-baumwoll-t-shirt-mit-ami-de-coeur-item-36899289.aspx?lang=de-DE&size=19",
+    "availability": "https://schema.org/InStock",
+    "hasMerchantReturnPolicy": {
+     "@type": "MerchantReturnPolicy",
+     "returnPolicyCategory": "https://schema.org/MerchantReturnFiniteReturnWindow",
+     "merchantReturnDays": 30,
+     "returnMethod": "https://schema.org/ReturnByMail",
+     "returnFees": "https://schema.org/FreeReturn",
+     "applicableCountry": [
+      "DE"
+     ]
+    },
+    "priceSpecification": [
+     {
+      "@type": "UnitPriceSpecification",
+      "price": 60,
+      "priceCurrency": "EUR"
+     }
+    ]
+   }
+  },
+  {
+   "@type": "Product",
+   "sku": "36899289-21",
+   "name": "AMI Paris Baumwoll-T-Shirt mit Ami de Coeur | 6 Jahre",
+   "size": "6 Jahre",
+   "image": "https://cdn-images.farfetch-contents.com/36/89/92/89/36899289_69172521_1000.jpg?ov=true",
+   "offers": {
+    "@type": "Offer",
+    "url": "https://www.farfetch.com/de/shopping/kids/ami-paris-baumwoll-t-shirt-mit-ami-de-coeur-item-36899289.aspx?lang=de-DE&size=21",
+    "availability": "https://schema.org/InStock",
+    "hasMerchantReturnPolicy": {
+     "@type": "MerchantReturnPolicy",
+     "returnPolicyCategory": "https://schema.org/MerchantReturnFiniteReturnWindow",
+     "merchantReturnDays": 30,
+     "returnMethod": "https://schema.org/ReturnByMail",
+     "returnFees": "https://schema.org/FreeReturn",
+     "applicableCountry": [
+      "DE"
+     ]
+    },
+    "priceSpecification": [
+     {
+      "@type": "UnitPriceSpecification",
+      "price": 60,
+      "priceCurrency": "EUR"
+     }
+    ]
+   }
+  }
+ ],
+ "url": "https://www.farfetch.com/de/shopping/kids/ami-paris-baumwoll-t-shirt-mit-ami-de-coeur-item-36899289.aspx"
+}
+</script>
+<script type="application/ld+json">
+{
+ "@context": "https://schema.org",
+ "@type": "BreadcrumbList",
+ "itemListElement": [
+  {
+   "@type": "ListItem",
+   "position": 1,
+   "item": {
+    "@id": "/de/shopping/kids/items.aspx",
+    "name": "Kids"
+   }
+  },
+  {
+   "@type": "ListItem",
+   "position": 2,
+   "item": {
+    "@id": "/de/shopping/kids/designer-ami-paris/items.aspx",
+    "name": "AMI Paris"
+   }
+  },
+  {
+   "@type": "ListItem",
+   "position": 3,
+   "item": {
+    "@id": "/de/shopping/kids/designer-ami-paris/boys-clothing-3/items.aspx",
+    "name": "Kleidung für Jungen"
+   }
+  },
+  {
+   "@type": "ListItem",
+   "position": 4,
+   "item": {
+    "@id": "/de/shopping/kids/designer-ami-paris/t-shirts-3/items.aspx",
+    "name": "Klassisches T-Shirt"
+   }
+  }
+ ]
+}
+</script>
+<h4 class="ltr-2pfgen-Body-BodyBold" data-component="BodyBold">Zusammensetzung</h4><p class="ltr-4y8w0i-Body" data-component="Body"><span class="ltr-4y8w0i-Body" data-component="Body">Bio-Baumwolle 100%</span></p>
+</body></html>"""
+
+# The same shape, discounted. Two UnitPriceSpecification entries per variant:
+# the one without a priceType is what is paid, the StrikethroughPrice one is
+# what it was. 45 against 90 — the whole chain, published, which is why this
+# parser needs no DOM price overlay.
+SAMPLE_DETAIL_SALE_HTML = r"""<html><body>
+<script type="application/ld+json">
+{
+ "@context": "https://schema.org",
+ "@type": "ProductGroup",
+ "name": "Pullover mit Logo-Stickerei",
+ "image": [
+  {
+   "@type": "ImageObject",
+   "contentUrl": "https://cdn-images.farfetch-contents.com/32/48/54/56/32485456_62556294_1000.jpg?ov=true",
+   "description": "Marni Kids Pullover mit Logo-Stickerei | Grau"
+  },
+  {
+   "@type": "ImageObject",
+   "contentUrl": "https://cdn-images.farfetch-contents.com/32/48/54/56/32485456_62556268_1000.jpg?ov=true",
+   "description": "Marni Kids Pullover mit Logo-Stickerei | Gestricktes Top"
+  },
+  {
+   "@type": "ImageObject",
+   "contentUrl": "https://cdn-images.farfetch-contents.com/32/48/54/56/32485456_62571423_1000.jpg?ov=true",
+   "description": "Marni Kids Pullover mit Logo-Stickerei | Tops"
+  },
+  {
+   "@type": "ImageObject",
+   "contentUrl": "https://cdn-images.farfetch-contents.com/32/48/54/56/32485456_62556313_1000.jpg?ov=true",
+   "description": "Marni Kids Pullover mit Logo-Stickerei | Kleidung für Baby Boys"
+  }
+ ],
+ "description": "Marni Kids Pullover mit Logo-Stickerei | Grau | Grau | Logo-Stickerei | runder Ausschnitt | lange Ärmel | Baumwolle | Gestricktes Top | Tops | Kleidung für Baby Girls | Gestricktes Top | Tops | Kleidung für Baby Boys | Kinder",
+ "productGroupID": "32485456",
+ "color": "Grau",
+ "brand": {
+  "@type": "Brand",
+  "name": "Marni Kids"
+ },
+ "itemCondition": "https://schema.org/NewCondition",
+ "variesBy": [
+  "https://schema.org/size"
+ ],
+ "hasVariant": [
+  {
+   "@type": "Product",
+   "sku": "32485456-19",
+   "name": "Marni Kids Pullover mit Logo-Stickerei | 3-6 M.",
+   "size": "3-6 M.",
+   "image": "https://cdn-images.farfetch-contents.com/32/48/54/56/32485456_62556294_1000.jpg?ov=true",
+   "offers": {
+    "@type": "Offer",
+    "url": "https://www.farfetch.com/de/shopping/kids/marni-kids-pullover-mit-logo-stickerei-item-32485456.aspx?lang=de-DE&size=19",
+    "availability": "https://schema.org/InStock",
+    "hasMerchantReturnPolicy": {
+     "@type": "MerchantReturnPolicy",
+     "returnPolicyCategory": "https://schema.org/MerchantReturnFiniteReturnWindow",
+     "merchantReturnDays": 30,
+     "returnMethod": "https://schema.org/ReturnByMail",
+     "returnFees": "https://schema.org/FreeReturn",
+     "applicableCountry": [
+      "DE"
+     ]
+    },
+    "priceSpecification": [
+     {
+      "@type": "UnitPriceSpecification",
+      "price": 45,
+      "priceCurrency": "EUR"
+     },
+     {
+      "@type": "UnitPriceSpecification",
+      "price": 90,
+      "priceCurrency": "EUR",
+      "priceType": "https://schema.org/StrikethroughPrice"
+     }
+    ]
+   }
+  },
+  {
+   "@type": "Product",
+   "sku": "32485456-20",
+   "name": "Marni Kids Pullover mit Logo-Stickerei | 6-9 M.",
+   "size": "6-9 M.",
+   "image": "https://cdn-images.farfetch-contents.com/32/48/54/56/32485456_62556294_1000.jpg?ov=true",
+   "offers": {
+    "@type": "Offer",
+    "url": "https://www.farfetch.com/de/shopping/kids/marni-kids-pullover-mit-logo-stickerei-item-32485456.aspx?lang=de-DE&size=20",
+    "availability": "https://schema.org/InStock",
+    "hasMerchantReturnPolicy": {
+     "@type": "MerchantReturnPolicy",
+     "returnPolicyCategory": "https://schema.org/MerchantReturnFiniteReturnWindow",
+     "merchantReturnDays": 30,
+     "returnMethod": "https://schema.org/ReturnByMail",
+     "returnFees": "https://schema.org/FreeReturn",
+     "applicableCountry": [
+      "DE"
+     ]
+    },
+    "priceSpecification": [
+     {
+      "@type": "UnitPriceSpecification",
+      "price": 45,
+      "priceCurrency": "EUR"
+     },
+     {
+      "@type": "UnitPriceSpecification",
+      "price": 90,
+      "priceCurrency": "EUR",
+      "priceType": "https://schema.org/StrikethroughPrice"
+     }
+    ]
+   }
+  }
+ ],
+ "url": "https://www.farfetch.com/de/shopping/kids/marni-kids-pullover-mit-logo-stickerei-item-32485456.aspx"
+}
+</script>
+<script type="application/ld+json">
+{
+ "@context": "https://schema.org",
+ "@type": "BreadcrumbList",
+ "itemListElement": [
+  {
+   "@type": "ListItem",
+   "position": 1,
+   "item": {
+    "@id": "/de/shopping/kids/items.aspx",
+    "name": "Kids"
+   }
+  },
+  {
+   "@type": "ListItem",
+   "position": 2,
+   "item": {
+    "@id": "/de/shopping/kids/marni-kids/items.aspx",
+    "name": "Marni Kids"
+   }
+  },
+  {
+   "@type": "ListItem",
+   "position": 3,
+   "item": {
+    "@id": "/de/shopping/kids/marni-kids/baby-boy-clothing-5/items.aspx",
+    "name": "Kleidung für Baby Boys"
+   }
+  },
+  {
+   "@type": "ListItem",
+   "position": 4,
+   "item": {
+    "@id": "/de/shopping/kids/marni-kids/knitwear-5/items.aspx",
+    "name": "Gestricktes Top"
+   }
+  }
+ ]
+}
+</script>
+<h4 class="ltr-2pfgen-Body-BodyBold" data-component="BodyBold">Zusammensetzung</h4><p class="ltr-4y8w0i-Body" data-component="Body"><span class="ltr-4y8w0i-Body" data-component="Body">Baumwolle 100%</span></p>
+</body></html>"""
+
+
+# The SAME product as SAMPLE_DETAIL_FULL_PRICE_HTML (item 36899289), captured
+# on a US exit rather than a DE one, so the cross-locale claims are pinned
+# against real bytes from both markets rather than against one market and an
+# assumption about the other.
+#
+# What this fixture is FOR: the variant sku is identical across markets while
+# every human-readable field is not. A cross-market comparison therefore joins
+# on sku, and `size` is display text.
+SAMPLE_DETAIL_US_HTML = r"""<html><body>
+<script type="application/ld+json">
+{
+ "@context": "https://schema.org",
+ "@type": "ProductGroup",
+ "name": "cotton t-shirt with Ami de Coeur",
+ "image": [
+  {
+   "@type": "ImageObject",
+   "contentUrl": "https://cdn-images.farfetch-contents.com/36/89/92/89/36899289_69172521_1000.jpg",
+   "description": "AMI Paris cotton t-shirt with Ami de Coeur | White"
+  },
+  {
+   "@type": "ImageObject",
+   "contentUrl": "https://cdn-images.farfetch-contents.com/36/89/92/89/36899289_69623678_1000.jpg",
+   "description": "AMI Paris cotton t-shirt with Ami de Coeur | Boys T-Shirts"
+  }
+ ],
+ "description": "AMI Paris cotton t-shirt with Ami de Coeur | White | boxy fit | round collar | Ami de Coeur embossed and topstitched on chest | tonal Ami embroidery under back neckline | organic cotton | Organic Cotton | Teen T-Shirts | Teen Tops | Teen Girl Clothing | Teen T-shirts | Tops | Teen Boy Clothing | Girls T-Shirts | Tops | Girls Clothing | Boys T-Shirts | Boys Tops | Boys Clothing | Kids",
+ "productGroupID": "36899289",
+ "color": "White",
+ "brand": {
+  "@type": "Brand",
+  "name": "AMI Paris"
+ },
+ "itemCondition": "https://schema.org/NewCondition",
+ "variesBy": [
+  "https://schema.org/size"
+ ],
+ "hasVariant": [
+  {
+   "@type": "Product",
+   "sku": "36899289-19",
+   "name": "AMI Paris cotton t-shirt with Ami de Coeur | 4 yrs",
+   "size": "4 yrs",
+   "image": "https://cdn-images.farfetch-contents.com/36/89/92/89/36899289_69172521_1000.jpg",
+   "offers": {
+    "@type": "Offer",
+    "url": "https://www.farfetch.com//shopping/kids/ami-paris-cotton-t-shirt-with-ami-de-coeur-item-36899289.aspx?lang=en-US&size=19",
+    "availability": "https://schema.org/InStock",
+    "hasMerchantReturnPolicy": {
+     "@type": "MerchantReturnPolicy",
+     "returnPolicyCategory": "https://schema.org/MerchantReturnFiniteReturnWindow",
+     "merchantReturnDays": 30,
+     "returnMethod": "https://schema.org/ReturnByMail",
+     "returnFees": "https://schema.org/FreeReturn",
+     "applicableCountry": [
+      "US"
+     ]
+    },
+    "priceSpecification": [
+     {
+      "@type": "UnitPriceSpecification",
+      "price": 90,
+      "priceCurrency": "USD"
+     }
+    ]
+   }
+  },
+  {
+   "@type": "Product",
+   "sku": "36899289-21",
+   "name": "AMI Paris cotton t-shirt with Ami de Coeur | 6 yrs",
+   "size": "6 yrs",
+   "image": "https://cdn-images.farfetch-contents.com/36/89/92/89/36899289_69172521_1000.jpg",
+   "offers": {
+    "@type": "Offer",
+    "url": "https://www.farfetch.com//shopping/kids/ami-paris-cotton-t-shirt-with-ami-de-coeur-item-36899289.aspx?lang=en-US&size=21",
+    "availability": "https://schema.org/InStock",
+    "hasMerchantReturnPolicy": {
+     "@type": "MerchantReturnPolicy",
+     "returnPolicyCategory": "https://schema.org/MerchantReturnFiniteReturnWindow",
+     "merchantReturnDays": 30,
+     "returnMethod": "https://schema.org/ReturnByMail",
+     "returnFees": "https://schema.org/FreeReturn",
+     "applicableCountry": [
+      "US"
+     ]
+    },
+    "priceSpecification": [
+     {
+      "@type": "UnitPriceSpecification",
+      "price": 90,
+      "priceCurrency": "USD"
+     }
+    ]
+   }
+  }
+ ],
+ "url": "https://www.farfetch.com//shopping/kids/ami-paris-cotton-t-shirt-with-ami-de-coeur-item-36899289.aspx"
+}
+</script>
+<script type="application/ld+json">
+{
+ "@context": "https://schema.org",
+ "@type": "BreadcrumbList",
+ "itemListElement": [
+  {
+   "@type": "ListItem",
+   "position": 1,
+   "item": {
+    "@id": "/shopping/kids/items.aspx",
+    "name": "Kids Home"
+   }
+  },
+  {
+   "@type": "ListItem",
+   "position": 2,
+   "item": {
+    "@id": "/shopping/kids/designer-ami-paris/items.aspx",
+    "name": "AMI Paris"
+   }
+  },
+  {
+   "@type": "ListItem",
+   "position": 3,
+   "item": {
+    "@id": "/shopping/kids/designer-ami-paris/boys-clothing-3/items.aspx",
+    "name": "Boys Clothing"
+   }
+  },
+  {
+   "@type": "ListItem",
+   "position": 4,
+   "item": {
+    "@id": "/shopping/kids/designer-ami-paris/t-shirts-3/items.aspx",
+    "name": "Boys T-Shirts"
+   }
+  }
+ ]
+}
+</script>
+<h4 class="ltr-2pfgen-Body-BodyBold" data-component="BodyBold">Composition</h4><p class="ltr-4y8w0i-Body" data-component="Body"><span class="ltr-4y8w0i-Body" data-component="Body">Organic Cotton 100%</span></p>
+</body></html>"""
+
+
 def check(label, condition):
     status = "PASS" if condition else "FAIL"
     print(f"[{status}] {label}")
     return condition
 
 
-def main() -> int:
-    ok = True
+def _kwonly_only(fn) -> bool:
+    """True if `fn` takes no positional parameters at all.
 
-    # Checks that could not run because an optional engine library is absent.
-    # Reported at the end: a suite that silently skips part of itself and still
-    # says "all passed" is the same defect as code that reports success without
-    # checking that what it wanted actually happened.
-    _skips = []
+    A shared helper called from three engines is exactly where a positional
+    argument goes wrong quietly: tokopedia-scraper's classify(html, status,
+    url) was called as classify(html, url=...) by two of its three engines
+    and both crashed on their FIRST fetch, invisible to import, --help,
+    compileall and 400+ green assertions (CLAUDE.md §17). Keyword-only
+    parameters make that shape impossible to write.
+    """
+    import inspect
+    return all(p.kind is inspect.Parameter.KEYWORD_ONLY
+               for p in inspect.signature(fn).parameters.values())
 
-    products = parse_products(SAMPLE_LISTING_HTML, "https://www.farfetch.com/shopping/kids/items.aspx", category="Kids")
-    ok &= check("parser extracts exactly 2 real products (junk link excluded)", len(products) == 2)
-    ok &= check("first product has correct title/price",
-                products[0].title == "Marni Kids logo-print cotton T-shirt" and products[0].price == 79.0)
-    ok &= check("three-price tile resolves to lowest price + highest original",
-                products[1].price == 64.0 and products[1].original_price == 160.0)
-    # This fixture was written as a "multiple boutiques" case. It is not: the
-    # live site shows exactly this shape as ONE product's discount chain —
-    # 160 -50% -> 80 -20% -> 64, matching the four real products measured on a
-    # /sale/all/ page. The old expectation of 50.0 read only the FIRST
-    # percentage, which is not the discount the buyer gets.
-    ok &= check("discount_pct is the compounded discount (160->64 = 60%), not "
-                "the first printed percentage (-50%)",
-                products[1].discount_pct == 60.0)
-    ok &= check("category label propagated", products[0].category == "Kids")
-    ok &= check("junk 'sizing guide' link did not create a 3rd product or steal a sibling's data", len(products) == 2)
 
-    farfetch_products = parse_products(SAMPLE_FARFETCH_JSONLD_HTML, "https://www.farfetch.com/shopping/kids/girls-clothing-4/items.aspx")
-    ok &= check("Farfetch JSON-LD: product URL comes from offers.url, not the listing page",
-                len(farfetch_products) == 2
-                and farfetch_products[0].url == "https://www.farfetch.com/shopping/kids/diesel-kids-logo-t-shirt-item-33055894.aspx"
-                and farfetch_products[1].url == "https://www.farfetch.com/shopping/kids/marni-kids-logo-print-t-shirt-item-32485327.aspx")
-    ok &= check("Farfetch JSON-LD: brand parsed correctly", farfetch_products[0].brand == "Diesel Kids")
+# Skips and their engine names are accumulated ACROSS sections, so they are
+# module state rather than something threaded through every signature. Only
+# these: a section that needs anything else makes it.
+#
+# A suite that silently skips part of itself and still says "all passed" is
+# the same defect as code reporting success without checking that what it
+# wanted actually happened — which is why they are reported at the end rather
+# than merely collected.
+_skips = []
+_skipped_engines = set()
 
-    # sku is recovered from the URL: Farfetch's listing JSON-LD carries no
-    # sku/productID field at all (verified on two live captures two weeks
-    # apart), so without this every row would have sku=None.
-    ok &= check("JSON-LD: sku recovered from the -item-<digits>.aspx URL",
-                farfetch_products[0].sku == "33055894" and farfetch_products[1].sku == "32485327")
-    ok &= check("CSS fallback: sku recovered from the URL too",
-                products[0].sku == "29998189" and products[1].sku == "99999")
+# The repo this suite is checking. Was recomputed inside several sections
+# when they all lived in one function and could see each other's locals.
+_repo_root = os.path.dirname(os.path.abspath(__file__))
 
-    # EUR / symbol-after-number locale — a $-only regex scores 0 here.
-    eur = parse_products(SAMPLE_EUR_LISTING_HTML, "https://www.farfetch.com/de/shopping/kids/girls-clothing-4/items.aspx")
-    ok &= check("EUR locale: all 3 products parsed despite '125 €' form", len(eur) == 3)
-    ok &= check("EUR locale: currency detected as EUR, not defaulted to USD",
-                all(p.currency == "EUR" for p in eur))
-    ok &= check("EUR locale: plain price parsed", eur[0].price == 125.0)
-    # 65 -> 46 is 29.2%, and the tile prints "-30%" — the site rounds for
-    # display. The computed figure is the discount actually received, so that is
-    # what ships; the 1pp cross-check tolerance treats this as agreement and
-    # logs nothing.
-    ok &= check("EUR locale: discounted tile resolves low/high correctly, not inverted",
-                eur[1].price == 46.0 and eur[1].original_price == 65.0)
-    ok &= check("EUR locale: discount computed from prices (29.2%), not read "
-                "from the site's rounded '-30%'",
-                eur[1].discount_pct == 29.2)
-    ok &= check("EUR locale: EU decimal convention '1.234,56' parsed as 1234.56",
-                eur[2].price == 1234.56)
 
-    # A single separator with no second one to disambiguate against is
-    # ambiguous between "thousands grouping" and "decimal point". This
-    # project supports exactly four currencies (_CURRENCY_SYMBOLS: USD, EUR,
-    # GBP, JPY), none with a 3-digit decimal subunit, so 3 trailing digits
-    # after the only separator present means thousands, not decimal —
-    # getting this backwards previously turned "$1,234" into 1.234.
-    from product_parser import _prices_in
-    ok &= check("thousands separator: '$1,234' (US, no cents shown) is 1234, not 1.234",
-                _prices_in("$1,234")[0] == [1234.0])
-    ok &= check("thousands separator: '€1.234' (EU, no cents shown) is 1234, not 1.234",
-                _prices_in("€1.234")[0] == [1234.0])
-    ok &= check("thousands separator: '¥123,456' (JPY, no decimal subunit) is 123456",
-                _prices_in("¥123,456")[0] == [123456.0])
-    ok &= check("thousands separator: a lone separator with 2 trailing digits is still "
-                "read as a decimal point, e.g. '$1,23' -> 1.23",
-                _prices_in("$1,23")[0] == [1.23])
-    ok &= check("thousands separator: repeated thousands groups, '$1,234,567' -> 1234567",
-                _prices_in("$1,234,567")[0] == [1234567.0])
+# Fixtures several sections assert against. Computed once at import, as they
+# were when this was one function — they are pure, and recomputing them per
+# section would be three copies of the same arrangement pretending to be
+# three tests.
+live = detect_recaptcha_in_page(lambda _js: LIVE_DISCOVERY_FARFETCH,
+                                page_url="https://www.farfetch.com/")
+v3 = detect_recaptcha_in_page(lambda _js: LIVE_DISCOVERY_V3, page_url="https://x/")
+v2 = detect_recaptcha_in_page(lambda _js: LIVE_DISCOVERY_V2_CHECKBOX, page_url="https://x/")
+products = parse_products(SAMPLE_LISTING_HTML,
+                          "https://www.farfetch.com/shopping/kids/items.aspx",
+                          category="Kids")
 
-    # The ?page=N fallback used when NEXT_PAGE_SELECTOR matches nothing.
-    from product_parser import page_url
-    ok &= check("page_url: adds ?page=N to a bare listing URL",
-                page_url("https://www.farfetch.com/shopping/kids/x/items.aspx", 2)
-                == "https://www.farfetch.com/shopping/kids/x/items.aspx?page=2")
-    ok &= check("page_url: REPLACES an existing page param rather than "
-                "appending a second one",
-                page_url("https://www.farfetch.com/shopping/x/items.aspx?page=1", 3)
-                == "https://www.farfetch.com/shopping/x/items.aspx?page=3")
-    ok &= check("page_url: preserves the filters and sort order already in the "
-                "URL — dropping them would silently scrape a different listing",
-                page_url("https://www.farfetch.com/de/shopping/x/items.aspx?view=90&sort=3", 4)
-                == "https://www.farfetch.com/de/shopping/x/items.aspx?view=90&sort=3&page=4")
-    ok &= check("page_url: an existing param differing only in case is still "
-                "replaced, not duplicated",
-                page_url("https://www.farfetch.com/shopping/x/items.aspx?PAGE=7", 8)
-                == "https://www.farfetch.com/shopping/x/items.aspx?page=8")
+import scraper_api_client as _sac  # noqa: E402 — after the fixtures it reads
 
-    # Some Farfetch markets print a 3-letter ISO code instead of a symbol.
-    # A tile priced that way matched nothing before and was dropped as "not a
-    # product tile" — losing every product on that locale rather than
-    # reporting one with an unfamiliar currency.
-    ok &= check("ISO currency code, code first: 'AED 100' -> 100 AED",
-                _prices_in("AED 100") == ([100.0], "AED"))
-    ok &= check("ISO currency code, code last: '100 CHF' -> 100 CHF",
-                _prices_in("100 CHF") == ([100.0], "CHF"))
-    ok &= check("ISO currency code carries the thousands/decimal handling too: "
-                "'SAR 1,250.50' -> 1250.50 SAR",
-                _prices_in("SAR 1,250.50") == ([1250.5], "SAR"))
-    ok &= check("ISO currency code: a discounted tile's three prices all parse",
-                _prices_in("AED 245 AED 135 AED 108")
-                == ([245.0, 135.0, 108.0], "AED"))
-    # The allowlist is the whole point: a bare [A-Z]{3} would turn a size
-    # chart or a spec line into phantom prices.
-    ok &= check("three capitals that are NOT a currency code are not a price: "
-                "'XXL 100' yields nothing",
-                _prices_in("XXL 100") == ([], None))
-    ok &= check("a longer word starting with a real code is not matched: "
-                "'SARAH 100' yields nothing",
-                _prices_in("SARAH 100") == ([], None))
+# playwright is optional; the suite must pass with no engine installed at all.
+try:
+    import playwright_scraper as _ps
+except ImportError:
+    _ps = None
 
-    # A space is the thousands separator in French, Russian and others, and a
-    # rendered page uses a no-break variant so the number does not wrap. All
-    # three forms appeared in an audit and all three parsed as 234, an order
-    # of magnitude off, silently.
-    ok &= check("space-grouped thousands: '1 234 €' is 1234, not 234",
-                _prices_in("1 234 €") == ([1234.0], "EUR"))
-    ok &= check("no-break space (U+00A0) groups thousands too — this is what a "
-                "rendered page actually contains",
-                _prices_in("1 234 €") == ([1234.0], "EUR"))
-    ok &= check("narrow no-break space (U+202F) as well",
-                _prices_in("1 234 €") == ([1234.0], "EUR"))
-    ok &= check("space grouping combines with a decimal comma: "
-                "'1 234,56 €' -> 1234.56",
-                _prices_in("1 234,56 €") == ([1234.56], "EUR"))
-    ok &= check("space grouping requires FULL groups of three digits, so a size "
-                "list beside a price ('5 yrs, 6 yrs 200 €') does not merge into "
-                "one number",
-                _prices_in("Verfügbar in 5 yrs, 6 yrs 200 €")
-                == ([200.0], "EUR"))
 
-    # A bare "$" is genuinely ambiguous, but a PREFIXED one is not, and
-    # reporting HK$1,234 as USD is the wrong currency rather than a rounding
-    # error — directly against this project's cross-country comparison use.
-    ok &= check("HK$ is HKD, not USD", _prices_in("HK$1,234") == ([1234.0], "HKD"))
-    ok &= check("A$ is AUD and NT$ is TWD, and the prefix is tried before the "
-                "bare '$' so it cannot be swallowed",
-                _prices_in("A$99") == ([99.0], "AUD")
-                and _prices_in("NT$1 500") == ([1500.0], "TWD"))
-    ok &= check("a bare '$' still reads as USD — on the US site that is what it "
-                "means, and JSON-LD supplies the real currency when the site "
-                "publishes one",
-                _prices_in("$1,234") == ([1234.0], "USD"))
-
-    with tempfile.TemporaryDirectory() as tmp:
-        prefix = os.path.join(tmp, "smoke_out")
-        save(products, prefix, "both")
-        ok &= check("JSON file written", os.path.isfile(prefix + ".json") and os.path.getsize(prefix + ".json") > 0)
-        ok &= check("CSV file written", os.path.isfile(prefix + ".csv") and os.path.getsize(prefix + ".csv") > 0)
-
-    challenge = detect_recaptcha_v3(SAMPLE_RECAPTCHA_HTML, "https://www.farfetch.com/account/signup")
-    ok &= check("reCAPTCHA v3 detected with correct sitekey/action",
-                challenge is not None and challenge.sitekey == "6Lc_test_sitekey_123456789" and challenge.action == "signup")
-
-    no_challenge = detect_recaptcha_v3(SAMPLE_LISTING_HTML, "https://www.farfetch.com/shopping/kids/items.aspx")
-    ok &= check("no false-positive captcha detection on clean page", no_challenge is None)
-
-    widget_challenge = detect_recaptcha_v3(SAMPLE_FARFETCH_CAPTCHA_WIDGET_HTML, "https://www.farfetch.com/shopping/kids/items.aspx")
-    ok &= check("reCAPTCHA v3 detected via Farfetch's <captcha-widget> custom-element format",
-                widget_challenge is not None
-                and widget_challenge.sitekey == "6LeifPcbAAAAAJaiPe_xgLTfnbdpEMAYJAAnVFJT"
-                and widget_challenge.action == "verify")  # data-action="null" -> default
-
+def check_runtime_recaptcha_detection_added_2026_08_24(ok: bool) -> bool:
+    """runtime reCAPTCHA detection (added 2026-08-24)"""
     # --- runtime reCAPTCHA detection (added 2026-08-24) ---------------------
     # First, pin the regression itself: the static detector finds NOTHING in
     # today's real modal markup. This is not a bug in the fixture.
@@ -407,12 +803,10 @@ def main() -> int:
                 live is not None and live.kind == "recaptcha_v2_invisible"
                 and live.is_invisible_v2 and not live.is_v3)
 
-    v3 = detect_recaptcha_in_page(lambda _js: LIVE_DISCOVERY_V3, page_url="https://x/")
     ok &= check("api.js render=<sitekey> classified as v3",
                 v3 is not None and v3.kind == "recaptcha_v3" and v3.is_v3)
     ok &= check("runtime detector carries the action through", v3 is not None and v3.action == "signup")
 
-    v2 = detect_recaptcha_in_page(lambda _js: LIVE_DISCOVERY_V2_CHECKBOX, page_url="https://x/")
     ok &= check("size=normal classified as a v2 checkbox",
                 v2 is not None and v2.kind == "recaptcha_v2")
     # No render param at all (older/unknown loader): fall back to size + frames.
@@ -432,6 +826,11 @@ def main() -> int:
     ok &= check("runtime detector survives an evaluate that raises",
                 detect_recaptcha_in_page(lambda _js: (_ for _ in ()).throw(RuntimeError("no page"))) is None)
 
+    return ok
+
+
+def check_reconciling_two_detectors_that_disagree(ok: bool) -> bool:
+    """reconciling two detectors that disagree"""
     # --- reconciling two detectors that disagree ---------------------------
     # The real Scraping Browser capture: static markup claims v3, the loader
     # says v2-invisible. The loader has to win — it's what Google enforces.
@@ -467,7 +866,17 @@ def main() -> int:
                 reconcile_detections(sb_html, v3_both) is not None
                 and reconcile_detections(sb_html, v3_both).kind == "recaptcha_v3")
 
+    return ok
+
+
+def check_api_v2_task_objects_must_match_the_documented_ty(ok: bool) -> bool:
+    """API v2 task objects must match the documented types"""
     # --- API v2 task objects must match the documented types ---------------
+    return ok
+
+
+def check_discounted_prices_the_dom_overlay(ok: bool) -> bool:
+    """discounted prices: the DOM overlay"""
     # ---- discounted prices: the DOM overlay ---------------------------------
     # This site's listing JSON-LD publishes ONE price per product, and on a
     # discounted item it is the INTERMEDIATE one — the sale price before a
@@ -607,6 +1016,7 @@ def main() -> int:
                 "of the tile's prices (scoping-failure guard)",
                 _dis[0].price == 999.0 and _dis[0].original_price is None)
 
+        # KNOWN LIMITATION, pinned deliberately    #
     # ---- KNOWN LIMITATION, pinned deliberately -----------------------------
     # The overlay assumes every price in a tile belongs to ONE discount chain,
     # which is measured behaviour for this site: Farfetch prints original /
@@ -658,6 +1068,7 @@ def main() -> int:
                 "tiles (how much of this site paints at load varies)",
                 len(_ldo) == 1 and _ldo[0].price == 70.0)
 
+        # price_source    #
     # ---- price_source ------------------------------------------------------
     # The same column used to hold two figures with different confidence —
     # the DOM-corrected price a customer pays, or the raw JSON-LD one
@@ -708,7 +1119,13 @@ def main() -> int:
                 and _grid["77777777"].original_price == 245.0
                 and _grid["88888888"].price == 52.0
                 and _grid["88888888"].original_price == 130.0)
+    return ok
 
+
+
+
+def check_category_label(ok: bool) -> bool:
+    """category label"""
     # ---- category label -----------------------------------------------------
     # Before this existed, `category` was null on every row unless the caller
     # remembered --category. A column that is empty by default reads as a
@@ -750,6 +1167,11 @@ def main() -> int:
     ok &= check("an explicit --category always beats the URL-derived label",
                 bool(_explicit) and all(p.category == "Kids" for p in _explicit))
 
+    return ok
+
+
+def check_sample_selection(ok: bool) -> bool:
+    """sample selection"""
     # ---- sample selection ---------------------------------------------------
     # sample_output.json is three rows, so which three matters. A row type that
     # is rare in the run must not get a reserved slot: on a sale page the only
@@ -798,6 +1220,11 @@ def main() -> int:
                     bool(_ms.looks_fabricated(
                         {"sku": "sample-product-123456", "title": "Sample Product"})))
 
+    return ok
+
+
+def check_credential_loading(ok: bool) -> bool:
+    """credential loading"""
     # ---- credential loading -------------------------------------------------
     # The .env.example sync check is the one that matters most here: a variable
     # documented in the example file that nothing reads is a setting which looks
@@ -859,7 +1286,6 @@ def main() -> int:
                        f"undocumented: {sorted(_declared - _documented)}"),
                     _documented == _declared)
 
-    import captcha_solver as _cs
     from captcha_solver import _v2_task_for, CaptchaChallenge
 
     t_v3 = _v2_task_for(v3, 0.7)
@@ -890,6 +1316,11 @@ def main() -> int:
     ok &= check("v2 API: the 'verify' placeholder action is omitted, not sent",
                 "pageAction" not in _v2_task_for(no_action, 0.7))
 
+    return ok
+
+
+def check_v2_createtask_gettaskresult_round_trip_mocked(ok: bool) -> bool:
+    """v2 createTask/getTaskResult round trip (mocked)"""
     # --- v2 createTask/getTaskResult round trip (mocked) -------------------
     calls = []
 
@@ -940,6 +1371,7 @@ def main() -> int:
         _cs.requests.post = real_post
     ok &= check("v2 API: an errorId response raises with the error code", raised)
 
+        # 2captcha payload must match the variant (legacy v1)    #
     # --- 2captcha payload must match the variant (legacy v1) ---------------
     captured = {}
 
@@ -1008,7 +1440,13 @@ def main() -> int:
         no_key_raised = True
     ok &= check("solve_recaptcha() with no API key raises before touching the network",
                 no_key_raised)
+    return ok
 
+
+
+
+def check_sign_up_modal_selectors(ok: bool) -> bool:
+    """sign-up modal selectors"""
     # --- sign-up modal selectors -------------------------------------------
     # The modal diagnostics are not part of the published scraper (they drive a
     # registration form, which this project never submits), so these checks only
@@ -1041,10 +1479,14 @@ def main() -> int:
                     and "slice-login-register-name" in register_matches
                     and "slice-login-sign-up-tab" not in register_matches)
 
+    return ok
+
+
+def check_empty_result_contract(ok: bool) -> bool:
+    """empty-result contract"""
     # --- empty-result contract ---------------------------------------------
     # A run that finds nothing must not look like a successful run that found
     # nothing to sell, and must not overwrite last night's good file with `[]`.
-    from output_writer import EXIT_NO_PRODUCTS
 
     with tempfile.TemporaryDirectory() as tmp:
         prefix = os.path.join(tmp, "empty_out")
@@ -1084,6 +1526,11 @@ def main() -> int:
                     "parses as a table with zero rows rather than failing",
                     _hdr == list(asdict(Product()).keys()) and _rest == [])
 
+    return ok
+
+
+def check_blocked_vs_empty_exit_code(ok: bool) -> bool:
+    """blocked-vs-empty exit code"""
     # --- blocked-vs-empty exit code -----------------------------------------
     # README documents exit 3 (blocked before parsing) as distinct from exit 4
     # (genuinely zero products), but nothing detected a bot-challenge page in
@@ -1092,9 +1539,7 @@ def main() -> int:
     # behind Akamai/Cloudflare would previously reach parse_products, get 0
     # products back, and exit 4 exactly like an empty category, which is the
     # ambiguity the exit-code contract exists to prevent.
-    from output_writer import EXIT_BLOCKED
-    from product_parser import detect_bot_challenge, BOT_CHALLENGE_MARKERS
-    import scraper_api_client as _sac
+    from product_parser import BOT_CHALLENGE_MARKERS
 
     ok &= check("EXIT_BLOCKED (3) and EXIT_NO_PRODUCTS (4) are distinct codes",
                 EXIT_BLOCKED == 3 and EXIT_BLOCKED != EXIT_NO_PRODUCTS)
@@ -1108,6 +1553,74 @@ def main() -> int:
                 "a second copy that can drift out of sync",
                 _sac.BOT_CHALLENGE_MARKERS is BOT_CHALLENGE_MARKERS)
 
+    return ok
+
+
+def check_akamai_s_refusal_page_the_2026_09_11_audit_s_p0(ok: bool) -> bool:
+    """Akamai's REFUSAL page (the 2026-09-11 audit's P0)"""
+    # --- Akamai's REFUSAL page (the 2026-09-11 audit's P0) ------------------
+    # Both fixtures below are the real thing, captured 2026-09-14 from a
+    # datacentre address that farfetch.com refuses: the reference id is the
+    # only thing edited (it is per-request, so pinning a real one would be
+    # noise). The page is 318-426 bytes, carries HTTP 403, and contains NONE
+    # of the challenge markers above — so detect_bot_challenge returned None,
+    # and a plainly blocked run reported exit 4, "this category is empty".
+    #
+    # The TWO fixtures are the point, not duplication. The same page reaches
+    # the parser in two different spellings depending on transport, and a
+    # marker can pass one while silently missing the other:
+    from product_parser import detect_access_denied, describe_block
+
+    ok &= check("detect_access_denied: the browser-DOM form of the refusal "
+                "page is recognised",
+                detect_access_denied(SAMPLE_AKAMAI_DENIED_DOM_HTML))
+    ok &= check("detect_access_denied: the RAW-TRANSPORT form is recognised "
+                "too — Akamai entity-escapes the punctuation, so a literal "
+                "'errors.edgesuite.net' marker matches the browser engines "
+                "and misses scraper_api_client entirely",
+                detect_access_denied(SAMPLE_AKAMAI_DENIED_RAW_HTML))
+    ok &= check("...and the raw form really is escaped, so that check is not "
+                "quietly testing the same string twice",
+                "errors.edgesuite.net" not in SAMPLE_AKAMAI_DENIED_RAW_HTML
+                and "errors&#46;edgesuite&#46;net" in SAMPLE_AKAMAI_DENIED_RAW_HTML)
+    ok &= check("detect_bot_challenge reports the refusal page as akamai, so "
+                "it reaches EXIT_BLOCKED like any other block",
+                detect_bot_challenge(SAMPLE_AKAMAI_DENIED_DOM_HTML) == "akamai"
+                and detect_bot_challenge(SAMPLE_AKAMAI_DENIED_RAW_HTML) == "akamai")
+    ok &= check("describe_block calls a refusal a refusal, not a challenge — "
+                "a log naming a widget that is not there sends the reader "
+                "looking for one",
+                "refusal" in describe_block(SAMPLE_AKAMAI_DENIED_DOM_HTML, "akamai")
+                and "challenge" in describe_block('<div class="cf-challenge">',
+                                                  "cloudflare"))
+
+    # The negative half, and the half that matters more: a marker that fires
+    # on a good page is worse than no marker at all (CLAUDE.md §18, where a
+    # bare "akamai" marker made tokopedia-scraper report every served page as
+    # blocked). Every real-capture fixture in this suite is checked, not just
+    # the one listing sample.
+    for _name, _html in sorted((n, v) for n, v in list(globals().items())
+                               if n.startswith("SAMPLE_") and n.endswith("HTML")
+                               and "DENIED" not in n and isinstance(v, str)):
+        ok &= check(f"detect_access_denied does NOT fire on {_name}",
+                    not detect_access_denied(_html))
+
+    # "edgesuite" on its own is an ordinary Akamai ASSET domain. Matching it
+    # bare would report a site serving its own images from one as blocked on
+    # every page — the exact shape of the §18 trap. Pinned so a future
+    # broadening of the marker is a decision rather than a surprise.
+    ok &= check("a page merely SERVED from an edgesuite asset host is not a "
+                "refusal — only errors.edgesuite.net is",
+                not detect_access_denied(
+                    '<html><head><title>Kids</title></head><body>'
+                    '<img src="https://cdn.a1937.edgesuite.net/x.jpg">'
+                    '</body></html>'))
+
+    return ok
+
+
+def check_page_content_mid_navigation(ok: bool) -> bool:
+    """page.content() mid-navigation"""
     # --- page.content() mid-navigation --------------------------------------
     # Playwright raises when the document swaps under the snapshot, which
     # farfetch.com's client-side geo-redirect makes routine.
@@ -1123,6 +1636,7 @@ def main() -> int:
         _ps = None
         _skips.append(f"page.content() navigation-race checks "
                       f"(playwright not installed: {exc.name})")
+        _skipped_engines.add("playwright")
     if _ps is not None:
 
         ok &= check("playwright_scraper._chrome_ua names the browser's REAL version, "
@@ -1229,6 +1743,113 @@ def main() -> int:
                     "can fail out of order",
                     "pages_failed=failed_pages" in _src)
 
+        # --- the checkpoint: resume without re-fetching ------------------
+        # A run that dies on page 17 of 20 used to start again at page 1. The
+        # checkpoint is written after EVERY page and always, never behind a
+        # flag — nobody passes --checkpoint on the run that is about to be
+        # killed, and by then the pages are gone.
+        import run_state as _rs
+
+        class _Args:
+            def __init__(self, url="https://www.farfetch.com/shopping/kids/items.aspx",
+                         pages=5, category="Kids", out="x"):
+                self.url, self.pages, self.category, self.out = url, pages, category, out
+
+        with tempfile.TemporaryDirectory() as _tmp:
+            _pfx = os.path.join(_tmp, "run")
+            _a = _Args(out=_pfx)
+            _cp = _rs.Checkpoint(_pfx, _a)
+            _p1 = [Product(sku="a", price=1.0), Product(sku="b", price=2.0)]
+            _p2 = [Product(sku="c", price=3.0)]
+            _cp.record(1, _p1, "https://x/1")
+            _cp.record(2, _p2, "https://x/2")
+
+            ok &= check("the checkpoint is on disk after each page, not at the "
+                        "end — the run it exists for is the one that never "
+                        "reaches the end",
+                        os.path.exists(_rs.path_for(_pfx)))
+
+            _cp2 = _rs.Checkpoint(_pfx, _Args(out=_pfx))
+            _msg = _cp2.resume()
+            ok &= check("...and a fresh Checkpoint restores those pages, in "
+                        "page order, with their products intact",
+                        _cp2.resumed_from == [1, 2]
+                        and [p.sku for p in _cp2.products_in_page_order()]
+                        == ["a", "b", "c"])
+            ok &= check("...saying which pages it restored, rather than "
+                        "resuming silently",
+                        any("1-2" in m for m in _msg))
+
+            # The whole risk of resume in one check. Mixing two categories
+            # into one file looks like a successful scrape of something that
+            # was never scraped — worse than any crash.
+            _other = _rs.Checkpoint(_pfx, _Args(url="https://www.farfetch.com/shopping/women/items.aspx",
+                                                out=_pfx))
+            _m2 = _other.resume()
+            ok &= check("a checkpoint for a DIFFERENT url is refused, and the "
+                        "message names the difference",
+                        _other.resumed_from == []
+                        and any("DIFFERENT run" in m and "start_url" in m
+                                for m in _m2))
+
+            _diff_pages = _rs.Checkpoint(_pfx, _Args(pages=9, out=_pfx))
+            ok &= check("...so is one for a different page count",
+                        _diff_pages.resume() and _diff_pages.resumed_from == [])
+            _diff_cat = _rs.Checkpoint(_pfx, _Args(category="Women", out=_pfx))
+            ok &= check("...and one for a different category label",
+                        _diff_cat.resume() and _diff_cat.resumed_from == [])
+
+            # Retry/proxy settings are exactly what a person changes between
+            # the crash and the retry. Refusing on those would refuse every
+            # real resume.
+            _a_retry = _Args(out=_pfx)
+            _a_retry.retries, _a_retry.proxy = 99, "http://x:1"
+            ok &= check("changing --retries or --proxy does NOT invalidate a "
+                        "checkpoint — neither changes what a page contains",
+                        _rs.identity(_a_retry) == _rs.identity(_a))
+
+            _bumped = json.loads(open(_rs.path_for(_pfx), encoding="utf-8").read())
+            _bumped["format_version"] = _rs.FORMAT_VERSION + 1
+            with open(_rs.path_for(_pfx), "w", encoding="utf-8") as _f:
+                json.dump(_bumped, _f)
+            _oldfmt = _rs.Checkpoint(_pfx, _Args(out=_pfx))
+            ok &= check("a checkpoint from a build whose Product had other "
+                        "columns is refused, not fed to the dataclass",
+                        _oldfmt.resume() and _oldfmt.resumed_from == [])
+
+            with open(_rs.path_for(_pfx), "w", encoding="utf-8") as _f:
+                _f.write('{"format_version": 1, "pages": {"1": ')   # truncated
+            _trunc = _rs.Checkpoint(_pfx, _Args(out=_pfx))
+            ok &= check("a truncated checkpoint (the process died mid-write) "
+                        "is reported and skipped, never crashes the resume",
+                        _trunc.resume() and _trunc.resumed_from == [])
+
+            _cp.clear()
+            ok &= check("a completed run deletes its checkpoint — a stale one "
+                        "would offer to resume a run that is already done",
+                        not os.path.exists(_rs.path_for(_pfx)))
+
+            _single = _rs.Checkpoint(_pfx, _Args(pages=1, out=_pfx))
+            _single.record(1, _p1)
+            ok &= check("a single-page run writes no checkpoint at all — there "
+                        "is no page to resume to",
+                        not os.path.exists(_rs.path_for(_pfx)))
+
+            _creds = _Args(url="https://user:secret@www.farfetch.com/x", out=_pfx)
+            ok &= check("a URL carrying credentials is masked before it is "
+                        "written to disk",
+                        "secret" not in json.dumps(_rs.identity(_creds)))
+
+        ok &= check("playwright only SKIPS a stored page when pagination is "
+                    "addressable — page 17 is unreachable without 16 when the "
+                    "site chains next-links, and silently not fetching it "
+                    "would produce a run missing its middle",
+                    "restorable and planned is None" in _src)
+        ok &= check("a partial run KEEPS its checkpoint; only a complete one "
+                    "clears it",
+                    "if stop_reason in COMPLETE_STOP_REASONS and rows:"
+                    in _src)
+
         # Phase 2: each worker owns a browser AND an exit for its lifetime.
         import proxy_pool as _pp_here
         _shared = _pp_here.ProxyPool(["http://a:1", "http://b:2", "http://c:3"])
@@ -1256,7 +1877,7 @@ def main() -> int:
         # level because they are one-line decisions with no return value.
         ok &= check("concurrency defaults to 1, so the default run is exactly "
                     "the sequential one",
-                    '"--concurrency", type=int, default=1' in _src)
+                    '"--concurrency", type=positive_int, default=1' in _src)
         ok &= check("raising concurrency without a proxy pool warns that every "
                     "worker leaves from the same address",
                     "with no proxy pool: every worker" in _src)
@@ -1442,6 +2063,11 @@ def main() -> int:
         ok &= check("fingerprint: an empty fingerprint yields a script that patches nothing",
                     "null" in empty and "getParameter" in empty)
 
+    return ok
+
+
+def check_puppeteer_pyppeteer_ua_derived_from_the_real_lau(ok: bool) -> bool:
+    """Puppeteer/pyppeteer: UA derived from the real launched version"""
     # ---- Puppeteer/pyppeteer: UA derived from the real launched version ----
     # Guarded the same way as the Playwright block above: importing
     # puppeteer_scraper pulls in pyppeteer, which is not installed in the
@@ -1451,6 +2077,7 @@ def main() -> int:
     except ImportError as exc:
         _pup = None
         _skips.append(f"puppeteer_scraper UA checks (pyppeteer not installed: {exc.name})")
+        _skipped_engines.add("pyppeteer")
     if _pup is not None:
         ok &= check("puppeteer_scraper._chrome_ua names the browser's REAL version, "
                     "not a hardcoded one that only ever drifts out of date",
@@ -1458,6 +2085,11 @@ def main() -> int:
                     == "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
                        "(KHTML, like Gecko) Chrome/127.0.6533.17 Safari/537.36")
 
+    return ok
+
+
+def check_selenium_chromedriver_on_the_local_path(ok: bool) -> bool:
+    """Selenium: --chromedriver on the LOCAL path"""
     # ---- Selenium: --chromedriver on the LOCAL path -----------------------
     # This was remote-only, which broke exactly the machine that already had a
     # driver: webdriver-manager was mandatory and would try to download a copy
@@ -1540,7 +2172,35 @@ def main() -> int:
     except ImportError:
         _skips.append("selenium --chromedriver local-path checks "
                       "(selenium not installed)")
+        _skipped_engines.add("selenium")
 
+    # A missing chromedriver is a SETUP problem, not a crash. It used to be
+    # `raise SystemExit("...")`, which prints the message and exits 1 — the
+    # code the contract reserves for "this program fell over". Confirmed live
+    # on 2026-09-14: a machine with neither chromedriver nor webdriver-manager
+    # got exit 1 for something the operator can fix in one command.
+    #
+    # Checked at the source level: reaching the real branch needs a machine
+    # with no chromedriver, which is exactly the environment this suite cannot
+    # assume. cli_entry answers the equivalent question (an engine's driver
+    # LIBRARY absent) with 2 as well, and the two must not disagree about the
+    # same kind of problem.
+    _sel_src = open(os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                 "selenium_scraper.py"),
+                    encoding="utf-8").read()
+    _driver_msg = "Launching a local Chrome needs a chromedriver"
+    ok &= check("a missing chromedriver exits 2 (setup problem), not 1 "
+                "(crash) — the same answer cli_entry gives for a missing "
+                "driver library",
+                _driver_msg in _sel_src
+                and "raise SystemExit(2) from None" in _sel_src
+                and f'raise SystemExit(\n                "{_driver_msg}' not in _sel_src)
+
+    return ok
+
+
+def check_selenium_two_live_local_failures_turned_into_tes(ok: bool) -> bool:
+    """Selenium: two live local failures, turned into tests"""
     # ---- Selenium: two live local failures, turned into tests -------------
     # A local run spent 60 seconds and then printed a message about `debuggerAddress`
     # on a run that never used --cdp-endpoint. Two separate defects: no version
@@ -1609,11 +2269,46 @@ def main() -> int:
                     and any("Canary" in c for c in cands)
                     and any("Brave" in c for c in cands)
                     and any("Edge" in c for c in cands))
-        _t0 = _time.time()
-        _sel._local_chrome_version()
-        ok &= check("selenium: the browser search checks existence before spawning, "
-                    "so it costs well under a second (was 10.5s live)",
-                    _time.time() - _t0 < 3.0)
+        # The original defect was that this probe EXECUTED every candidate,
+        # including ones that do not exist, and spent 10.5s doing it. The fix
+        # is to test for the file first.
+        #
+        # This used to be asserted as "takes under 3 seconds", and that is a
+        # PROXY for the behaviour rather than the behaviour: it passed for the
+        # right reason almost always and failed on a loaded machine, which is
+        # the worst kind of check — one that teaches people to re-run rather
+        # than to look. Seen doing exactly that on 2026-09-15.
+        #
+        # Asserted directly instead: every candidate that is executed must
+        # have been checked for existence first. The probe is handed a
+        # candidate list of paths that cannot exist, and must spawn NOTHING.
+        _spawned = []
+        _orig_run = subprocess.run
+
+        def _tracking_run(cmd, *a, **k):
+            _spawned.append(cmd)
+            return _orig_run(cmd, *a, **k)
+
+        _orig_cands = _sel._chrome_candidates
+        _sel._chrome_candidates = lambda: [
+            "/nonexistent/Chrome", "/also/not/here/Chromium"]
+        subprocess.run = _tracking_run
+        try:
+            _sel._local_chrome_version()
+        finally:
+            subprocess.run = _orig_run
+            _sel._chrome_candidates = _orig_cands
+        # NOT "spawns nothing": on macOS the probe legitimately asks Spotlight
+        # where a browser is, which is a subprocess and is not the bug. The
+        # bug was executing CANDIDATE PATHS that do not exist, so that is what
+        # is asserted — no spawned command may name one.
+        _executed = " ".join(str(c) for c in _spawned)
+        ok &= check("selenium: a candidate path that does not exist is never "
+                    "EXECUTED — the original probe ran every path it could "
+                    "think of, with a 10s timeout each, and spent 10.5s "
+                    "finding nothing",
+                    "/nonexistent/Chrome" not in _executed
+                    and "/also/not/here/Chromium" not in _executed)
 
         # the run that finally passed: the check warned "no browser on this
         # machine" while --chrome-binary named Chrome in /Applications, and the
@@ -1666,7 +2361,13 @@ def main() -> int:
                     "debuggerAddress" in remote_msg)
     except ImportError:
         _skips.append("selenium version-guard checks (selenium not installed)")
+        _skipped_engines.add("selenium")
 
+    return ok
+
+
+def check_cross_page_dedup_cross_run_diff(ok: bool) -> bool:
+    """cross-page dedup + cross-run diff"""
     # ---- cross-page dedup + cross-run diff --------------------------------
     # Pins the pagination bug the three browser engines all shared until this
     # was added: all_products.extend(products) with no seen-set, so a stale or
@@ -1760,13 +2461,16 @@ def main() -> int:
                 [c["sku"] for c in _sc3["changed"]] == ["40"]
                 and not _sc3["source_changed"])
 
+    return ok
+
+
+def check_run_metadata_partial_runs_must_not_read_as_delis(ok: bool) -> bool:
+    """run metadata: partial runs must not read as delistings"""
     # ---- run metadata: partial runs must not read as delistings -----------
     # A run cut short on page 3 of 10 is missing every product on pages
     # 4-10. Diffed against yesterday's full run, all of them came back as
     # `removed` — indistinguishable from "these products were delisted".
     # finish_run writes a sidecar recording that, and diff_runs refuses.
-    from output_writer import (finish_run, run_meta, EXIT_PARTIAL,
-                               COMPLETE_STOP_REASONS)
     import diff_runs as _dr
 
     ok &= check("EXIT_PARTIAL (6) is distinct from 0, EXIT_BLOCKED and "
@@ -1813,6 +2517,46 @@ def main() -> int:
                     "still-intact output, which save() deliberately keeps",
                     rc_b == EXIT_BLOCKED and not os.path.exists(_b + ".meta.json"))
 
+        # --- the 2026-09-11 audit's second P0 ----------------------------
+        # A run that never GOT the page used to report EXIT_NO_PRODUCTS, so
+        # a dead proxy, a network flap and a genuinely empty category were
+        # one value to an automated caller — three situations wanting three
+        # different responses (retry this exit / change exit / accept the
+        # answer). Measured on the day of the audit: the .env proxy was dead
+        # (curl: "Proxy CONNECT aborted" against any host), and the run
+        # reported exit 4, "no products".
+        for _reason in FETCH_FAILURE_STOP_REASONS:
+            _f = os.path.join(tmp, f"fetchfail_{_reason}")
+            rc_f = finish_run([], _f, "json", False, blocked=False,
+                              stop_reason=_reason, pages_requested=1,
+                              pages_completed=0, start_url="u", final_url="u")
+            ok &= check(f"finish_run: '{_reason}' with nothing gathered exits "
+                        f"EXIT_FETCH_FAILED (5), not EXIT_NO_PRODUCTS (4) — "
+                        f"nothing can be concluded about the catalogue",
+                        rc_f == EXIT_FETCH_FAILED)
+
+        _e = os.path.join(tmp, "genuinely_empty")
+        rc_e = finish_run([], _e, "json", False, blocked=False,
+                          stop_reason="completed", pages_requested=1,
+                          pages_completed=1, start_url="u", final_url="u")
+        ok &= check("finish_run: a page that WAS fetched and held nothing is "
+                    "still EXIT_NO_PRODUCTS — widening 5 must not swallow "
+                    "the one case 4 is actually for",
+                    rc_e == EXIT_NO_PRODUCTS)
+
+        # A fetch failure that still gathered pages is a PARTIAL run, not a
+        # fetch failure: the output is written and exit 6 already says so.
+        # This is the ordering inside finish_run, pinned.
+        _fp = os.path.join(tmp, "partial_not_fetchfail")
+        rc_fp = finish_run(_two, _fp, "json", False, blocked=False,
+                           stop_reason="page_load_timeout", pages_requested=10,
+                           pages_completed=2, start_url="u", final_url="u")
+        ok &= check("finish_run: a timeout that still gathered products stays "
+                    "EXIT_PARTIAL — exit 5 means 'we have nothing', and two "
+                    "good pages is not nothing",
+                    rc_fp == EXIT_PARTIAL)
+
+
         # diff_runs must refuse a comparison involving the partial run.
         class _A:
             def __init__(self, old, new, force=False):
@@ -1827,6 +2571,226 @@ def main() -> int:
                     _dr._check_comparable(_A(os.path.join(tmp, "nope.json"),
                                              os.path.join(tmp, "nope2.json"))) is True)
 
+    return ok
+
+
+def check_run_metadata_id_timings_quality(ok: bool) -> bool:
+    """run metadata: id, timings, quality"""
+    # --- run metadata: id, timings, quality ------------------------------
+    _rows = [Product(sku="a", price=1.0, currency="USD", title="t",
+                     brand="b", image_url="i", price_source="jsonld+dom"),
+             Product(sku="b", price=None, currency=None, title=None)]
+    _q = quality_metrics(_rows)
+    ok &= check("quality metrics are FRACTIONS, not counts — a count has to "
+                "be read against the row total to mean anything, and a "
+                "fraction is what a threshold compares against",
+                _q["rows"] == 2 and _q["priced"] == 0.5
+                and _q["dom_confirmed_price"] == 0.5
+                and _q["with_currency"] == 0.5)
+    ok &= check("...and an empty result reports rows=0 rather than dividing "
+                "by it",
+                quality_metrics([]) == {"rows": 0})
+    ok &= check("two runs get two different run ids — two runs of the same "
+                "command ARE different runs, which is the thing being "
+                "identified",
+                new_run_id() != new_run_id() and len(new_run_id()) == 12)
+
+    return ok
+
+
+def check_the_webhook(ok: bool) -> bool:
+    """the webhook"""
+    # --- the webhook ------------------------------------------------------
+    # Three properties, each because the obvious version gets it wrong.
+    import notify as _nf
+
+    _hook = "https://hooks.slack.com/services/T00000000/B00000000/SECRETTOKEN"
+    ok &= check("a webhook URL is described by scheme and host only — most "
+                "carry their token in the PATH, so logging the URL publishes "
+                "the credential",
+                "SECRETTOKEN" not in _nf.describe(_hook)
+                and "hooks.slack.com" in _nf.describe(_hook))
+
+    class _Boom:
+        def post(self, *a, **k):
+            # requests puts the FULL url, query string included, into the text
+            # of its connection errors. This is that, exactly.
+            raise RuntimeError(f"Failed to establish a new connection: {_hook}")
+
+    class _Rejects:
+        status_code = 500
+
+        def post(self, *a, **k):
+            return self
+
+    class _Accepts:
+        status_code = 204
+        sent = None
+
+        def post(self, url, data=None, headers=None, timeout=None):
+            _Accepts.sent = (url, json.loads(data.decode()), timeout)
+            return self
+
+    _real_import = builtins.__import__
+
+    def _with_requests(stub):
+        def _imp(name, *a, **k):
+            if name == "requests":
+                return stub
+            return _real_import(name, *a, **k)
+        return _imp
+
+    for _stub, _expect, _label in (
+            (_Boom(), False, "an unreachable endpoint"),
+            (_Rejects(), False, "an endpoint answering HTTP 500"),
+            (_Accepts(), True, "a working endpoint")):
+        _buf = io.StringIO()
+        _h = logging.StreamHandler(_buf)
+        _nf.logger.addHandler(_h)
+        builtins.__import__ = _with_requests(_stub)
+        try:
+            _delivered = _nf.send(_hook, {"status": "failed"}, 3)
+        finally:
+            builtins.__import__ = _real_import
+            _nf.logger.removeHandler(_h)
+        _logged = _buf.getvalue()
+        ok &= check(f"webhook: {_label} never raises, and never puts the URL "
+                    f"in the log",
+                    _delivered is _expect and "SECRETTOKEN" not in _logged)
+
+    ok &= check("webhook: the payload carries the exit code alongside the "
+                "metadata — that is the field an alerting rule branches on, "
+                "and it is not otherwise in the sidecar",
+                _Accepts.sent is not None
+                and _Accepts.sent[1]["exit_code"] == 3
+                and _Accepts.sent[1]["status"] == "failed")
+    ok &= check("webhook: the POST is bounded, so a hung endpoint cannot hold "
+                "the process open after the data is on disk",
+                _Accepts.sent[2] == _nf.TIMEOUT_S)
+    ok &= check("webhook: no URL means no attempt at all",
+                _nf.send(None, {}, 0) is False)
+
+    # It fires on FAILURE too, which is the main use: finish_run deliberately
+    # writes no sidecar for a run that gathered nothing, so a webhook keyed on
+    # the sidecar would be silent for exactly the runs worth hearing about.
+    _fired = {}
+
+    def _capture(url, meta, rc):
+        _fired["meta"], _fired["rc"] = meta, rc
+        return True
+
+    _real_send = _nf.send
+    _nf.send = _capture
+    try:
+        with tempfile.TemporaryDirectory() as _t:
+            _rc = finish_run([], os.path.join(_t, "n"), "json", False,
+                             blocked=True, stop_reason="blocked_akamai",
+                             pages_requested=1, pages_completed=0,
+                             start_url="u", final_url="u",
+                             webhook="https://example.invalid/hook")
+    finally:
+        _nf.send = _real_send
+    ok &= check("webhook fires for a run that wrote NOTHING — the sidecar is "
+                "deliberately absent there, so a webhook keyed on the sidecar "
+                "would miss every run worth an alert",
+                _fired.get("rc") == EXIT_BLOCKED
+                and _fired["meta"]["status"] == "failed"
+                and _fired["meta"]["stop_reason"] == "blocked_akamai")
+
+    ok &= check("EXIT_FETCH_FAILED (5) is distinct from every other code in "
+                "the contract",
+                EXIT_FETCH_FAILED == 5
+                and EXIT_FETCH_FAILED not in (0, 1, 2, EXIT_BLOCKED,
+                                              EXIT_NO_PRODUCTS, EXIT_PARTIAL))
+    ok &= check("scraper_api_client's EXIT_API_ERROR is the SAME code, not a "
+                "second 5 that can drift — one meaning per exit code across "
+                "the family",
+                _sac.EXIT_API_ERROR == EXIT_FETCH_FAILED)
+    ok &= check("no fetch-failure stop reason is also a COMPLETE one — a run "
+                "cannot both have failed to fetch and have seen everything",
+                not set(FETCH_FAILURE_STOP_REASONS) & set(COMPLETE_STOP_REASONS))
+
+    # stop_reason_for is the one place that names why a page yielded nothing.
+    # Ordered by how much each signal PROVES (CLAUDE.md §17's
+    # classification-order trap), so the specific reason outranks the general.
+    ok &= check("stop_reason_for: a named vendor outranks a bare status — "
+                "'blocked_akamai' says more than 'http_error'",
+                stop_reason_for(load_failed=False, blocked_by="akamai",
+                                http_status=403) == "blocked_akamai")
+    ok &= check("stop_reason_for: a dead exit is reported as such, not as a "
+                "timeout — they want opposite responses",
+                stop_reason_for(load_failed=True, blocked_by=None,
+                                proxy_failure="ERR_PROXY_CONNECTION_FAILED")
+                == "proxy_unusable")
+    ok &= check("stop_reason_for: an error status with no recognised marker "
+                "is still not the listing",
+                stop_reason_for(load_failed=False, blocked_by=None,
+                                http_status=503) == "http_error")
+    ok &= check("stop_reason_for: a plain timeout stays a timeout",
+                stop_reason_for(load_failed=True, blocked_by=None) ==
+                "page_load_timeout")
+    # PARSER DRIFT, the last piece of the audit's P0 item 3. A page that
+    # LINKS to eighteen products and parses to zero is this repo's bug, not an
+    # empty category, and the two send a reader to opposite places. The
+    # scenario is real: the CSS fallback drops a product link whose tile
+    # yields no price text, so a scoping failure turns a full page into no
+    # rows — the "junk-link data theft" shape seen from the other side.
+    from product_parser import count_product_links
+
+    _full_unparseable = "<html><body>" + "".join(
+        f'<a href="/shopping/kids/b-item-{1000 + i}.aspx">Item {i}</a>'
+        for i in range(8)) + "</body></html>"
+    _genuinely_empty = '<html><body><div class="grid"></div></body></html>'
+    _parses_fine = "<html><body>" + "".join(
+        f'<a href="/shopping/kids/b-item-{2000 + i}.aspx">'
+        f'<span>Brand</span><span>Item {i}</span><span>${10 + i}</span></a>'
+        for i in range(8)) + "</body></html>"
+
+    ok &= check("count_product_links counts DISTINCT products by id, not "
+                "anchors — a tile links to its product twice, so counting "
+                "anchors makes a threshold mean half what it says",
+                count_product_links(
+                    '<a href="/x-item-1.aspx"><img></a>'
+                    '<a href="/x-item-1.aspx">t</a>'
+                    '<a href="/y-item-2.aspx">o</a>') == 2)
+    ok &= check("parse drift is a REAL case, not a hypothetical: a page full "
+                "of product links with no parseable price yields 0 rows, "
+                "because the fallback drops a tile it can find no price in",
+                count_product_links(_full_unparseable) == 8
+                and parse_products(_full_unparseable, "https://x/") == [])
+    ok &= check("...and it is distinguishable: an empty category has no "
+                "product links at all",
+                count_product_links(_genuinely_empty) == 0)
+    ok &= check("...and the signal is not always on — a page that parses "
+                "fine has links AND rows",
+                count_product_links(_parses_fine) == 8
+                and len(parse_products(_parses_fine, "https://x/")) == 8)
+    ok &= check("stop_reason_for names it, and ranks it LAST: everything "
+                "above says the page never arrived, this one says it arrived "
+                "and we failed to read it",
+                stop_reason_for(load_failed=False, blocked_by=None,
+                                parse_drift=True) == "parse_drift"
+                and stop_reason_for(load_failed=True, blocked_by=None,
+                                    parse_drift=True) == "page_load_timeout")
+    ok &= check("parse_drift is NOT a fetch failure — the catalogue question "
+                "really was answered, so the exit code stays 4; what changes "
+                "is that the sidecar names it as OUR bug",
+                "parse_drift" not in FETCH_FAILURE_STOP_REASONS
+                and "parse_drift" not in COMPLETE_STOP_REASONS)
+
+    ok &= check("stop_reason_for: a 200 that loaded fine is 'completed' — the "
+                "helper must not invent a failure",
+                stop_reason_for(load_failed=False, blocked_by=None,
+                                http_status=200) == "completed")
+    ok &= check("stop_reason_for is keyword-only, so adding a signal later "
+                "cannot silently re-bind an existing caller's argument",
+                _kwonly_only(stop_reason_for))
+
+    return ok
+
+
+def check_json_ld_shapes_that_are_legal_but_were_not_handl(ok: bool) -> bool:
+    """JSON-LD shapes that are legal but were not handled"""
     # ---- JSON-LD shapes that are legal but were not handled ----------------
     # All of these are valid schema.org and all were reproduced against the
     # old parser: the first two CRASHED the run (a null and an ImageObject),
@@ -1879,6 +2843,11 @@ def main() -> int:
                 "category for what was really an unread format",
                 [p.sku for p in parse_products(_GRAPH, _LDU)] == ["90000007"])
 
+    return ok
+
+
+def check_proxy_credentials_must_not_reach_a_browser_comma(ok: bool) -> bool:
+    """proxy credentials must not reach a browser command line"""
     # ---- proxy credentials must not reach a browser command line -----------
     # Chromium's --proxy-server becomes part of the browser process's argv,
     # readable by anything that can run `ps`. Playwright got this right via
@@ -1894,6 +2863,11 @@ def main() -> int:
                     "--proxy-server={args.proxy}" not in _esrc
                     and "parsed.hostname" in _esrc or "proxy_parts.hostname" in _esrc)
 
+    return ok
+
+
+def check_proxy_pool_and_rotation(ok: bool) -> bool:
+    """proxy pool and rotation"""
     # ---- proxy pool and rotation -------------------------------------------
     # `--proxy` was one static string applied once at launch: the shape of a
     # demo, not of the thing proxies are bought for. These pin the rules that
@@ -2027,6 +3001,479 @@ def main() -> int:
                     _ps._proxy_failure(Exception("Timeout 60000ms exceeded")) == ""
                     and _ps._proxy_failure(Exception("net::ERR_NAME_NOT_RESOLVED")) == "")
 
+    return ok
+
+
+def check_product_detail_pages(ok: bool) -> bool:
+    """product detail pages: one row per size"""
+    from product_detail_parser import (parse_product_detail, composition,
+                                       labelled_blocks, discount_pct)
+
+    full = parse_product_detail(SAMPLE_DETAIL_FULL_PRICE_HTML, "https://x/")
+    sale = parse_product_detail(SAMPLE_DETAIL_SALE_HTML, "https://x/")
+
+    # THE finding this parser exists for. A detail page publishes
+    # ProductGroup where a listing publishes ItemList/Product, so the listing
+    # parser returns zero here — silently, which is the dangerous part.
+    listing_on_detail = parse_products(SAMPLE_DETAIL_FULL_PRICE_HTML,
+                                       "https://x/")
+    ok &= check("the LISTING parser finds nothing on a detail page — it reads "
+                "ItemList/Product and a detail page publishes ProductGroup, "
+                "which is why this is a second parser and not a flag",
+                listing_on_detail == [])
+    ok &= check("...and the detail parser does find it",
+                len(full) == 2 and len(sale) == 2)
+
+    ok &= check("one row per SIZE, keyed on the variant sku — the id that is "
+                "actually unique; product_id groups them",
+                [r.sku for r in full] == ["36899289-19", "36899289-21"]
+                and {r.product_id for r in full} == {"36899289"})
+    ok &= check("sizes are read as the site states them, localised and in "
+                "more than one convention on a single locale",
+                [r.size for r in full] == ["4 Jahre", "6 Jahre"]
+                and [r.size for r in sale] == ["3-6 M.", "6-9 M."])
+
+    # Values, not coverage: a column can be 100% populated and wrong.
+    r = full[0]
+    ok &= check("title, brand and colour come off the group, not the variant",
+                r.title == "Baumwoll-T-Shirt mit Ami de Coeur"
+                and r.brand == "AMI Paris" and r.color == "Weiß")
+    ok &= check("the category is the breadcrumb PATH — the names are nested "
+                "under `item`, and reading element['name'] gives None on "
+                "every entry, which looks like 'no breadcrumbs'",
+                r.category == "Kids > AMI Paris > Kleidung für Jungen > "
+                              "Klassisches T-Shirt")
+    ok &= check("the row's url is the VARIANT's offer url, which carries the "
+                "size — not the product url shared by every size",
+                r.url.endswith("size=19") and full[1].url.endswith("size=21"))
+
+    # The price chain, which is the reason no DOM overlay is ported here.
+    s = sale[0]
+    ok &= check("a discounted variant reads price AND original price as "
+                "facts: the spec without a priceType is what is paid, the "
+                "StrikethroughPrice one is what it was",
+                s.price == 45.0 and s.original_price == 90.0
+                and s.currency == "EUR")
+    ok &= check("...and the discount is arithmetic from those two",
+                s.discount_pct == 50.0)
+    ok &= check("a FULL-PRICE variant has no original_price and no discount — "
+                "None, not 0, which would read as 'measured, and it is zero'",
+                r.original_price is None and r.discount_pct is None)
+    ok &= check("discount_pct refuses a negative: an 'original' at or below "
+                "the price means the two figures are not what they were "
+                "taken for",
+                discount_pct(100.0, 90.0) is None
+                and discount_pct(100.0, 100.0) is None
+                and discount_pct(90.0, 100.0) == 10.0)
+
+    ok &= check("price_source says the figure came from the VARIANT's own "
+                "chain, so diff_runs cannot compare a detail row with a "
+                "listing row as though they were alike",
+                {x.price_source for x in full + sale} == {"jsonld-variant"})
+
+    # Composition is a labelled DOM block, and the label is localised while
+    # the classes are build hashes.
+    ok &= check("composition is read from the labelled block, not guessed out "
+                "of the JSON-LD description blurb",
+                r.composition == "Bio-Baumwolle 100%"
+                and sale[0].composition == "Baumwolle 100%")
+    # Checked over the parser's STRING LITERALS, docstrings excluded. The
+    # docstring names this class precisely to say "do not anchor on it", and
+    # a line-based grep flags that as a violation of the rule it states. What
+    # matters is whether a class name is ever used to MATCH something.
+    _pdp_src = open(os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                 "product_detail_parser.py"),
+                    encoding="utf-8").read()
+    _pdp_tree = _ast.parse(_pdp_src)
+    _docstrings = set()
+    for _n in _ast.walk(_pdp_tree):
+        if isinstance(_n, (_ast.Module, _ast.FunctionDef, _ast.AsyncFunctionDef,
+                           _ast.ClassDef)):
+            _d = _ast.get_docstring(_n, clean=False)
+            if _d:
+                _docstrings.add(_d)
+    _literals = [n.value for n in _ast.walk(_pdp_tree)
+                 if isinstance(n, _ast.Constant) and isinstance(n.value, str)
+                 and n.value not in _docstrings]
+    ok &= check("...by its heading text, so a renamed build-hash class cannot "
+                "break it — the fixture carries the real class names and no "
+                "string the parser MATCHES on contains one",
+                "ltr-2pfgen" in SAMPLE_DETAIL_FULL_PRICE_HTML
+                and not any("ltr-" in lit for lit in _literals))
+    ok &= check("an unlabelled page leaves composition empty rather than "
+                "picking up the wrong block",
+                composition(BeautifulSoup(
+                    "<html><h4>Versand</h4><p>3 Tage</p></html>",
+                    "html.parser")) is None)
+    ok &= check("labelled_blocks returns every label->value pair, so the next "
+                "field somebody wants is already there",
+                labelled_blocks(BeautifulSoup(
+                    "<html><h4>Versand</h4><p>3 Tage</p></html>",
+                    "html.parser")) == {"versand": "3 Tage"})
+
+    # --- the same product on a second market -------------------------
+    us = parse_product_detail(SAMPLE_DETAIL_US_HTML, "https://x/")
+    ok &= check("the variant SKU is identical across markets — which is what "
+                "a cross-market comparison can join on",
+                [x.sku for x in us] == [x.sku for x in full]
+                == ["36899289-19", "36899289-21"])
+    ok &= check("...while the size LABEL is translated, so it is display text "
+                "and not a key: the DE '4 Jahre' is the US '4 yrs'",
+                [x.size for x in full] == ["4 Jahre", "6 Jahre"]
+                and [x.size for x in us] == ["4 yrs", "6 yrs"])
+    ok &= check("title, colour, composition and category are all localised "
+                "too — none of them identifies a product across markets",
+                us[0].title != r.title and us[0].color != r.color
+                and us[0].composition != r.composition
+                and us[0].category != r.category)
+    ok &= check("...and the composition label differs per locale, which is "
+                "why it is matched from a SET of headings rather than one "
+                "string ('Zusammensetzung' vs 'Composition')",
+                r.composition == "Bio-Baumwolle 100%"
+                and us[0].composition == "Organic Cotton 100%")
+    ok &= check("prices are set per market, not converted — the same product "
+                "is 60 EUR and 90 USD, so a cross-market difference is "
+                "pricing rather than arbitrage",
+                r.price == 60.0 and r.currency == "EUR"
+                and us[0].price == 90.0 and us[0].currency == "USD")
+
+    ok &= check("images: the group's full set on every row, primary first",
+                r.image_url.endswith("36899289_69172521_1000.jpg?ov=true")
+                and len(r.image_urls.split(" | ")) == 2)
+
+    # The JSON-LD shapes that are legal and have broken a naive parser here
+    # before. Each is the real failure, not a hypothetical.
+    ok &= check("a page with no ProductGroup returns [] and says so, rather "
+                "than raising — but the CALLER must treat that as a failure",
+                parse_product_detail("<html><body>nothing</body></html>",
+                                     "https://x/") == [])
+    ok &= check("'offers': null is handled — an explicit null is not a "
+                "missing key, so a .get() default never applies to it",
+                parse_product_detail(
+                    '<html><script type="application/ld+json">'
+                    '{"@type":"ProductGroup","name":"n","productGroupID":"1",'
+                    '"hasVariant":[{"@type":"Product","sku":"1-1",'
+                    '"size":"S","offers":null}]}</script></html>',
+                    "https://x/")[0].price is None)
+    ok &= check("a ProductGroup nested in @graph is found, not reported as an "
+                "empty product",
+                len(parse_product_detail(
+                    '<html><script type="application/ld+json">'
+                    '{"@graph":[{"@type":"ProductGroup","name":"n",'
+                    '"productGroupID":"1","hasVariant":[{"@type":"Product",'
+                    '"sku":"1-1","size":"S"}]}]}</script></html>',
+                    "https://x/")) == 1)
+    ok &= check("a product with NO size axis still emits a row rather than "
+                "being dropped",
+                len(parse_product_detail(
+                    '<html><script type="application/ld+json">'
+                    '{"@type":"ProductGroup","name":"n","productGroupID":"7"}'
+                    '</script></html>', "https://x/")) == 1)
+    ok &= check("one unparseable ld+json block does not cost the other one",
+                len(parse_product_detail(
+                    '<html><script type="application/ld+json">{oh no</script>'
+                    '<script type="application/ld+json">'
+                    '{"@type":"ProductGroup","name":"n","productGroupID":"1",'
+                    '"hasVariant":[{"@type":"Product","sku":"1-1"}]}'
+                    '</script></html>', "https://x/")) == 1)
+
+    # KNOWN LIMITATION, pinned rather than half-guarded: all 38 variants
+    # captured were InStock, so the negative case has never been seen on a
+    # real page. The mapping is asserted on synthetic values so that a future
+    # change to it is a decision.
+    def _stock(value):
+        return parse_product_detail(
+            '<html><script type="application/ld+json">'
+            '{"@type":"ProductGroup","name":"n","productGroupID":"1",'
+            '"hasVariant":[{"@type":"Product","sku":"1-1","offers":'
+            '{"availability":"https://schema.org/' + value + '"}}]}'
+            '</script></html>', "https://x/")[0].in_stock
+
+    ok &= check("in_stock: an unanticipated availability value reads as NOT "
+                "available rather than silently as yes — allowlisted, not "
+                "`!= OutOfStock`. NOTE: no real out-of-stock variant has been "
+                "captured yet, so a False is less proven than a True",
+                _stock("InStock") is True and _stock("OutOfStock") is False
+                and _stock("SomethingNewSchemaOrgAdded") is False)
+
+    # Columns that do NOT exist, each because it was looked for and not found.
+    fields = set(ProductVariant().__dict__)
+    ok &= check("no rating/review_count column: 0 occurrences of "
+                "aggregateRating or ratingValue across seven captured detail "
+                "pages, so they would be null on every row of every run",
+                not fields & {"rating", "review_count"})
+    ok &= check("no merchant or shipping column either — absent on 7 of 7 "
+                "pages; and no return-policy column, which IS present but "
+                "identical on all 38 variants, making it a line in the README",
+                not fields & {"merchant", "boutique", "seller",
+                              "shipping", "delivery", "return_days"})
+    ok &= check("ProductVariant keeps Product's shared prefix, in order, so "
+                "one column name means one thing across the family",
+                [f for f in fields if f in set(Product().__dict__)]
+                and list(ProductVariant().__dict__)[:4]
+                == list(Product().__dict__)[:4])
+
+    # --- the crawl that drives the parser ------------------------------
+    # The sidecar has to say which kind of row the file holds: the repo used
+    # to have one kind, so the repo implied it, and it no longer does.
+    ok &= check("run_meta records the mode, defaulting to listing",
+                run_meta(status="complete", stop_reason="completed",
+                         pages_requested=1, pages_completed=1, start_url="u",
+                         final_url="u", products=1)["mode"] == "listing"
+                and run_meta(status="complete", stop_reason="completed",
+                             pages_requested=1, pages_completed=1,
+                             start_url="u", final_url="u", products=1,
+                             mode="detail")["mode"] == "detail")
+
+    # An empty run's CSV header must describe what the file was FOR. With two
+    # row kinds, defaulting to Product would give an empty detail run a
+    # listing header — columns describing something it does not contain.
+    with tempfile.TemporaryDirectory() as _t:
+        _lp = os.path.join(_t, "l.csv")
+        _dp = os.path.join(_t, "d.csv")
+        write_csv([], _lp)
+        write_csv([], _dp, row_type=ProductVariant)
+        _lh = next(csv.reader(open(_lp, encoding="utf-8")))
+        _dh = next(csv.reader(open(_dp, encoding="utf-8")))
+        ok &= check("an empty CSV still carries a header, and it is the "
+                    "header of the row kind that run was for",
+                    "rating" in _lh and "size" not in _lh
+                    and "size" in _dh and "rating" not in _dh)
+
+    # The checkpoint stores rows; it has to rebuild them as the right class.
+    class _A:
+        def __init__(self, mode="listing"):
+            self.url, self.pages, self.category = "https://x/", 5, "Kids"
+            self.out, self.mode = "x", mode
+
+    import run_state as _rs2
+    with tempfile.TemporaryDirectory() as _t:
+        _pfx = os.path.join(_t, "r")
+        _a = _A(mode="detail")
+        _cp = _rs2.Checkpoint(_pfx, _a, row_type=ProductVariant)
+        _cp.record(1, [ProductVariant(sku="1-19", size="4 Jahre", price=45.0)])
+        _back = _rs2.Checkpoint(_pfx, _A(mode="detail"),
+                                row_type=ProductVariant)
+        _back.resume()
+        ok &= check("a detail checkpoint rebuilds ProductVariant rows — "
+                    "hardcoding Product raises TypeError on the first "
+                    "unexpected key, AFTER the run has announced it is "
+                    "resuming",
+                    len(_back.pages.get(1, [])) == 1
+                    and _back.pages[1][0].size == "4 Jahre")
+        _wrong = _rs2.Checkpoint(_pfx, _A(mode="listing"))
+        _msgs = _wrong.resume()
+        ok &= check("a LISTING run refuses a detail checkpoint: the mode is "
+                    "part of the identity, because the two hold rows of "
+                    "different shapes",
+                    _wrong.resumed_from == []
+                    and any("DIFFERENT run" in m for m in _msgs))
+
+    # The engine wiring, at the source level: these are one-line decisions
+    # whose only observable effect is in a file the suite cannot produce
+    # without a browser. Read here rather than reusing the copy another
+    # section happens to hold — a section that depends on a sibling's local
+    # is the coupling the split just removed.
+    _eng_src = open(os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                 "playwright_scraper.py"),
+                    encoding="utf-8").read()
+    ok &= check("the engine offers --mode listing|detail and caps a crawl "
+                "with --max-products",
+                '"--mode", choices=["listing", "detail"]' in _eng_src
+                and '"--max-products"' in _eng_src)
+    ok &= check("...and tells finish_run which mode and which row type, so "
+                "the sidecar and an empty CSV both describe what the run was "
+                "for",
+                "mode=args.mode, row_type=row_type" in _eng_src)
+    ok &= check("a capped crawl does not report itself as complete",
+                'stop_reason = "max_products_reached"' in _eng_src)
+    ok &= check("...nor does one whose product pages failed — the listing "
+                "pages all succeeding says nothing about the product pages",
+                'stop_reason = "detail_pages_failed"' in _eng_src)
+    ok &= check("neither reason is in COMPLETE_STOP_REASONS",
+                "max_products_reached" not in COMPLETE_STOP_REASONS
+                and "detail_pages_failed" not in COMPLETE_STOP_REASONS)
+
+    import diff_runs as _dr2
+    ok &= check("diff_runs refuses to compare a listing run with a detail "
+                "run, and --force does not apply — every line of that diff "
+                "would be an artefact of the comparison",
+                "_check_same_mode" in open(
+                    os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                 "diff_runs.py"), encoding="utf-8").read()
+                and hasattr(_dr2, "_check_same_mode"))
+    return ok
+
+
+def check_engine_flag_parity(ok: bool) -> bool:
+    """the three engines' flag sets, against each other"""
+    # The README used to say "Same CLI, same parsing core, same output" with
+    # no qualification, and that was false: measured, Playwright carries 12
+    # flags the others do not. Nine of those predate this batch
+    # (--concurrency, --dump-html, --fingerprint, --fp-*, --proxy-*) and
+    # three came with detail mode. Nobody noticed because nothing compared
+    # them.
+    #
+    # Asserted in BOTH directions, which is the half that is usually missed:
+    # a NEW unshared flag fails, and so does CLOSING a difference that the
+    # README documents. The second matters because the exception list is the
+    # documentation — a flag quietly gaining parity would leave the README
+    # describing a limitation that no longer exists.
+    import ast as _a
+
+    # argparse receivers only. Counting every `.add_argument` catches Chrome
+    # switches too — `options.add_argument("--no-sandbox")` is the same method
+    # name on a different object — and inventing nine Selenium-only CLI flags
+    # that do not exist is exactly the kind of wrong number this check is for.
+    _parsers = {"p", "parser", "ap"}
+
+    def _flags(name):
+        src = open(os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                name), encoding="utf-8").read()
+        found = set()
+        for node in _a.walk(_a.parse(src)):
+            if (isinstance(node, _a.Call)
+                    and isinstance(node.func, _a.Attribute)
+                    and node.func.attr == "add_argument"
+                    and isinstance(node.func.value, _a.Name)
+                    and node.func.value.id in _parsers):
+                for arg in node.args:
+                    if (isinstance(arg, _a.Constant)
+                            and str(arg.value).startswith("--")):
+                        found.add(arg.value)
+        return found
+
+    _sets = {name: _flags(name) for name in
+             ("playwright_scraper.py", "selenium_scraper.py",
+              "puppeteer_scraper.py")}
+    _shared = set.intersection(*_sets.values())
+
+    # The documented exceptions, and why each one is not a bug. A flag that
+    # is not here and not shared IS a bug.
+    ENGINE_SPECIFIC = {
+        "playwright_scraper.py": {
+            # Playwright-only by design: the sync API ties a browser to its
+            # creating thread, so the worker model is not portable as-is.
+            "--concurrency",
+            # Written for the primary engine and not yet ported. Named here
+            # so the gap is a decision rather than an accident.
+            "--dump-html", "--fingerprint", "--fp-tags", "--fp-country",
+            "--proxy-file", "--proxy-rotate", "--proxy-shuffle",
+            "--proxy-block-retries",
+            "--mode", "--max-products", "--resume",
+        },
+        "selenium_scraper.py": {
+            # Driver plumbing that only Selenium has: it launches a separate
+            # chromedriver process, and the other two do not.
+            "--chromedriver", "--chrome-binary", "--disable-build-check",
+            "--driver-timeout",
+        },
+        "puppeteer_scraper.py": set(),
+    }
+
+    ok &= check(f"the three engines share a common flag set ({len(_shared)} "
+                f"flags) — the CLI contract the README describes",
+                len(_shared) >= 15 and "--url" in _shared
+                and "--pages" in _shared and "--out" in _shared
+                and "--webhook" in _shared)
+
+    _undocumented = {}
+    _closed = {}
+    for name, flags in _sets.items():
+        unshared = flags - _shared
+        _undocumented[name] = sorted(unshared - ENGINE_SPECIFIC[name])
+        _closed[name] = sorted(ENGINE_SPECIFIC[name] - unshared)
+
+    ok &= check(f"...and every flag that is NOT shared is a documented "
+                f"exception (undocumented: "
+                f"{ {k: v for k, v in _undocumented.items() if v} or 'none'})",
+                not any(_undocumented.values()))
+    ok &= check(f"...in both directions: a flag that gained parity must be "
+                f"removed from the exception list, or the README keeps "
+                f"describing a limitation that is gone (stale: "
+                f"{ {k: v for k, v in _closed.items() if v} or 'none'})",
+                not any(_closed.values()))
+
+    # And the README must not claim a parity that does not exist. It said
+    # "Same CLI, same parsing core, same output" flat out.
+    _readme = open(os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                "README.md"), encoding="utf-8").read()
+    ok &= check("the README does not claim an unqualified identical CLI, "
+                "because three flags are Playwright-only",
+                "Same CLI, same parsing core, same output. Pick by" not in _readme)
+    ok &= check("...and it names the engine-specific flags, so a reader "
+                "picking an engine learns what they give up",
+                "--mode" in _readme and "Playwright only" in _readme)
+    return ok
+
+
+def check_the_suite_s_own_shape(ok: bool) -> bool:
+    """the suite's own shape"""
+    # main() was one 2,650-line function. The 2026-09-11 audit called that
+    # out and it was right: a reader could not find a section without
+    # scrolling, and a traceback only ever named `main`. It is now a preamble
+    # plus one function per section.
+    #
+    # What is NOT done, and the reason is measured rather than preferred:
+    # splitting into separate pytest modules. Doing so needs either a second
+    # copy of these checks or the loss of `python3 smoke_test.py`, which runs
+    # with no pytest installed — and pytest is not in requirements.txt, so a
+    # fresh clone can verify the repo with nothing extra. tests/test_smoke.py
+    # already turns every check below into its own pytest result.
+    #
+    # Guarded here because a 2,650-line function does not appear in one
+    # commit; it accretes.
+    _self = _ast.parse(open(__file__, encoding="utf-8").read())
+    _fns = [n for n in _self.body if isinstance(n, _ast.FunctionDef)]
+    _main = next((n for n in _fns if n.name == "main"), None)
+    _sections = [n for n in _fns if n.name.startswith("check_")]
+    _lines = {n.name: n.end_lineno - n.lineno for n in _fns}
+
+    ok &= check("the suite is split into section functions, not one long "
+                "main() — a 2,650-line function is what the audit found",
+                len(_sections) >= 20)
+    ok &= check(f"main() is a preamble plus calls, not the suite itself "
+                f"({_lines.get('main')} lines)",
+                _main is not None and _lines["main"] < 400)
+    ok &= check("every section function is called from main() exactly once — "
+                "a section nobody calls is a test suite quietly shrinking",
+                all(open(__file__, encoding="utf-8").read().count(
+                    f"ok = {n.name}(ok)") == 1 for n in _sections))
+
+    # The merge that produced these functions once left a `return ok` in the
+    # MIDDLE of a merged body, which made every check after it dead code: 308
+    # of 315 silently stopped running, and only a count caught it. An early
+    # return inside a section is the shape of that mistake.
+    def _own_returns(fn):
+        """Returns belonging to `fn` itself, not to anything nested in it.
+
+        A section legitimately defines helper functions and classes, and
+        their returns are theirs. Descending into them would flag every
+        section that has one.
+        """
+        out = []
+        stack = list(fn.body)
+        while stack:
+            node = stack.pop()
+            if isinstance(node, (_ast.FunctionDef, _ast.AsyncFunctionDef,
+                                 _ast.ClassDef, _ast.Lambda)):
+                continue
+            if isinstance(node, _ast.Return):
+                out.append(node)
+            stack.extend(_ast.iter_child_nodes(node))
+        return out
+
+    _early = [n.name for n in _sections
+              if any(r.lineno < n.end_lineno - 1 for r in _own_returns(n))]
+    ok &= check(f"no section returns before its end, which is how a merge "
+                f"turns the rest of a section into dead code "
+                f"(offenders: {_early or 'none'})",
+                not _early)
+    return ok
+
+
+def check_naming_and_dead_feature_guards(ok: bool) -> bool:
+    """naming and dead-feature guards"""
     # ---- naming and dead-feature guards ----------------------------------
     # Not testing behaviour — testing claims. Three separate rounds of work went
     # into naming the products correctly and removing a flag that could not
@@ -2073,7 +3520,6 @@ def main() -> int:
                 + ("" if not offenders else " -> " + "; ".join(offenders[:4])),
                 not offenders)
 
-    import captcha_solver as _cs
     ok &= check("solve_recaptcha no longer takes use_antidetect",
                 "use_antidetect" not in inspect.signature(_cs.solve_recaptcha).parameters)
     ok &= check("the placeholder antidetect endpoint constant is gone",
@@ -2092,7 +3538,6 @@ def main() -> int:
     #
     # Two sources of truth, one dead and one with a hole. Running the shipped
     # one here as well means a failure shows up locally, before a push.
-    _repo_root = os.path.dirname(os.path.abspath(__file__))
     _script = os.path.join(_repo_root, ".github", "ci_checks.py")
     ok &= check("ci_checks.py is present", os.path.exists(_script))
     if os.path.exists(_script):
@@ -2111,6 +3556,305 @@ def main() -> int:
                     or "ci_checks.py --all" in _wf)
         ok &= check("...and carries no second, narrower inline credential "
                     "grep", "(ws|wss)://[^ " not in _wf)
+
+    return ok
+
+
+def check_canary_yml_the_exit_code_table_it_prints_must_be(ok: bool) -> bool:
+    """canary.yml: the exit-code table it prints must be the engines'"""
+    # --- canary.yml: the exit-code table it prints must be the engines' ----
+    # The 2026-09-11 audit found the canary announcing "exit 124 — self-imposed
+    # timeout" for a code no engine has ever returned, while having no entry
+    # for 5 or 6 at all. Nothing executed that table, so it drifted silently
+    # for months and a fetch failure was reported as an unknown code. It now
+    # lives in a shipped script that imports the constants, and this pins both
+    # halves: the table agrees with output_writer, and the workflow calls the
+    # script instead of reimplementing a copy of it.
+    _canary_script = os.path.join(_repo_root, ".github", "canary_check.py")
+    ok &= check("canary_check.py is present", os.path.exists(_canary_script))
+    if os.path.exists(_canary_script):
+        sys.path.insert(0, os.path.join(_repo_root, ".github"))
+        import canary_check as _cc
+        from output_writer import EXIT_DRIVER_TIMEOUT
+
+        _contract = {0, 1, 2, EXIT_BLOCKED, EXIT_NO_PRODUCTS,
+                     EXIT_FETCH_FAILED, EXIT_PARTIAL, EXIT_DRIVER_TIMEOUT}
+        ok &= check("the canary's exit-code table covers every code the "
+                    "contract defines — no code can fall through to "
+                    "'unexpected'",
+                    _contract <= set(_cc.EXIT_MEANINGS))
+        ok &= check("...and invents none: every key is a code some engine "
+                    "really returns",
+                    set(_cc.EXIT_MEANINGS) == _contract)
+        ok &= check("124 is named, not a magic number — selenium_scraper uses "
+                    "the shared constant, so the table cannot come to describe "
+                    "something else (it used to say 'the page never became "
+                    "ready'; it is chromedriver failing to START)",
+                    EXIT_DRIVER_TIMEOUT == 124
+                    and "_leave_now(124)" not in open(
+                        os.path.join(_repo_root, "selenium_scraper.py"),
+                        encoding="utf-8").read())
+        # Output is swallowed while probing: check_exit_code PRINTS
+        # "::error::..." lines, and this suite runs inside tests.yml, where
+        # GitHub turns that prefix into a workflow annotation. A green run
+        # that annotates itself with six errors is worse than no check.
+        def _verdict(code, allow_block):
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                return _cc.check_exit_code(code, allow_block=allow_block)
+
+        ok &= check("a clean run is the only code the canary passes on when a "
+                    "block is NOT excused",
+                    _verdict(0, False) == 0
+                    and all(_verdict(c, False) == 1
+                            for c in (1, 2, EXIT_BLOCKED, EXIT_NO_PRODUCTS,
+                                      EXIT_FETCH_FAILED, EXIT_PARTIAL)))
+        ok &= check("--allow-block excuses a BLOCK and nothing else — a "
+                    "datacentre refusal says nothing about the site, but 0 "
+                    "products on a page that loaded still does",
+                    _verdict(EXIT_BLOCKED, True) == 0
+                    and all(_verdict(c, True) == 1
+                            for c in (1, 2, EXIT_NO_PRODUCTS,
+                                      EXIT_FETCH_FAILED, EXIT_PARTIAL)))
+
+        _cwf = open(os.path.join(_repo_root, ".github", "workflows",
+                                 "canary.yml"), encoding="utf-8").read()
+        ok &= check("canary.yml calls the shipped script rather than carrying "
+                    "its own copy of the table",
+                    "canary_check.py --exit-code" in _cwf
+                    and "case \"$code\" in" not in _cwf)
+        # Comment lines are excluded on purpose: the header explains what the
+        # old commented-out --proxy line was and why it is gone, and prose
+        # about a flag cannot leak a credential. Only an executable line can.
+        _cwf_code = [ln for ln in _cwf.splitlines()
+                     if not ln.lstrip().startswith("#")]
+        ok &= check("the canary never puts the proxy credential in argv — it "
+                    "goes through the environment env_config.py already "
+                    "reads (CLAUDE.md §3, §11)",
+                    not any("--proxy" in ln for ln in _cwf_code)
+                    and "FARFETCH_PROXY: ${{ secrets.FARFETCH_PROXY }}" in _cwf)
+        ok &= check("the proxy-backed job SKIPS rather than fails when the "
+                    "secret is absent — a check that is red every morning is "
+                    "a check nobody reads",
+                    "HAVE_PROXY: ${{ secrets.FARFETCH_PROXY != '' }}" in _cwf
+                    and "::notice::Skipped" in _cwf)
+        ok &= check("BOTH canary jobs exercise pagination (--pages 3): with "
+                    "one page a dead next-link stays invisible, which is how "
+                    "the silent-single-page bug survived once already",
+                    sum(1 for ln in _cwf_code if "--pages 3" in ln) == 2)
+
+    return ok
+
+
+def check_numeric_flags_are_range_checked_in_every_cli(ok: bool) -> bool:
+    """numeric flags are range-checked, in every CLI"""
+    # --- numeric flags are range-checked, in every CLI ---------------------
+    # `--retries 0` was accepted by all three browser engines, and the attempt
+    # loop is `range(1, retries + 1)` — so zero attempts means page.goto() is
+    # never called. The run parsed about:blank (39 bytes, measured 2026-09-14
+    # against a page that returns 559 with --retries 1) and exited 4, "the
+    # page was fetched and held nothing". A wrong answer reached by typing a
+    # number, which is the bug class this repo cares about most.
+    #
+    # The validators live in arg_types.py and are attached as argparse
+    # `type=` callables, so argparse produces the usage error and exit 2
+    # itself, before a browser is launched. The risk that then remains is
+    # DRIFT — a numeric flag added later with a bare `type=int`. This walks
+    # every CLI's AST and closes it.
+    import arg_types as _at
+
+    _clis = ["playwright_scraper.py", "selenium_scraper.py",
+             "puppeteer_scraper.py", "scraper_api_client.py",
+             "diff_runs.py", "fingerprint_client.py"]
+    _unguarded = []
+    _guarded = 0
+    for _name in _clis:
+        _tree = _ast.parse(open(os.path.join(_repo_root, _name),
+                                encoding="utf-8").read())
+        for _node in _ast.walk(_tree):
+            if not (isinstance(_node, _ast.Call)
+                    and isinstance(_node.func, _ast.Attribute)
+                    and _node.func.attr == "add_argument"):
+                continue
+            _flag = next((a.value for a in _node.args
+                          if isinstance(a, _ast.Constant)
+                          and isinstance(a.value, str)
+                          and a.value.startswith("--")), None)
+            _type = next((k.value for k in _node.keywords if k.arg == "type"),
+                         None)
+            if _flag is None or _type is None:
+                continue
+            # A bare `int`/`float` is the shape being hunted.
+            if isinstance(_type, _ast.Name) and _type.id in ("int", "float"):
+                if _flag not in _at.UNVALIDATED_OK:
+                    _unguarded.append(f"{_name} {_flag}")
+            elif (isinstance(_type, _ast.Name) and _type.id in _at.VALIDATORS):
+                _guarded += 1
+            elif (isinstance(_type, _ast.Call)
+                  and isinstance(_type.func, _ast.Name)
+                  and _type.func.id == "bounded_int"):
+                _guarded += 1
+
+    ok &= check(f"every numeric CLI flag is range-checked ({_guarded} guarded; "
+                f"unguarded: {_unguarded or 'none'}) — a bare type=int is how "
+                f"--retries 0 came to mean 'never fetch the page'",
+                not _unguarded)
+    ok &= check("...and at least one flag in each browser engine is actually "
+                "guarded, so the walk above is finding call sites rather than "
+                "quietly matching nothing",
+                _guarded >= 15)
+
+    # Zero is allowed exactly where it names a real behaviour and refused
+    # where it names none. Pinned in both directions: a validator that
+    # rejects everything would pass a one-sided check.
+    for _fn, _good, _bad in (
+            (_at.positive_int, ("1", "50"), ("0", "-1", "x")),
+            (_at.nonneg_int, ("0", "3"), ("-1", "x")),
+            (_at.nonneg_float, ("0", "0.0", "2.5"), ("-0.1", "x")),
+            (_at.bounded_int(1, 120), ("1", "120", "60"), ("0", "121", "x"))):
+        _name = getattr(_fn, "__name__", "?")
+        _ok_good = all(_fn(v) is not None for v in _good)
+        _ok_bad = True
+        for v in _bad:
+            try:
+                _fn(v)
+                _ok_bad = False
+            except argparse.ArgumentTypeError:
+                pass
+        ok &= check(f"{_name}: accepts {_good} and refuses {_bad}",
+                    _ok_good and _ok_bad)
+
+    return ok
+
+
+def check_the_dockerfile_s_copy_list_vs_the_entrypoint_s_i(ok: bool) -> bool:
+    """the Dockerfile's COPY list vs the entrypoint's import graph"""
+    # --- the Dockerfile's COPY list vs the entrypoint's import graph -------
+    # An explicit COPY list is right — the image should carry no test suite
+    # and no stray .env — but it falls behind, and CI is the only thing that
+    # builds the image. Every repo in this family has shipped an image that
+    # died with ModuleNotFoundError on every invocation, --help included,
+    # because one module was missing from that list (CLAUDE.md §10). This
+    # check needs no Docker, and it is what catches a module added today.
+    _dockerfile = open(os.path.join(_repo_root, "Dockerfile"),
+                       encoding="utf-8").read()
+    _copied = set(re.findall(r"([A-Za-z_][A-Za-z0-9_]*\.py)", _dockerfile))
+
+    # Walk the entrypoint's imports transitively, keeping only modules that
+    # are files in this repo.
+    _local = {f[:-3] for f in os.listdir(_repo_root) if f.endswith(".py")}
+    _needed, _queue = set(), ["playwright_scraper"]
+    while _queue:
+        _mod = _queue.pop()
+        if _mod in _needed or _mod not in _local:
+            continue
+        _needed.add(_mod)
+        _t = _ast.parse(open(os.path.join(_repo_root, _mod + ".py"),
+                             encoding="utf-8").read())
+        for _n in _ast.walk(_t):
+            if isinstance(_n, _ast.Import):
+                _queue += [a.name.split(".")[0] for a in _n.names]
+            elif isinstance(_n, _ast.ImportFrom) and _n.level == 0 and _n.module:
+                _queue.append(_n.module.split(".")[0])
+
+    _missing = sorted(m for m in _needed if m + ".py" not in _copied)
+    ok &= check(f"the Dockerfile COPYs every module its entrypoint imports "
+                f"(needs {len(_needed)}; missing: {_missing or 'none'}) — a "
+                f"module left out breaks the image on EVERY invocation, "
+                f"--help included",
+                not _missing)
+    ok &= check("...and still carries no test suite or fixtures into the "
+                "image",
+                "smoke_test.py" not in _copied and "tests" not in _dockerfile)
+
+    # pyproject lists the same flat modules. A new module missing here
+    # installs a package whose console script cannot import itself.
+    _pyproject = open(os.path.join(_repo_root, "pyproject.toml"),
+                      encoding="utf-8").read()
+    _declared = set(re.findall(r'^\s*"([a-z_]+)",\s*$', _pyproject, re.M))
+    _undeclared = sorted(m for m in _needed if m not in _declared)
+    ok &= check(f"pyproject's py-modules lists every module the entrypoint "
+                f"imports (missing: {_undeclared or 'none'})",
+                not _undeclared)
+
+        # console scripts point at something that exists    #
+    # --- console scripts point at something that exists -------------------
+    # A [project.scripts] entry naming a missing module or a non-callable
+    # installs perfectly happily and fails only when a user runs it — the
+    # same "looks configured, is not" shape as the rest of this file. Checked
+    # statically so it does not need an install.
+    _scripts = dict(re.findall(r'^([a-z0-9-]+) = "([a-z_]+:[a-z_]+)"\s*$',
+                               _pyproject, re.M))
+    ok &= check(f"pyproject declares console scripts ({len(_scripts)} of them)",
+                len(_scripts) >= 8)
+    _bad_targets = []
+    for _cmd, _target in sorted(_scripts.items()):
+        _mod, _fn = _target.split(":")
+        if _mod not in _declared:
+            _bad_targets.append(f"{_cmd} -> {_mod} not in py-modules")
+            continue
+        _t = _ast.parse(open(os.path.join(_repo_root, _mod + ".py"),
+                             encoding="utf-8").read())
+        if not any(isinstance(n, (_ast.FunctionDef, _ast.AsyncFunctionDef))
+                   and n.name == _fn for n in _t.body):
+            _bad_targets.append(f"{_cmd} -> {_target} is not a top-level def")
+    ok &= check(f"every console script points at a real top-level function in "
+                f"a declared module (bad: {_bad_targets or 'none'})",
+                not _bad_targets)
+
+    # The three engines go through cli_entry, not straight at their own
+    # main(). Installing ONE extra — which is what the README says to do —
+    # still puts all three commands on PATH, and running the other two used
+    # to print a ModuleNotFoundError traceback for a command the install
+    # itself created. cli_entry turns that into exit 2 and the pip line.
+    ok &= check("the engine commands go through cli_entry, so a missing "
+                "driver is a usage error naming the extra to install rather "
+                "than a traceback",
+                all(_scripts.get(f"farfetch-scraper-{_e}", "").startswith("cli_entry:")
+                    for _e in ("playwright", "selenium", "puppeteer")))
+
+    import cli_entry as _ce
+    ok &= check("...and cli_entry knows every engine, with the right driver "
+                "name for each — pyppeteer's module and its extra differ, "
+                "which is why this is a map and not a string operation",
+                _ce._ENGINES["puppeteer_scraper"] == ("pyppeteer", "puppeteer")
+                and set(_ce._ENGINES) == {"playwright_scraper",
+                                          "selenium_scraper",
+                                          "puppeteer_scraper"})
+
+    # Both halves of the triage, with the import stubbed so neither case
+    # launches a browser. The engine's OWN driver missing is a usage error;
+    # anything else must surface as itself, or a genuinely broken module gets
+    # reported as "you forgot an extra" and the real cause is never seen.
+    _real_import = _ce.importlib.import_module
+
+    def _raise_missing(name):
+        def _stub(_mod):
+            raise ModuleNotFoundError(f"No module named {name!r}", name=name)
+        return _stub
+
+    _ce.importlib.import_module = _raise_missing("pyppeteer")
+    _buf = io.StringIO()
+    with contextlib.redirect_stderr(_buf):
+        _rc_missing_driver = _ce._run("puppeteer_scraper")
+    _msg = _buf.getvalue()
+
+    _ce.importlib.import_module = _raise_missing("bs4")
+    try:
+        _ce._run("puppeteer_scraper")
+        _other = "swallowed"
+    except ModuleNotFoundError as e:
+        _other = e.name
+    _ce.importlib.import_module = _real_import
+
+    ok &= check("cli_entry: the engine's own driver missing is exit 2 with "
+                "the pip line, not a traceback for a command the install "
+                "itself created",
+                _rc_missing_driver == 2
+                and "pip install" in _msg and "puppeteer" in _msg)
+    ok &= check("cli_entry: any OTHER missing module is re-raised unchanged — "
+                "a broken import must never be blamed on a missing extra",
+                _other == "bs4")
 
     # `--fp-tags` MUST DEFAULT TO ONE OS-FAMILY TAG. It shipped as
     # "Windows,Chrome,Desktop", which the fingerprint API rejects with HTTP
@@ -2170,6 +3914,220 @@ def main() -> int:
     # printing a live credential to anyone who types --help.
     ok &= check("the --key help text does not interpolate its default",
                 "%(default)s" not in _fp_src)
+    return ok
+
+
+
+
+def main() -> int:
+    ok = True
+
+    # Checks that could not run because an optional engine library is absent.
+    # Reported at the end: a suite that silently skips part of itself and still
+    # says "all passed" is the same defect as code that reports success without
+    # checking that what it wanted actually happened.
+    _skips = []
+    # Which engine LIBRARIES were absent, as names rather than prose. The
+    # engine-smoke CI job runs one venv per engine and has to assert that THIS
+    # engine did not skip while the other two did — which a free-text line
+    # cannot answer. Printed as one machine-readable line at the end.
+    _skipped_engines = set()
+
+    ok &= check("parser extracts exactly 2 real products (junk link excluded)", len(products) == 2)
+    ok &= check("first product has correct title/price",
+                products[0].title == "Marni Kids logo-print cotton T-shirt" and products[0].price == 79.0)
+    ok &= check("three-price tile resolves to lowest price + highest original",
+                products[1].price == 64.0 and products[1].original_price == 160.0)
+    # This fixture was written as a "multiple boutiques" case. It is not: the
+    # live site shows exactly this shape as ONE product's discount chain —
+    # 160 -50% -> 80 -20% -> 64, matching the four real products measured on a
+    # /sale/all/ page. The old expectation of 50.0 read only the FIRST
+    # percentage, which is not the discount the buyer gets.
+    ok &= check("discount_pct is the compounded discount (160->64 = 60%), not "
+                "the first printed percentage (-50%)",
+                products[1].discount_pct == 60.0)
+    ok &= check("category label propagated", products[0].category == "Kids")
+    ok &= check("junk 'sizing guide' link did not create a 3rd product or steal a sibling's data", len(products) == 2)
+
+    farfetch_products = parse_products(SAMPLE_FARFETCH_JSONLD_HTML, "https://www.farfetch.com/shopping/kids/girls-clothing-4/items.aspx")
+    ok &= check("Farfetch JSON-LD: product URL comes from offers.url, not the listing page",
+                len(farfetch_products) == 2
+                and farfetch_products[0].url == "https://www.farfetch.com/shopping/kids/diesel-kids-logo-t-shirt-item-33055894.aspx"
+                and farfetch_products[1].url == "https://www.farfetch.com/shopping/kids/marni-kids-logo-print-t-shirt-item-32485327.aspx")
+    ok &= check("Farfetch JSON-LD: brand parsed correctly", farfetch_products[0].brand == "Diesel Kids")
+
+    # sku is recovered from the URL: Farfetch's listing JSON-LD carries no
+    # sku/productID field at all (verified on two live captures two weeks
+    # apart), so without this every row would have sku=None.
+    ok &= check("JSON-LD: sku recovered from the -item-<digits>.aspx URL",
+                farfetch_products[0].sku == "33055894" and farfetch_products[1].sku == "32485327")
+    ok &= check("CSS fallback: sku recovered from the URL too",
+                products[0].sku == "29998189" and products[1].sku == "99999")
+
+    # EUR / symbol-after-number locale — a $-only regex scores 0 here.
+    eur = parse_products(SAMPLE_EUR_LISTING_HTML, "https://www.farfetch.com/de/shopping/kids/girls-clothing-4/items.aspx")
+    ok &= check("EUR locale: all 3 products parsed despite '125 €' form", len(eur) == 3)
+    ok &= check("EUR locale: currency detected as EUR, not defaulted to USD",
+                all(p.currency == "EUR" for p in eur))
+    ok &= check("EUR locale: plain price parsed", eur[0].price == 125.0)
+    # 65 -> 46 is 29.2%, and the tile prints "-30%" — the site rounds for
+    # display. The computed figure is the discount actually received, so that is
+    # what ships; the 1pp cross-check tolerance treats this as agreement and
+    # logs nothing.
+    ok &= check("EUR locale: discounted tile resolves low/high correctly, not inverted",
+                eur[1].price == 46.0 and eur[1].original_price == 65.0)
+    ok &= check("EUR locale: discount computed from prices (29.2%), not read "
+                "from the site's rounded '-30%'",
+                eur[1].discount_pct == 29.2)
+    ok &= check("EUR locale: EU decimal convention '1.234,56' parsed as 1234.56",
+                eur[2].price == 1234.56)
+
+    # A single separator with no second one to disambiguate against is
+    # ambiguous between "thousands grouping" and "decimal point". This
+    # project supports exactly four currencies (_CURRENCY_SYMBOLS: USD, EUR,
+    # GBP, JPY), none with a 3-digit decimal subunit, so 3 trailing digits
+    # after the only separator present means thousands, not decimal —
+    # getting this backwards previously turned "$1,234" into 1.234.
+    from product_parser import _prices_in
+    ok &= check("thousands separator: '$1,234' (US, no cents shown) is 1234, not 1.234",
+                _prices_in("$1,234")[0] == [1234.0])
+    ok &= check("thousands separator: '€1.234' (EU, no cents shown) is 1234, not 1.234",
+                _prices_in("€1.234")[0] == [1234.0])
+    ok &= check("thousands separator: '¥123,456' (JPY, no decimal subunit) is 123456",
+                _prices_in("¥123,456")[0] == [123456.0])
+    ok &= check("thousands separator: a lone separator with 2 trailing digits is still "
+                "read as a decimal point, e.g. '$1,23' -> 1.23",
+                _prices_in("$1,23")[0] == [1.23])
+    ok &= check("thousands separator: repeated thousands groups, '$1,234,567' -> 1234567",
+                _prices_in("$1,234,567")[0] == [1234567.0])
+
+    # The ?page=N fallback used when NEXT_PAGE_SELECTOR matches nothing.
+    from product_parser import page_url
+    ok &= check("page_url: adds ?page=N to a bare listing URL",
+                page_url("https://www.farfetch.com/shopping/kids/x/items.aspx", 2)
+                == "https://www.farfetch.com/shopping/kids/x/items.aspx?page=2")
+    ok &= check("page_url: REPLACES an existing page param rather than "
+                "appending a second one",
+                page_url("https://www.farfetch.com/shopping/x/items.aspx?page=1", 3)
+                == "https://www.farfetch.com/shopping/x/items.aspx?page=3")
+    ok &= check("page_url: preserves the filters and sort order already in the "
+                "URL — dropping them would silently scrape a different listing",
+                page_url("https://www.farfetch.com/de/shopping/x/items.aspx?view=90&sort=3", 4)
+                == "https://www.farfetch.com/de/shopping/x/items.aspx?view=90&sort=3&page=4")
+    ok &= check("page_url: an existing param differing only in case is still "
+                "replaced, not duplicated",
+                page_url("https://www.farfetch.com/shopping/x/items.aspx?PAGE=7", 8)
+                == "https://www.farfetch.com/shopping/x/items.aspx?page=8")
+
+    # Some Farfetch markets print a 3-letter ISO code instead of a symbol.
+    # A tile priced that way matched nothing before and was dropped as "not a
+    # product tile" — losing every product on that locale rather than
+    # reporting one with an unfamiliar currency.
+    ok &= check("ISO currency code, code first: 'AED 100' -> 100 AED",
+                _prices_in("AED 100") == ([100.0], "AED"))
+    ok &= check("ISO currency code, code last: '100 CHF' -> 100 CHF",
+                _prices_in("100 CHF") == ([100.0], "CHF"))
+    ok &= check("ISO currency code carries the thousands/decimal handling too: "
+                "'SAR 1,250.50' -> 1250.50 SAR",
+                _prices_in("SAR 1,250.50") == ([1250.5], "SAR"))
+    ok &= check("ISO currency code: a discounted tile's three prices all parse",
+                _prices_in("AED 245 AED 135 AED 108")
+                == ([245.0, 135.0, 108.0], "AED"))
+    # The allowlist is the whole point: a bare [A-Z]{3} would turn a size
+    # chart or a spec line into phantom prices.
+    ok &= check("three capitals that are NOT a currency code are not a price: "
+                "'XXL 100' yields nothing",
+                _prices_in("XXL 100") == ([], None))
+    ok &= check("a longer word starting with a real code is not matched: "
+                "'SARAH 100' yields nothing",
+                _prices_in("SARAH 100") == ([], None))
+
+    # A space is the thousands separator in French, Russian and others, and a
+    # rendered page uses a no-break variant so the number does not wrap. All
+    # three forms appeared in an audit and all three parsed as 234, an order
+    # of magnitude off, silently.
+    ok &= check("space-grouped thousands: '1 234 €' is 1234, not 234",
+                _prices_in("1 234 €") == ([1234.0], "EUR"))
+    ok &= check("no-break space (U+00A0) groups thousands too — this is what a "
+                "rendered page actually contains",
+                _prices_in("1 234 €") == ([1234.0], "EUR"))
+    ok &= check("narrow no-break space (U+202F) as well",
+                _prices_in("1 234 €") == ([1234.0], "EUR"))
+    ok &= check("space grouping combines with a decimal comma: "
+                "'1 234,56 €' -> 1234.56",
+                _prices_in("1 234,56 €") == ([1234.56], "EUR"))
+    ok &= check("space grouping requires FULL groups of three digits, so a size "
+                "list beside a price ('5 yrs, 6 yrs 200 €') does not merge into "
+                "one number",
+                _prices_in("Verfügbar in 5 yrs, 6 yrs 200 €")
+                == ([200.0], "EUR"))
+
+    # A bare "$" is genuinely ambiguous, but a PREFIXED one is not, and
+    # reporting HK$1,234 as USD is the wrong currency rather than a rounding
+    # error — directly against this project's cross-country comparison use.
+    ok &= check("HK$ is HKD, not USD", _prices_in("HK$1,234") == ([1234.0], "HKD"))
+    ok &= check("A$ is AUD and NT$ is TWD, and the prefix is tried before the "
+                "bare '$' so it cannot be swallowed",
+                _prices_in("A$99") == ([99.0], "AUD")
+                and _prices_in("NT$1 500") == ([1500.0], "TWD"))
+    ok &= check("a bare '$' still reads as USD — on the US site that is what it "
+                "means, and JSON-LD supplies the real currency when the site "
+                "publishes one",
+                _prices_in("$1,234") == ([1234.0], "USD"))
+
+    with tempfile.TemporaryDirectory() as tmp:
+        prefix = os.path.join(tmp, "smoke_out")
+        save(products, prefix, "both")
+        ok &= check("JSON file written", os.path.isfile(prefix + ".json") and os.path.getsize(prefix + ".json") > 0)
+        ok &= check("CSV file written", os.path.isfile(prefix + ".csv") and os.path.getsize(prefix + ".csv") > 0)
+
+    challenge = detect_recaptcha_v3(SAMPLE_RECAPTCHA_HTML, "https://www.farfetch.com/account/signup")
+    ok &= check("reCAPTCHA v3 detected with correct sitekey/action",
+                challenge is not None and challenge.sitekey == "6Lc_test_sitekey_123456789" and challenge.action == "signup")
+
+    no_challenge = detect_recaptcha_v3(SAMPLE_LISTING_HTML, "https://www.farfetch.com/shopping/kids/items.aspx")
+    ok &= check("no false-positive captcha detection on clean page", no_challenge is None)
+
+    widget_challenge = detect_recaptcha_v3(SAMPLE_FARFETCH_CAPTCHA_WIDGET_HTML, "https://www.farfetch.com/shopping/kids/items.aspx")
+    ok &= check("reCAPTCHA v3 detected via Farfetch's <captcha-widget> custom-element format",
+                widget_challenge is not None
+                and widget_challenge.sitekey == "6LeifPcbAAAAAJaiPe_xgLTfnbdpEMAYJAAnVFJT"
+                and widget_challenge.action == "verify")  # data-action="null" -> default
+
+
+    # Every section, in the order they were written. A section
+    # takes the running verdict and returns it; nothing else is
+    # threaded between them.
+    ok = check_runtime_recaptcha_detection_added_2026_08_24(ok)
+    ok = check_reconciling_two_detectors_that_disagree(ok)
+    ok = check_api_v2_task_objects_must_match_the_documented_ty(ok)
+    ok = check_discounted_prices_the_dom_overlay(ok)
+    ok = check_category_label(ok)
+    ok = check_sample_selection(ok)
+    ok = check_credential_loading(ok)
+    ok = check_v2_createtask_gettaskresult_round_trip_mocked(ok)
+    ok = check_sign_up_modal_selectors(ok)
+    ok = check_empty_result_contract(ok)
+    ok = check_blocked_vs_empty_exit_code(ok)
+    ok = check_akamai_s_refusal_page_the_2026_09_11_audit_s_p0(ok)
+    ok = check_page_content_mid_navigation(ok)
+    ok = check_puppeteer_pyppeteer_ua_derived_from_the_real_lau(ok)
+    ok = check_selenium_chromedriver_on_the_local_path(ok)
+    ok = check_selenium_two_live_local_failures_turned_into_tes(ok)
+    ok = check_cross_page_dedup_cross_run_diff(ok)
+    ok = check_run_metadata_partial_runs_must_not_read_as_delis(ok)
+    ok = check_run_metadata_id_timings_quality(ok)
+    ok = check_the_webhook(ok)
+    ok = check_json_ld_shapes_that_are_legal_but_were_not_handl(ok)
+    ok = check_proxy_credentials_must_not_reach_a_browser_comma(ok)
+    ok = check_proxy_pool_and_rotation(ok)
+    ok = check_product_detail_pages(ok)
+    ok = check_engine_flag_parity(ok)
+    ok = check_the_suite_s_own_shape(ok)
+    ok = check_naming_and_dead_feature_guards(ok)
+    ok = check_canary_yml_the_exit_code_table_it_prints_must_be(ok)
+    ok = check_numeric_flags_are_range_checked_in_every_cli(ok)
+    ok = check_the_dockerfile_s_copy_list_vs_the_entrypoint_s_i(ok)
 
     print()
     if _skips:
@@ -2177,9 +4135,13 @@ def main() -> int:
               f"library is not installed here:")
         for line in _skips:
             print(f"  - {line}")
-        print("Expected in CI, which installs no engine on purpose. Install one "
-              "to exercise them.")
+        print("Expected in the offline CI job, which installs no engine on "
+              "purpose. Install one to exercise them.")
         print()
+    # Always printed, including when empty, so a CI job can tell "no engine
+    # skipped" from "this line was never reached".
+    print(f"SKIPPED_ENGINES: {','.join(sorted(_skipped_engines))}")
+    print()
 
     if ok:
         print("All smoke tests passed. Core logic is sound — safe to move on to a real browser run.")

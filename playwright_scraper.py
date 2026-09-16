@@ -42,6 +42,7 @@ Requires: pip install -r requirements.txt -r requirements-playwright.txt
 
 import argparse
 import logging
+import os
 import queue
 import sys
 import threading
@@ -55,13 +56,19 @@ from playwright.sync_api import (sync_playwright, Error as PWError,
 
 from captcha_solver import (detect_recaptcha_v3, detect_recaptcha_in_page,
                             reconcile_detections, solve_recaptcha,
-                            INJECT_TOKEN_JS, RECAPTCHA_DISCOVERY_JS)
+                            INJECT_TOKEN_JS)
 from product_parser import (parse_products, SELECTORS, detect_bot_challenge,
-                            page_url)
-from output_writer import dedupe_by_sku, finish_run
+                            describe_block, page_url,
+                            count_product_links)
+from product_detail_parser import parse_product_detail
+from output_writer import (dedupe_by_sku, finish_run, stop_reason_for,
+                           COMPLETE_STOP_REASONS, new_run_id,
+                           ProductVariant)
+from run_state import Checkpoint
 from proxy_pool import (from_args as proxy_pool_from_args, to_playwright, mask,
                         ROTATE_MODES, ProxyError, ProxyPool)
 import env_config
+from arg_types import positive_int, nonneg_int, nonneg_float
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger("playwright_scraper")
@@ -97,10 +104,34 @@ class PageOutcome:
     products: List = field(default_factory=list)
     blocked_by: Optional[str] = None
     load_failed: bool = False
+    # The response status for the document itself, where the driver exposes
+    # one (Playwright and pyppeteer return a Response from goto(); Selenium
+    # has no equivalent without a CDP session, so it stays None there and the
+    # HTML markers carry the whole job — see CLAUDE.md §8 on needing a
+    # STRUCTURAL secondary signal for exactly that case).
+    http_status: Optional[int] = None
+    # Chromium's own error text when the EXIT was unusable
+    # (ERR_PROXY_CONNECTION_FAILED and friends), as opposed to the site being
+    # slow. Recorded rather than folded into load_failed because the two want
+    # opposite responses — another try at the same exit vs. a different exit —
+    # and the run metadata should say which one happened.
+    proxy_failure: Optional[str] = None
+    # The page was served, carried product links, and the parser still
+    # returned nothing. That is not an empty category — it is this repo's
+    # bug, and the two deserve opposite responses from whoever reads the run.
+    parse_drift: bool = False
+
+    @property
+    def http_error(self) -> bool:
+        """The edge answered, with an error. Whatever came back is not the
+        listing, even when no vendor marker names who refused us — an
+        unrecognised 403 body is still a 403."""
+        return self.http_status is not None and self.http_status >= 400
 
     @property
     def ok(self) -> bool:
-        return not self.load_failed and self.blocked_by is None
+        return (not self.load_failed and self.blocked_by is None
+                and not self.http_error)
 
 
 def _plan_page_urls(page, args, page_one_url: str) -> Optional[List[str]]:
@@ -506,6 +537,7 @@ def _fetch_one_page(session, args, pool, page_num: int, url: str) -> PageOutcome
     # the same address just burns it further.
     block_retries = args.proxy_block_retries if (pool and len(pool) > 1) else 0
     html, vendor, load_failed = None, None, False
+    http_status = None
 
     for block_attempt in range(block_retries + 1):
         logger.info("Fetching page %d/%d: %s", page_num, args.pages, url)
@@ -516,7 +548,15 @@ def _fetch_one_page(session, args, pool, page_num: int, url: str) -> PageOutcome
         load_failed, exit_failed = False, None
         for attempt in range(1, args.retries + 1):
             try:
-                session.page.goto(url, wait_until="domcontentloaded", timeout=60000)
+                # goto() hands back the Response for the document itself.
+                # It was being discarded, and with it the single most
+                # reliable signal a refusing edge gives us: Farfetch's
+                # "Access Denied" page arrives under HTTP 403 (measured
+                # 2026-09-14), while every marker on it was unknown to the
+                # parser. Taking the status first is CLAUDE.md §8.
+                resp = session.page.goto(url, wait_until="domcontentloaded",
+                                         timeout=60000)
+                http_status = resp.status if resp else None
                 load_failed = False
                 break
             except (PWTimeout, PWError) as e:
@@ -550,18 +590,28 @@ def _fetch_one_page(session, args, pool, page_num: int, url: str) -> PageOutcome
 
         handle_captcha_if_present(session.page, args)
 
-        # Don't wait for network idle (retail sites never go fully
-        # quiet) and don't accept a single selector match as "ready"
-        # (see MIN_CARD_MATCHES comment above).
-        try:
-            session.page.wait_for_function(
-                f"document.querySelectorAll({ITEM_LINK_SELECTOR!r}).length > {MIN_CARD_MATCHES}",
-                timeout=20000,
-            )
-            session.page.wait_for_timeout(1000)
-        except PWTimeout:
-            logger.warning("No product markers appeared within 20s — "
-                            "parsing whatever loaded (may be a bot-check/consent page).")
+        if http_status is not None and http_status >= 400:
+            # An error status is not a page that has yet to paint, so the
+            # readiness wait below can only expire. Skipping it is worth
+            # doing rather than tidy: the wait is 20s, and it was being
+            # spent on every attempt of every page of a blocked run —
+            # 20s x --retries x --proxy-block-retries x --pages of nothing.
+            logger.warning("HTTP %d for %s — the edge answered with an error, "
+                           "so this is not the listing. Not waiting for "
+                           "products to paint.", http_status, url)
+        else:
+            # Don't wait for network idle (retail sites never go fully
+            # quiet) and don't accept a single selector match as "ready"
+            # (see MIN_CARD_MATCHES comment above).
+            try:
+                session.page.wait_for_function(
+                    f"document.querySelectorAll({ITEM_LINK_SELECTOR!r}).length > {MIN_CARD_MATCHES}",
+                    timeout=20000,
+                )
+                session.page.wait_for_timeout(1000)
+            except PWTimeout:
+                logger.warning("No product markers appeared within 20s — "
+                                "parsing whatever loaded (may be a bot-check/consent page).")
 
         html = session.page.content()
         vendor = detect_bot_challenge(html)
@@ -578,8 +628,16 @@ def _fetch_one_page(session, args, pool, page_num: int, url: str) -> PageOutcome
             pool.advance(f"blocked by {vendor} on page {page_num}")
             session.relaunch()
 
+    outcome.http_status = http_status
+    outcome.proxy_failure = exit_failed
+
     if load_failed:
-        logger.error("Gave up loading %s after %d attempt(s).", url, args.retries)
+        if exit_failed:
+            logger.error("Gave up loading %s: the exit is unusable (%s). That "
+                         "is a dead proxy, not a slow site — another try at "
+                         "the same address cannot help.", url, exit_failed)
+        else:
+            logger.error("Gave up loading %s after %d attempt(s).", url, args.retries)
         outcome.load_failed = True
         return outcome
 
@@ -604,11 +662,26 @@ def _fetch_one_page(session, args, pool, page_num: int, url: str) -> PageOutcome
                                     full_page=True)
         except Exception as e:
             logger.warning("Could not capture screenshot: %s", e)
-        logger.error("Blocked by a %s challenge page before parsing (%d bytes) — "
+        logger.error("Blocked by %s before parsing (%d bytes) — "
                      "saved to %s%s. This is exit 3, distinct from a genuinely "
-                     "empty category (exit 4).", vendor, len(html), debug_html,
+                     "empty category (exit 4).", describe_block(html, vendor), len(html), debug_html,
                      f" (tried {block_retries + 1} exit(s))" if block_retries else "")
         outcome.blocked_by = vendor
+        return outcome
+
+    if outcome.http_error:
+        # An error status whose body carries no marker we recognise. We still
+        # know this is not the listing, and saying "0 products" about it
+        # would be a claim about the catalogue that this run cannot support.
+        # Reported separately from `blocked` precisely because we CANNOT name
+        # who refused us — "never present a guess as a fact" (CLAUDE.md §8).
+        debug_html = f"{args.out}_page{page_num}_debug.html"
+        with open(debug_html, "w", encoding="utf-8") as f:
+            f.write(html)
+        logger.error("HTTP %d for %s and nothing on the page names a known "
+                     "bot-check vendor — saved %d bytes to %s. Reported as a "
+                     "fetch failure, not an empty category.",
+                     outcome.http_status, url, len(html), debug_html)
         return outcome
 
     products = parse_products(html, session.page.url, category=args.category)
@@ -632,8 +705,24 @@ def _fetch_one_page(session, args, pool, page_num: int, url: str) -> PageOutcome
             session.page.screenshot(path=debug_png, full_page=True)
         except Exception as e:
             logger.warning("Could not capture screenshot: %s", e)
-        logger.warning("0 products parsed — saved what the browser actually saw to "
-                        "%s and %s. Open the .png to see it.", debug_html, debug_png)
+        linked = count_product_links(html)
+        if linked >= MIN_CARD_MATCHES:
+            # The distinction the audit asked for. A page that LINKS to 18
+            # products and parses to 0 is a broken parser, not an empty
+            # category, and reporting it as "no products" sends the reader to
+            # check the URL instead of the JSON-LD.
+            outcome.parse_drift = True
+            logger.error("PARSER DRIFT: the page links to %d product(s) and "
+                         "the parser extracted 0. This is not an empty "
+                         "category — the markup or the JSON-LD shape has "
+                         "changed. Saved what the browser saw to %s and %s.",
+                         linked, debug_html, debug_png)
+        else:
+            logger.warning("0 products parsed, and the page links to %d "
+                           "product(s) — consistent with an empty or filtered "
+                           "category, or a hub URL. Saved what the browser "
+                           "actually saw to %s and %s. Open the .png to see "
+                           "it.", linked, debug_html, debug_png)
 
     outcome.products = products
     outcome.final_url = session.page.url
@@ -664,7 +753,8 @@ def _worker_pool(pool, worker_index: int):
     return ProxyPool(proxies[offset:] + proxies[:offset], rotate="per-run")
 
 
-def _fetch_pages_concurrently(args, pool, specs, concurrency: int):
+def _fetch_pages_concurrently(args, pool, specs, concurrency: int,
+                              checkpoint=None):
     """Fetch `specs` [(page_num, url), ...] across `concurrency` workers.
 
     Each worker owns its own Playwright instance, browser and exit: with the
@@ -702,6 +792,13 @@ def _fetch_pages_concurrently(args, pool, specs, concurrency: int):
                                                   page_num, url)
                         with results_lock:
                             results.append(outcome)
+                            # Written from the COLLECTING side, inside the
+                            # lock that already serialises results — not from
+                            # each worker, which would have several threads
+                            # rewriting one file.
+                            if checkpoint is not None and outcome.ok:
+                                checkpoint.record(page_num, outcome.products,
+                                                  outcome.final_url)
                         if outcome.ok and not outcome.products:
                             logger.info("[%s] page %d returned no products — "
                                         "treating that as the end of the listing "
@@ -731,13 +828,112 @@ def _fetch_pages_concurrently(args, pool, specs, concurrency: int):
     return results, sorted(unattempted), exhausted.is_set()
 
 
-def scrape(args) -> None:
+
+def _crawl_details(session, args, listing_rows, checkpoint):
+    """Open each listed product and return one row per size.
+
+    Sequential, deliberately, for a first cut: detail mode multiplies a run's
+    requests by the number of products on a page (~18 here), and raising that
+    again with workers is a decision that wants a live measurement behind it
+    rather than a default.
+
+    The URLs come from the LISTING ROWS rather than from the page's HTML, so
+    the crawl and the listing parser cannot disagree about what counts as a
+    product — and the listing rows are already de-duplicated, which matters
+    because a tile links to its product twice.
+
+    Returns (rows, failures, attempted).
+    """
+    urls, seen = [], set()
+    for row in listing_rows:
+        if row.url and row.url not in seen:
+            seen.add(row.url)
+            urls.append(row.url)
+
+    total = len(urls)
+    if args.max_products and total > args.max_products:
+        logger.warning("Listing has %d products; --max-products %d caps this "
+                       "run. The cap is recorded in the run metadata, so a "
+                       "truncated crawl does not read as a complete one.",
+                       total, args.max_products)
+        urls = urls[:args.max_products]
+
+    logger.info("Detail mode: opening %d product page(s)%s.", len(urls),
+                f" of {total}" if len(urls) != total else "")
+
+    rows, failures = [], []
+    for i, url in enumerate(urls, start=1):
+        if checkpoint.has(i):
+            continue
+        if i > 1:
+            time.sleep(args.delay)
+        try:
+            resp = session.page.goto(url, wait_until="domcontentloaded",
+                                     timeout=60000)
+            status = resp.status if resp else None
+            if status is not None and status >= 400:
+                logger.warning("Product %d/%d: HTTP %d for %s — skipping.",
+                               i, len(urls), status, url)
+                failures.append(url)
+                continue
+            session.page.wait_for_timeout(1500)
+            html = session.page.content()
+        except (PWTimeout, PWError) as e:
+            reason = _proxy_failure(e)
+            logger.warning("Product %d/%d failed (%s) — skipping.", i,
+                           len(urls), reason or type(e).__name__)
+            failures.append(url)
+            continue
+
+        vendor = detect_bot_challenge(html)
+        if vendor:
+            logger.error("Product %d/%d: blocked by %s — skipping.", i,
+                         len(urls), describe_block(html, vendor))
+            failures.append(url)
+            continue
+
+        variants = parse_product_detail(html, session.page.url,
+                                        category=args.category)
+        if not variants:
+            # The parser already said why. Recorded as a failure rather than
+            # as "this product has no sizes", which is what an empty list
+            # would otherwise quietly mean.
+            failures.append(url)
+            continue
+
+        logger.info("Product %d/%d: %d size(s) — %s", i, len(urls),
+                    len(variants), (variants[0].title or "")[:60])
+        rows.extend(variants)
+        checkpoint.record(i, variants, session.page.url)
+
+    return rows, failures, len(urls)
+
+
+def scrape(args) -> int:
+    # One id per run, logged here and written into the sidecar, so a
+    # log line and an artefact can be tied together. "the run that
+    # failed" is not identifying for a scraper on a schedule.
+    run_id = new_run_id()
+    started_at = time.time()
+    logger.info("Run %s starting: %s", run_id, args.url)
     # One entry per page attempted, merged after the loop rather than folded
     # into shared state during it — see PageOutcome for why that ordering
     # matters more than it looks.
     outcomes: List[PageOutcome] = []
     seen_skus = set()
     blocked = False
+
+    # Written after every page, always — see run_state.py for why this is not
+    # behind a flag. --resume reads it; a completed run deletes it.
+    checkpoint = Checkpoint(args.out, args)
+    if args.resume:
+        for line in checkpoint.resume():
+            logger.info("%s", line)
+    elif checkpoint.enabled and os.path.exists(checkpoint.path):
+        logger.info("A checkpoint from an earlier run is at %s. It will be "
+                    "overwritten as this run progresses; pass --resume to "
+                    "continue that run instead of restarting it.",
+                    checkpoint.path)
     # Why the loop ended. "completed" means every requested page was
     # fetched; "pagination_exhausted" means the site itself ran out of pages
     # (also a complete result — there was nothing more to get). Anything else
@@ -785,12 +981,40 @@ def scrape(args) -> None:
             outcomes.append(first)
 
             if not first.ok:
-                stop_reason = ("page_load_timeout" if first.load_failed
-                               else f"blocked_{first.blocked_by}")
+                stop_reason = stop_reason_for(
+                    load_failed=first.load_failed,
+                    blocked_by=first.blocked_by,
+                    http_status=first.http_status,
+                    proxy_failure=first.proxy_failure,
+                    parse_drift=first.parse_drift)
                 blocked = first.blocked_by is not None
             else:
                 seen_skus.update(p.sku for p in first.products if p.sku is not None)
+                checkpoint.record(1, first.products, first.final_url)
                 planned = _plan_page_urls(session.page, args, first.final_url)
+
+                # Restored pages can only be SKIPPED when pages are
+                # addressable. Page 17's URL is unknowable without visiting
+                # 16 when pagination is a chain of links, so a resume there
+                # would have to walk every page anyway — and quietly not
+                # doing so would produce a run missing its middle. Say it
+                # instead.
+                restorable = [n for n in checkpoint.resumed_from if n >= 2]
+                if restorable and planned is None:
+                    logger.warning("--resume has %d stored page(s), but this "
+                                   "listing's pagination is a chain of links "
+                                   "rather than addressable URLs, so page N "
+                                   "cannot be reached without fetching N-1. "
+                                   "Re-fetching from page 2.", len(restorable))
+                    restorable = []
+                for n in restorable:
+                    outcomes.append(PageOutcome(
+                        page_num=n, url="(restored from checkpoint)",
+                        final_url=checkpoint.final_urls.get(n),
+                        products=checkpoint.pages[n]))
+                    seen_skus.update(p.sku for p in checkpoint.pages[n]
+                                     if p.sku is not None)
+                skip = set(restorable)
 
                 if args.pages > 1 and concurrency > 1 and planned is None:
                     logger.warning("--concurrency %d requested, but this listing's "
@@ -804,19 +1028,24 @@ def scrape(args) -> None:
                     # done its job, and holding it open would cost one more
                     # browser than asked for.
                     session.close()
-                    specs = [(n, planned[n - 2]) for n in range(2, args.pages + 1)]
+                    specs = [(n, planned[n - 2]) for n in range(2, args.pages + 1)
+                             if n not in skip]
                     logger.info("Fetching pages 2-%d across %d workers%s.",
                                 args.pages, concurrency,
                                 f" over {len(pool)} exit(s)" if pool else "")
                     rest, unattempted, exhausted = _fetch_pages_concurrently(
-                        args, pool, specs, concurrency)
+                        args, pool, specs, concurrency, checkpoint)
                     outcomes.extend(rest)
 
                     failed = [o for o in rest if not o.ok]
                     if failed:
                         worst = min(failed, key=lambda o: o.page_num)
-                        stop_reason = ("page_load_timeout" if worst.load_failed
-                                       else f"blocked_{worst.blocked_by}")
+                        stop_reason = stop_reason_for(
+                            load_failed=worst.load_failed,
+                            blocked_by=worst.blocked_by,
+                            http_status=worst.http_status,
+                            proxy_failure=worst.proxy_failure,
+                    parse_drift=worst.parse_drift)
                         blocked = any(o.blocked_by for o in rest)
                     elif exhausted:
                         stop_reason = "no_new_products"
@@ -837,11 +1066,24 @@ def scrape(args) -> None:
                             pool.advance(f"per-page rotation, page {page_num}")
                             session.relaunch()
 
+                        if page_num in skip:
+                            # Already held, and addressable, so the next URL
+                            # is constructible without visiting this one.
+                            url = planned[page_num - 1] if page_num < args.pages else url
+                            continue
+
                         outcome = _fetch_one_page(session, args, pool, page_num, url)
                         outcomes.append(outcome)
+                        if outcome.ok:
+                            checkpoint.record(page_num, outcome.products,
+                                              outcome.final_url)
                         if not outcome.ok:
-                            stop_reason = ("page_load_timeout" if outcome.load_failed
-                                           else f"blocked_{outcome.blocked_by}")
+                            stop_reason = stop_reason_for(
+                                load_failed=outcome.load_failed,
+                                blocked_by=outcome.blocked_by,
+                                http_status=outcome.http_status,
+                                proxy_failure=outcome.proxy_failure,
+                    parse_drift=outcome.parse_drift)
                             blocked = outcome.blocked_by is not None
                             break
 
@@ -894,11 +1136,59 @@ def scrape(args) -> None:
     final_url = (max(ok_pages, key=lambda o: o.page_num).final_url
                  if ok_pages else args.url)
 
-    return finish_run(all_products, args.out, args.format, args.allow_empty,
-                      blocked=blocked, stop_reason=stop_reason,
-                      pages_requested=args.pages, pages_completed=len(ok_pages),
-                      pages_failed=failed_pages,
-                      start_url=args.url, final_url=final_url)
+    rows, row_type = all_products, None
+    if args.mode == "detail":
+        # A fresh session for the crawl. The listing session is closed by now
+        # — and under --concurrency it was closed before the workers even
+        # started — so reopening is the consistent choice rather than
+        # threading one browser through two different phases.
+        detail_cp = Checkpoint(args.out, args, row_type=ProductVariant)
+        if args.resume:
+            for line in detail_cp.resume():
+                logger.info("%s", line)
+        with sync_playwright() as pw:
+            dsession = _BrowserSession(pw, args, pool,
+                                       remote=bool(args.cdp_endpoint)).open()
+            try:
+                rows, detail_failures, attempted = _crawl_details(
+                    dsession, args, all_products, detail_cp)
+            finally:
+                dsession.close()
+
+        rows = detail_cp.products_in_page_order() or rows
+        row_type = ProductVariant
+        if detail_failures:
+            # A crawl that lost products is not a complete view of them, and
+            # the run must not claim to be. The listing pages all succeeding
+            # says nothing about the product pages.
+            logger.warning("%d of %d product page(s) yielded nothing — the "
+                           "result covers the rest.", len(detail_failures),
+                           attempted)
+            if stop_reason in COMPLETE_STOP_REASONS:
+                stop_reason = "detail_pages_failed"
+        elif args.max_products and attempted >= args.max_products:
+            # Truncation is not failure, but it is not completeness either.
+            if stop_reason in COMPLETE_STOP_REASONS:
+                stop_reason = "max_products_reached"
+
+    rc = finish_run(rows, args.out, args.format, args.allow_empty,
+                    blocked=blocked, stop_reason=stop_reason,
+                      run_id=run_id, started_at=started_at,
+                      webhook=args.webhook, mode=args.mode, row_type=row_type,
+                    pages_requested=args.pages, pages_completed=len(ok_pages),
+                    pages_failed=failed_pages,
+                    start_url=args.url, final_url=final_url)
+
+    # Only a run that saw everything drops its checkpoint. A partial or failed
+    # run keeps it — that is the run --resume exists for, and deleting it here
+    # would throw away the pages it did get.
+    if stop_reason in COMPLETE_STOP_REASONS and rows:
+        checkpoint.clear()
+    elif checkpoint.enabled and checkpoint.pages:
+        logger.info("Checkpoint kept at %s (%d page(s)) — re-run the same "
+                    "command with --resume to continue from there.",
+                    checkpoint.path, len(checkpoint.pages))
+    return rc
 
 
 def parse_args():
@@ -907,19 +1197,19 @@ def parse_args():
                    help="Farfetch category/hub/search listing URL. Required, unless "
                         "FARFETCH_URL is set in the environment or in .env.")
     p.add_argument("--category", default=None, help="Label to tag output rows with. Defaults to the category segment of the URL, so the column is never empty just because the flag was omitted.")
-    p.add_argument("--pages", type=int, default=1, help="Number of listing pages to crawl")
-    p.add_argument("--delay", type=float, default=2.0, help="Delay between pages, seconds")
-    p.add_argument("--concurrency", type=int, default=1, metavar="N",
+    p.add_argument("--pages", type=positive_int, default=1, help="Number of listing pages to crawl")
+    p.add_argument("--delay", type=nonneg_float, default=2.0, help="Delay between pages, seconds")
+    p.add_argument("--concurrency", type=positive_int, default=1, metavar="N",
                    help="Fetch pages through N parallel workers (default 1 — "
                         "unchanged sequential behaviour). Each worker runs its "
                         "own browser and holds its own proxy exit, so N>1 "
                         "without --proxy-file just sends N times the traffic "
                         "from one address. Ignored with --cdp-endpoint.")
-    p.add_argument("--retries", type=int, default=3,
+    p.add_argument("--retries", type=positive_int, default=3,
                    help="Attempts per page load before giving up (default 3). A "
                         "single network flap mid-run should not end a 50-page "
                         "job; the pause between attempts doubles each time.")
-    p.add_argument("--retry-delay", type=float, default=2.0,
+    p.add_argument("--retry-delay", type=nonneg_float, default=2.0,
                    help="Seconds before the first page-load retry, doubling "
                         "thereafter (default 2.0)")
     p.add_argument("--format", choices=["json", "csv", "both"], default="both")
@@ -936,11 +1226,41 @@ def parse_args():
     p.add_argument("--proxy-shuffle", action="store_true",
                    help="Shuffle the pool at startup, so concurrent runs do not "
                         "all begin on the first exit in the file.")
-    p.add_argument("--proxy-block-retries", type=int, default=2,
+    p.add_argument("--proxy-block-retries", type=nonneg_int, default=2,
                    help="When a page comes back as a bot-challenge, retry it from "
                         "this many OTHER exits before giving up (default 2). "
                         "Needs a pool of more than one; ignored otherwise.")
     p.add_argument("--twocaptcha-key", default=None, help="2captcha.com API key")
+    p.add_argument("--mode", choices=["listing", "detail"], default="listing",
+                   help="listing (default): one row per product, read from "
+                        "the category page. detail: open each product page "
+                        "and emit one row per SIZE, with per-size price, "
+                        "strikethrough price and availability. Detail costs "
+                        "one extra request per product, so a 3-page run of "
+                        "~18 products a page is ~54 more fetches — see "
+                        "--max-products.")
+    p.add_argument("--max-products", type=nonneg_int, default=0, metavar="N",
+                   help="In --mode detail, stop after N product pages "
+                        "(0 = no limit, the default). A cap is reported in "
+                        "the run metadata, so a truncated crawl never reads "
+                        "as a complete one.")
+    p.add_argument("--resume", action="store_true",
+                   help="Continue a run that stopped early, using the "
+                        "<out>.progress.json checkpoint every multi-page run "
+                        "writes. Pages already held are not fetched again. "
+                        "Refused if the checkpoint is for a different URL, "
+                        "page count or category. Only skips pages when the "
+                        "listing's pagination is addressable (?page=N) — a "
+                        "chain of next-links has to be walked in order.")
+    p.add_argument("--webhook", default=None, metavar="URL",
+                   help="POST the run summary (the same fields as the "
+                        ".meta.json sidecar, plus the exit code) to this "
+                        "URL when the run finishes — including when it "
+                        "fails, which is the case worth being told about. "
+                        "Never fails the run, never logged (the URL is "
+                        "usually the credential). Prefer FARFETCH_WEBHOOK "
+                        "in .env over this flag: argv is readable by "
+                        "anything that can run ps.")
     p.add_argument("--allow-empty", action="store_true",
                    help="Write output files even when 0 products were found. Off by "
                         "default so a failed run can't overwrite a good result with "
@@ -981,6 +1301,7 @@ def parse_args():
                         "rather spend a solve than risk missing content that "
                         "only appears afterwards.")
     p.add_argument("--min-score", type=float, default=0.7,
+                   choices=[0.3, 0.7, 0.9],
                    help="reCAPTCHA v3 minimum score to request (0.3, 0.7 or 0.9 — "
                         "the API only accepts these three). Ignored for v2 widgets.")
     p.add_argument("--cdp-endpoint", default=None,
@@ -1006,22 +1327,35 @@ def parse_args():
     return args
 
 
-if __name__ == "__main__":
+def main() -> int:
+    """The entry point, as a callable rather than a module-level block.
+
+    It was inline under `if __name__ == "__main__"`, which meant two things:
+    the console script declared in pyproject had nothing to point at, and the
+    offline suite could only ever test the helpers underneath it — the exact
+    gap CLAUDE.md §10 names ("test the public entry point, not only its
+    internals"), which is how a signature once drifted away from its callers
+    with every check still green.
+    """
     args = parse_args()
     if args.fingerprint and not args.twocaptcha_key:
         logger.error("--fingerprint needs --twocaptcha-key (the Fingerprint API uses the "
                      "same key, though it's a separate subscription from solving).")
-        sys.exit(2)
+        return 2
     if args.fingerprint and args.cdp_endpoint:
         logger.warning("--fingerprint is ignored with --cdp-endpoint: the Scraping Browser "
                        "supplies its own fingerprint, and stacking a second one on top "
                        "creates a mismatch rather than better cover.")
     try:
-        sys.exit(scrape(args))
+        return scrape(args)
     except ProxyError as e:
         # Bad usage, not a crash: a typo in a proxy list would otherwise
         # surface as a connection failure on page 1 with nothing naming it.
         logger.error("%s", e)
-        sys.exit(2)
+        return 2
     except KeyboardInterrupt:
-        sys.exit(1)
+        return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

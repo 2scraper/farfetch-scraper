@@ -52,6 +52,34 @@ output when a run finds nothing.
 file of plain functions with inline HTML/JSON fixtures — no pytest, no
 conftest, no fixtures directory. Copy the nearest existing check and edit it.
 
+Inside it, one function per section (`check_price_source`,
+`check_the_webhook`, …) and a `main()` that calls them in order. Each takes
+the running verdict and returns it. Add a section by writing the function and
+adding one call — the suite checks that every section function is called
+exactly once, because a section nobody calls is a test suite quietly
+shrinking.
+
+Run it either way; both execute the same code:
+
+```bash
+python3 smoke_test.py          # per-check PASS/FAIL, in order
+pytest -q                      # the same checks, one pytest result each
+pytest -k "refusal"            # select by check label
+```
+
+`tests/test_smoke.py` runs the suite once and turns each `[PASS]`/`[FAIL]`
+line into its own pytest result, so a failure names the check. It is a
+wrapper, not a second suite — there is exactly one implementation of these
+checks, on purpose.
+
+**Linters run in CI and are narrowly configured.** `ruff check .` and `mypy`,
+both reading their settings from `pyproject.toml`, which argues there why the
+selections are what they are. Install them with
+`pip install -r requirements-dev.txt`. Ruff's broader defaults would tell this
+package to use Python 3.10+ annotation syntax, which would break the 3.9 it
+supports and tests — so if you widen the selection, check its advice against
+`requires-python` before taking it.
+
 Four properties in this repo exist because they were once absent and cost real
 time. Tests pin all four, so a PR that breaks one will fail rather than
 silently regress:
@@ -62,8 +90,12 @@ silently regress:
 - **A run that finds nothing writes nothing.** It must not replace a good output
   file with `[]`. `--allow-empty` is the opt-out.
 - **Exit codes are a contract**, not decoration: `0` ok, `1` crash, `2` bad
-  usage, `3` blocked by a challenge, `4` zero products, `5` remote API error,
-  `124` self-imposed timeout. A pipeline branches on these.
+  usage, `3` blocked (a challenge, or an outright refusal), `4` the page was
+  fetched and held zero products, `5` the page was never fetched at all
+  (timeout, dead proxy, 4xx/5xx, or a Scraper API error), `6` partial run,
+  `124` Selenium's chromedriver-startup watchdog. A pipeline branches on
+  these, and `3`/`4`/`5` want three different responses — change exit,
+  accept the answer, check your own side.
 - **A sku already written by an earlier page of the same run is dropped, not
   duplicated.** All three browser engines paginate by following
   `NEXT_PAGE_SELECTOR`; a stale or repeating link must not double a row in the

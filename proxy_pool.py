@@ -86,7 +86,7 @@ def parse_proxy_line(line: str, source: str = "<arg>") -> Optional[str]:
     # ("http://host:port:login:password") pasted where a proxy URL belongs.
     # The extra colons become part of the port.
     try:
-        parsed.port
+        parsed.port  # noqa: B018 — the ACCESS is the check; see above
     except ValueError:
         raise ProxyError(
             f"{source}: {shown!r} — the port is not a number. If you copied "

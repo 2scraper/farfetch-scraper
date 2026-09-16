@@ -32,6 +32,22 @@ python3 playwright_scraper.py \
   --pages 1 --format both --out girls_clothing
 ```
 
+Or install it as a command, or pull the image:
+
+```bash
+pip install '.[playwright]' && playwright install chromium
+farfetch-scraper --url "$URL" --pages 1        # same tool, on your PATH
+
+docker run --rm -v "$PWD/out:/out" ghcr.io/2scraper/farfetch-scraper \
+  --url "$URL" --pages 1 --out /out/girls_clothing
+```
+
+Install exactly **one** engine extra (`playwright`, `selenium` or
+`puppeteer`): the three pin mutually unsatisfiable versions of `pyee` and
+`urllib3`, so pip resolves a conflict by quietly downgrading one of them. The
+commands for the engines you did not install say so and name the extra, rather
+than failing with an import traceback.
+
 Output shape: [`sample_output.json`](sample_output.json) /
 [`sample_output.csv`](sample_output.csv) — three rows cut from a real run, so you
 can see the exact fields before installing anything.
@@ -48,6 +64,7 @@ category URL — see [Troubleshooting](TROUBLESHOOTING.md).
 - [Engines](#engines)
 - [Configuration](#configuration)
 - [Flags](#flags) · [Exit codes](#exit-codes) · [Concurrency](#concurrency) · [Run metadata](#run-metadata)
+- [Product detail mode](#product-detail-mode) · [Resuming a run](#resuming-a-run-that-stopped-early)
 - [Output](#output)
 - [Diffing two runs](#diffing-two-runs)
 - [Using 2Captcha](#using-2captcha)
@@ -72,8 +89,8 @@ category URL — see [Troubleshooting](TROUBLESHOOTING.md).
   visit is geo-redirected on exit IP; verify the market in the output rather
   than assuming it — see [Geo-redirect](#site-specific-behaviour).
 
-Listing-level fields only. This repo does not open product pages, so no sizes,
-materials, colour variants or descriptions — those live one level deeper.
+Listing-level by default. `--mode detail` opens each product page as well and
+emits **one row per size** — see [Product detail mode](#product-detail-mode).
 
 ---
 
@@ -122,8 +139,10 @@ what is being requested and how the data is derived, this is that.
 
 ## Engines
 
-Same CLI, same parsing core, same output. Pick by how you want to reach a
-browser.
+Same parsing core, same output schema, same exit codes. The CLI is shared but
+**not identical** — see the table below the engine list.
+
+Pick by how you want to reach a browser.
 
 | Script | Engine | Own browser | Remote browser over CDP |
 |---|---|---|---|
@@ -131,6 +150,22 @@ browser.
 | `puppeteer_scraper.py` | pyppeteer | ✅ | ✅ |
 | `selenium_scraper.py` | Selenium | ✅ | ❌ see below |
 | `scraper_api_client.py` | HTTP API, no local browser | — | ✅ via `--cdp-url` |
+
+**Eighteen flags are shared by all three.** These are not:
+
+| Flag | Where | Why |
+|---|---|---|
+| `--concurrency` | Playwright only | The sync API ties a browser to its creating thread, so the worker model is not portable as it stands |
+| `--mode detail`, `--max-products` | Playwright only | The detail crawl was written for the primary engine and not yet ported |
+| `--resume` | Playwright only | Same — the checkpoint itself is engine-agnostic, only the wiring is missing |
+| `--dump-html`, `--fingerprint`, `--fp-tags`, `--fp-country` | Playwright only | Not yet ported |
+| `--proxy-file`, `--proxy-rotate`, `--proxy-shuffle`, `--proxy-block-retries` | Playwright only | The pool and rotation live in the Playwright loop; the others take a single `--proxy` |
+| `--chromedriver`, `--chrome-binary`, `--disable-build-check`, `--driver-timeout` | Selenium only | It launches a separate chromedriver process; the other two do not |
+
+The list is asserted in the offline suite **in both directions**: a new
+unshared flag fails the build, and so does closing a difference this table
+documents. A table nobody executes is how a README comes to describe
+something that stopped being true.
 
 **Selenium cannot use an authenticated remote CDP endpoint.** Playwright's
 `connect_over_cdp` and Puppeteer's `browserWSEndpoint` take a full
@@ -220,6 +255,10 @@ The three browser engines share these:
 | `--captcha-api` | `v2` | `v2` (current JSON API) or `v1` (legacy `in.php`) |
 | `--min-score` | `0.7` | reCAPTCHA v3 score to request — `0.3`, `0.7` or `0.9` only |
 | `--allow-empty` | off | Write output even when 0 products were found |
+| `--mode listing\|detail` | `listing` | `detail` opens each product page and emits one row per **size** |
+| `--max-products N` | 0 (no limit) | In `--mode detail`, stop after N product pages |
+| `--resume` | off | Continue a run that stopped early, from the checkpoint every multi-page run writes |
+| `--webhook URL` | — | POST the run summary when the run finishes, including when it fails |
 | `--dump-html` | – | Save the exact HTML the parser was given, on success too |
 | `--headless` / `--headful` | headless | Local browser only |
 
@@ -242,16 +281,35 @@ A contract, not decoration — the harness and any pipeline can branch on these.
 | `0` | Products written |
 | `1` | Unhandled error |
 | `2` | Bad usage |
-| `3` | Blocked before parsing — a bot-check or challenge page |
-| `4` | Ran fine, parsed **0 products** |
-| `5` | Remote API returned an error |
+| `3` | **Blocked before parsing** — a challenge page, or an outright refusal |
+| `4` | Fetched the page fine, parsed **0 products** |
+| `5` | **Never got the page** — navigation timeout, dead proxy, 4xx/5xx, or a Scraper API error |
 | `6` | **Partial run** — products written, but the page loop stopped early |
-| `124` | Self-imposed timeout expired |
+| `124` | Selenium only: chromedriver could not be **started** within the watchdog |
+
+**Exit 4 means the page loaded.** This is the one code that says something
+about the catalogue, and it only fires when the run really got the page,
+really parsed it, and it really held nothing. A run that was refused exits 3;
+a run that never obtained the page exits 5. Those three used to be one value,
+so a dead proxy and an empty category were indistinguishable to an automated
+caller — which wants three different responses:
+
+| Code | What to do about it |
+|---|---|
+| `3` | Change exit address. Retrying the same one only confirms the block. |
+| `4` | Accept the answer, or check the URL — a bare hub URL legitimately returns 0. |
+| `5` | Check your own side first: the proxy, the network, the endpoint. Retry is usually reasonable. |
+
+Exit 3 covers both shapes a block takes, and the log says which. A **challenge**
+page ships a widget and may be solvable; a **refusal** (Akamai's 318-byte
+`Access Denied`, which is what farfetch.com returns to a datacentre address)
+has nothing to solve, so only a different exit changes it.
 
 **Exit 4 writes nothing.** A run that finds nothing leaves the previous output
 file intact rather than replacing it with `[]`, because a consumer cannot tell an
 empty category from a failed run. Pass `--allow-empty` when empty is the expected
-answer; it writes the file and still exits 4.
+answer; it writes the file and still exits 4. Exits 3 and 5 write nothing
+either, and for the same reason.
 
 **Exit 6 writes what it got.** A timeout or a challenge on page 3 of 10 still
 saves the first two pages — discarding good data would be worse — but the result
@@ -313,9 +371,130 @@ Every run that writes output also writes `<out>.meta.json` beside it:
   "products": 192,
   "start_url": "https://www.farfetch.com/shopping/kids/girls-clothing-4/items.aspx",
   "final_url": "https://www.farfetch.com/de/shopping/kids/girls-clothing-4/items.aspx?page=2",
-  "finished_at": "2026-09-07T12:45:31.199634+00:00"
+  "run_id": "3e4df617423b",
+  "started_at": "2026-09-07T12:45:27.700000+00:00",
+  "finished_at": "2026-09-07T12:45:31.199634+00:00",
+  "duration_s": 3.5,
+  "quality": {
+    "rows": 192,
+    "priced": 0.995,
+    "with_currency": 1.0,
+    "with_title": 1.0,
+    "with_brand": 1.0,
+    "with_image": 0.99,
+    "with_sku": 1.0,
+    "discounted": 0.43,
+    "dom_confirmed_price": 0.87
+  }
 }
 ```
+
+`quality` is coverage of the columns that are allowed to be null, as
+fractions. A run can return the right NUMBER of rows with a column silently
+empty — "96 products" says nothing about whether their prices rendered — so
+the shares are recorded rather than left for each consumer to recompute.
+`dom_confirmed_price` is the one that is provenance rather than coverage: how
+much of the price data was confirmed against a rendered tile instead of taken
+from JSON-LD alone. A drop there is how a snapshot taken too early announces
+itself.
+
+`run_id` is one id per run, logged on the first line and written here, so a
+log line and an artefact can be tied together — "the run that failed" stops
+being identifying once a scraper is on a schedule.
+
+### Product detail mode
+
+`--mode detail` fetches the listing as usual, then opens each product page and
+emits **one row per size**:
+
+```bash
+python3 playwright_scraper.py --url "$URL" --pages 1 --mode detail --out sizes
+```
+
+```
+sku          size       price  was   stock  color  composition
+36899289-19  4 Jahre    60.00  —     true   Weiß   Bio-Baumwolle 100%
+36899289-21  6 Jahre    60.00  —     true   Weiß   Bio-Baumwolle 100%
+33056780-19  4 Jahre    33.00  65.00 true   Blau   Baumwolle 100%
+```
+
+The key is the **variant** sku (`36899289-19`); `product_id` (`36899289`)
+groups a product's sizes. It is a different row shape from listing mode, so
+the run's `mode` is recorded in the sidecar and `diff_runs.py` refuses to
+compare the two — `--force` does not apply to that one, because every line of
+such a diff would be an artefact of the comparison.
+
+It costs **one request per product**, so a page of ~18 products is ~18 extra
+fetches. `--max-products N` caps that, and a capped run is reported as
+`partial` with `stop_reason: max_products_reached` rather than as a complete
+view of the catalogue.
+
+What a detail page gives that a listing page does not: per-size availability,
+the material composition, the colour, the full image set, and — the one that
+matters most for price monitoring — an **honest discount**. A listing
+publishes one price, and on a discounted item it is the middle of the chain,
+which is why listing mode reconciles it against the rendered tile. A detail
+page publishes the whole chain as structured data, so `price` and
+`original_price` are facts there and `price_source` says `jsonld-variant`.
+
+What it does **not** give, measured across seven captured product pages rather
+than assumed: no ratings (`aggregateRating` appears nowhere), no merchant or
+boutique, and no shipping details. Those are not columns, because a column
+that is null on every row of every run is worse than a missing one.
+
+**Across markets, join on `sku`.** The same four products were captured on a
+DE and a US exit. The variant sku is byte-identical on both (`36899289-19`);
+everything readable is not — `4 Jahre` becomes `4 yrs`, `3-6 M.` becomes
+`3-6 mth`, `Bio-Baumwolle 100%` becomes `Organic Cotton 100%`, and the colour
+`Nude` becomes `Neutrals`, which is a different taxonomy value rather than a
+translation. A bare numeric size scale (`5`, `10`, `12`) is identical, having
+nothing to translate.
+
+Prices are **set per market, not converted**: the same t-shirt is 60 EUR and
+90 USD, and one dress is 1020 EUR against 598 USD. Read a cross-market
+difference as pricing, not as arbitrage.
+
+**`in_stock` has never been observed False.** 100 variants, 19 products, two
+markets, including an entire sale section — every one in stock. The size
+picker was also opened in a live browser on one product and showed exactly the
+sizes the structured data carried. Either everything was genuinely in stock,
+or `hasVariant` lists only available sizes and omits sold-out ones; that is
+unresolved, so treat a `false` with more suspicion than a `true`.
+
+### Resuming a run that stopped early
+
+Every multi-page run writes `<out>.progress.json` after each page, and a run
+that completes deletes it. `--resume` continues from it:
+
+```bash
+python3 playwright_scraper.py --url "$URL" --pages 20      # dies on page 17
+python3 playwright_scraper.py --url "$URL" --pages 20 --resume
+```
+
+It is not behind a flag on the first run on purpose: nobody passes
+`--checkpoint` on the run that is about to be killed, and by the time they
+want it the pages are gone.
+
+Two things it will not do. It refuses a checkpoint written for a **different**
+URL, page count or category, naming the difference — resuming the wrong one
+would merge two categories into one file, which looks like a successful scrape
+of something that was never scraped. And it only skips pages when the
+listing's pagination is **addressable** (`?page=N`): where the site chains
+next-links, page 17 cannot be reached without fetching 16, so it says so and
+re-fetches. Changing `--retries`, `--proxy` or `--concurrency` between the two
+runs is fine — none of them changes what a page contains.
+
+### Telling something else the run finished
+
+`--webhook URL` POSTs the block above, plus `exit_code`, when the run ends.
+
+It fires on **failure too**, which is the main use: a run that gathers nothing
+deliberately writes no sidecar, so anything keyed on the sidecar is silent for
+exactly the runs worth an alert. It never fails the run — an unreachable
+endpoint is a warning and the exit code is untouched — and the URL is never
+logged, because most webhook URLs carry their token in the path. Prefer
+`FARFETCH_WEBHOOK` in `.env` over the flag: argv is readable by anything that
+can run `ps`.
 
 `status` is the field to branch on: `complete` (everything requested was
 fetched, or the site's pagination ran out), `partial` (stopped early), `failed`
@@ -473,6 +652,13 @@ Four products, each optional and independently useful.
 Runs after **every** navigation, on any page — not scoped to one URL. Both
 detectors always run: one over the static HTML, one in the live page over
 `___grecaptcha_cfg`, and the results are reconciled.
+
+Both API versions were exercised against a live reCAPTCHA on 2026-09-15 —
+2Captcha's own demo page, sitekey read off it rather than pinned. `v2`
+(`createTask`/`getTaskResult`) returned a 2,510-character token in 44s; `v1`
+(`in.php`/`res.php`) returned a 2,574-character token in 6s. Both work; the
+times are one sample each and solve time varies with queue depth, so read
+them as "both paths are alive", not as a benchmark.
 
 **Detected is not the same as blocking, and that distinction costs money.**
 This site carries a reCAPTCHA in its sign-up modal that has nothing to do with

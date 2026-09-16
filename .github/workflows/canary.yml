@@ -7,15 +7,36 @@ name: canary
 # a real run, on a real category URL, on a schedule — so a site-side break is
 # caught here first.
 #
-# Uses no 2Captcha product and no secret by default: the README's own claim is
-# that an ordinary browser on a clean IP clears Akamai without one, and this
-# workflow is exactly the place that claim gets exercised continuously. GitHub
-# Actions runners are datacenter IPs, though, not the "clean residential IP"
-# the README measured against — so a red run here can mean either the site
-# changed (a real break) or this run's IP got a challenge Akamai didn't give a
-# residential one (see the exit-code breakdown in the run summary below). If
-# this proves too noisy in practice, set the FARFETCH_PROXY repo secret and
-# uncomment the --proxy line to run it from a residential exit instead.
+# TWO SIGNALS, and they are not redundant. The 2026-09-11 audit found this
+# workflow reporting failures it could not interpret: farfetch.com refuses a
+# GitHub runner's datacentre address, so the free run went red on days the
+# site and this code were both fine, while the exit-code table it printed
+# listed a code (124) no engine returns and had no entry for the codes they
+# do. A check that is red every morning is a check everyone learns to ignore.
+#
+#   reachability-no-proxy  — free, no secret, every day. Answers "can an
+#                            ordinary browser on a datacentre IP still get
+#                            this page, and does the parser still work on it?"
+#                            A BLOCK here is reported as a skip, not a
+#                            failure: it says something about the runner's
+#                            address, not about Farfetch. Anything else —
+#                            0 products, a fetch failure, a partial run —
+#                            still fails, because those are real news.
+#
+#   production-like        — the authoritative signal. Runs only when the
+#                            FARFETCH_PROXY secret is set, and is strict about
+#                            everything including a block, because from a
+#                            residential exit a block IS news. Skips with a
+#                            notice when the secret is absent (CLAUDE.md §11:
+#                            a canary that cannot pass must SKIP, not fail).
+#
+# The proxy secret is passed through the ENVIRONMENT, never as a --proxy
+# argument. env_config.py already reads FARFETCH_PROXY, an unset secret
+# arrives as an empty string which the loader treats as unset, so the same
+# step is correct with and without it — and the credential never reaches a
+# command line, where anything that can run `ps` could read it. This file
+# used to carry a commented-out `--proxy "${{ secrets.FARFETCH_PROXY }}"`
+# line, which would have put it in argv the moment anyone uncommented it.
 on:
   schedule:
     # Once a day, off the hour, so it isn't competing with everyone else's
@@ -24,7 +45,8 @@ on:
   workflow_dispatch:
 
 jobs:
-  live-run:
+  reachability-no-proxy:
+    name: reachability (no proxy, datacentre IP)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -53,10 +75,6 @@ jobs:
         # of silent decay this workflow exists to catch. Three pages is
         # enough to cross the page boundary twice while keeping the daily
         # request count trivial.
-        # continue-on-error: this step's exit code is read explicitly below
-        # so the interpretation (parser break vs. probable IP block) can be
-        # printed before the job is failed, rather than just going red with
-        # no context in the log.
         #
         # set +e: GitHub Actions runs `run:` steps as `bash -e ...` by
         # default, so without this the scraper exiting non-zero would abort
@@ -71,72 +89,21 @@ jobs:
           python3 playwright_scraper.py \
             --url "https://www.farfetch.com/shopping/kids/girls-clothing-4/items.aspx" \
             --pages 3 --out canary_run --dump-html canary_run.html
-            # --proxy "${{ secrets.FARFETCH_PROXY }}"   # uncomment once the secret is set
           echo "exit_code=$?" >> "$GITHUB_OUTPUT"
 
       - name: Interpret the exit code
-        run: |
-          code="${{ steps.run.outputs.exit_code }}"
-          case "$code" in
-            0)   echo "OK — products parsed from a live run." ;;
-            3)   echo "::error::Blocked before parsing (exit 3), a bot-check/challenge page. Possibly this runner's IP rather than a site change — see FARFETCH_PROXY in this workflow's header comment." ;;
-            4)   echo "::error::Ran fine but parsed 0 products (exit 4) on a URL known to have some — this is the shape a real site-side break takes." ;;
-            124) echo "::error::Self-imposed timeout (exit 124) — the page never became ready." ;;
-            *)   echo "::error::Unexpected exit code $code (see the step above for the traceback)." ;;
-          esac
-          test "$code" = "0"
+        # No `set +e` and no continue-on-error: this step SHOULD fail the job
+        # when the code is one worth failing on. canary_check.py decides
+        # which those are, and --allow-block tells it that a refusal from
+        # this address is information about the address, not about the site.
+        # The proxy-backed job below omits the flag, so a block fails there.
+        run: python3 .github/canary_check.py --exit-code "${{ steps.run.outputs.exit_code }}" --allow-block
 
       - name: Sanity-check the scraped data
-        # Exit 0 only means "some products were written" — it says nothing
-        # about whether the run actually rendered, e.g. a snapshot taken
-        # before prices load would still write rows, just with every price
-        # null. Runs only when the step above passed (code 0), since there is
-        # nothing to check on a blocked/empty run.
-        run: |
-          python3 - <<'EOF'
-          import json, sys
-          from pathlib import Path
-
-          PAGES_REQUESTED = 3
-          # A single page of this category has returned ~96 products on every
-          # measured run, so three pages should comfortably clear this. The
-          # floor guards against a near-empty render, and is deliberately far
-          # below the real figure rather than tracking it.
-          MIN_PRODUCTS = 120
-          rows = json.loads(Path("canary_run.json").read_text())
-          meta = json.loads(Path("canary_run.meta.json").read_text())
-
-          fail = []
-          if len(rows) < MIN_PRODUCTS:
-              fail.append(f"only {len(rows)} products, expected at least {MIN_PRODUCTS} "
-                          f"across {PAGES_REQUESTED} pages")
-
-          priced = sum(1 for r in rows if r.get("price") is not None)
-          if rows and priced / len(rows) < 0.9:
-              fail.append(f"only {priced}/{len(rows)} rows have a non-null price — "
-                          f"looks like a snapshot taken before prices rendered")
-
-          # The point of running more than one page: catch pagination dying.
-          # `no_new_products` after a single page means the next-page link AND
-          # the ?page= fallback both failed to reach new content.
-          if meta.get("pages_completed", 0) < PAGES_REQUESTED:
-              fail.append(f"pagination stopped after {meta.get('pages_completed')} of "
-                          f"{PAGES_REQUESTED} pages (stop_reason="
-                          f"{meta.get('stop_reason')!r}) — the next-page selector or "
-                          f"the ?page= fallback has probably broken")
-          if meta.get("status") != "complete":
-              fail.append(f"run status is {meta.get('status')!r}, not 'complete'")
-
-          dom_confirmed = sum(1 for r in rows if r.get("price_source") == "jsonld+dom")
-          if rows and dom_confirmed / len(rows) < 0.5:
-              fail.append(f"only {dom_confirmed}/{len(rows)} rows had their price "
-                          f"confirmed against a rendered tile — discounted rows may "
-                          f"carry pre-promo prices")
-
-          for line in fail:
-              print(f"::error::{line}")
-          sys.exit(1 if fail else 0)
-          EOF
+        # Only when the run actually produced output. Exit 0 says "some
+        # products were written" and nothing about whether they are right.
+        if: steps.run.outputs.exit_code == '0'
+        run: python3 .github/canary_check.py --data canary_run
 
       - name: Upload run artifacts (output, HTML snapshot, debug dumps)
         # Always, not just on failure: a run that returns the WRONG number of
@@ -145,7 +112,75 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: canary-run-${{ github.run_id }}
+          name: canary-no-proxy-${{ github.run_id }}
+          path: |
+            canary_run.json
+            canary_run.csv
+            canary_run.meta.json
+            canary_run.html*
+            canary_run_page*_debug.*
+          if-no-files-found: ignore
+          retention-days: 14
+
+  production-like:
+    name: production-like (residential proxy)
+    runs-on: ubuntu-latest
+    # `secrets` is not available in a job-level `if`, so presence is tested
+    # through the job env and read in each step's `if` — the same shape the
+    # Claude workflows in this repo use for their token.
+    env:
+      HAVE_PROXY: ${{ secrets.FARFETCH_PROXY != '' }}
+    steps:
+      - name: Explain the skip
+        if: env.HAVE_PROXY != 'true'
+        run: echo "::notice::Skipped - no FARFETCH_PROXY secret is set, so there is no residential exit to run from. farfetch.com refuses GitHub's datacentre addresses, so running this job without one would be red every morning while saying nothing about the site. The reachability job above still runs for free. Set the secret to turn this signal on; it is read from the environment by env_config.py and never reaches a command line."
+
+      - uses: actions/checkout@v4
+        if: env.HAVE_PROXY == 'true'
+
+      - uses: actions/setup-python@v5
+        if: env.HAVE_PROXY == 'true'
+        with:
+          python-version: "3.12"
+
+      - name: Install Playwright engine
+        if: env.HAVE_PROXY == 'true'
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt -r requirements-playwright.txt
+          playwright install --with-deps chromium
+
+      - name: Scrape a real, known-good category page through the proxy
+        id: run
+        if: env.HAVE_PROXY == 'true'
+        continue-on-error: true
+        env:
+          # Read by env_config.py, exactly as a local .env would be. NOT
+          # passed as --proxy: a credential in argv is readable by anything
+          # that can run `ps` and is the rule this repo states in §3 of its
+          # own docs.
+          FARFETCH_PROXY: ${{ secrets.FARFETCH_PROXY }}
+        run: |
+          set +e
+          python3 playwright_scraper.py \
+            --url "https://www.farfetch.com/shopping/kids/girls-clothing-4/items.aspx" \
+            --pages 3 --out canary_run --dump-html canary_run.html
+          echo "exit_code=$?" >> "$GITHUB_OUTPUT"
+
+      - name: Interpret the exit code
+        if: env.HAVE_PROXY == 'true'
+        # No --allow-block here: from a residential exit, a block is news.
+        run: python3 .github/canary_check.py --exit-code "${{ steps.run.outputs.exit_code }}"
+
+      - name: Sanity-check the scraped data
+        if: env.HAVE_PROXY == 'true' && steps.run.outputs.exit_code == '0'
+        run: python3 .github/canary_check.py --data canary_run
+
+      - name: Upload run artifacts (output, HTML snapshot, debug dumps)
+        if: always() && env.HAVE_PROXY == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: canary-production-like-${{ github.run_id }}
           path: |
             canary_run.json
             canary_run.csv

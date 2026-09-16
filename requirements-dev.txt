@@ -1,0 +1,28 @@
+# Development-only tools. Not needed to RUN the scraper — see requirements.txt
+# for that, plus exactly one requirements-{engine}.txt.
+#
+#   pip install -r requirements-dev.txt
+#
+# Pinned to majors rather than left floating, for the reason the canary exists:
+# a new linter release adding rules would turn CI red overnight on findings
+# nobody introduced, and a check that goes red on its own is one people learn
+# to ignore. Dependabot proposes the bumps weekly (.github/dependabot.yml), so
+# each one arrives as a PR whose CI run answers "does this add findings?".
+#
+# Kept in step with the `dev` extra in pyproject.toml by hand — same convention,
+# and same caveat, as requirements.txt and the [project] dependencies there.
+
+pytest>=7.0
+
+# Narrowly configured in pyproject.toml: Ruff to F/E9/B, mypy to the shared
+# core. Both configurations argue their own boundaries there; neither is a
+# default worth copying, because Ruff's defaults here would demand Python
+# 3.10+ syntax from a package that supports and tests 3.9.
+ruff~=0.14
+mypy~=1.18
+
+# Type stubs for the one third-party library the mypy-gated modules
+# import (notify.py posts the run summary with requests). Without
+# them mypy reports the import itself as an error rather than
+# checking the calls through it.
+types-requests~=2.32

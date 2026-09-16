@@ -6,6 +6,307 @@ All notable changes to this project are documented here. Format follows
 library with a stable API) reasonably can — a patch bump means "fixes", not
 a promise that every flag and exit code is contractually frozen.
 
+## [0.5.0] — 2026-09-15
+
+> **Read this before upgrading.** Two things change for an existing caller.
+>
+> **A run that gathered nothing and never got the page now exits 5**, where
+> it used to exit 4. If your automation branches on 4 meaning "anything went
+> wrong", it needs the new row — 4 now means only "the page was fetched and
+> held nothing", which is the one case that says something about the
+> catalogue. See the exit-code table in the README.
+>
+> **A blocked run now exits 3 where many of them used to exit 4.** Akamai's
+> refusal page was not recognised as a block, so every run refused by the
+> edge reported an empty category. Nothing about your setup changed; the
+> reports were wrong before.
+>
+> Everything else is additive: `--mode detail`, `--resume`, `--webhook`,
+> console scripts, and a container image on GHCR.
+
+This release is the work from a third-party audit taken on v0.4.2, plus what
+running the code against the live site turned up while working through it.
+The audit's own P0 was five items; all five are done, and two of its
+suggested fixes turned out not to work as written (see the first entry
+below). Of P1, four of six are done and two are declined with reasons in the
+PR. Of P2, three of four.
+
+### Fixed
+
+- **Akamai's "Access Denied" page was not recognised as a block.** Every
+  request to farfetch.com from a datacentre address returns 318–426 bytes
+  under HTTP 403 — a title, a refusal sentence, and an `errors.edgesuite.net`
+  reference. It carries none of the challenge markers this parser knew, which
+  describe Akamai's *challenge* page, so `detect_bot_challenge()` returned
+  `None` and a plainly blocked run exited **4**, telling the caller the
+  category was empty. Reproduced live on 2026-09-14 (exit 4) and re-run after
+  the fix (exit 3).
+
+  Two details are pinned by fixtures because both are easy to get wrong:
+
+  - The same page reaches the parser in **two spellings**. Akamai
+    entity-escapes the punctuation on the wire
+    (`errors&#46;edgesuite&#46;net`), while a browser parses it and
+    `page.content()` serialises it back out plain. A literal
+    `errors.edgesuite.net` marker therefore matches the three browser engines
+    and silently misses `scraper_api_client` — measured 0 occurrences in the
+    raw form. Entities are normalised before matching.
+  - Only `errors.edgesuite.net` is matched, never a bare `edgesuite`:
+    edgesuite.net is also an ordinary Akamai *asset* domain, and a marker
+    that fires on a good page is worse than no marker. Counted at zero on all
+    seven real-capture fixtures in the suite.
+
+- **A run that never got the page reported "0 products".** A navigation
+  timeout, a dead or unauthenticated proxy and a genuinely empty category
+  were one value to an automated caller, which wants three different
+  responses. They are now `5`, `5` and `4` respectively, and a dead exit is
+  recorded as `proxy_unusable` rather than as a timeout.
+
+  `5` rather than a new code: the contract already reserved it for a failed
+  transport, and the browser engines simply had no way to say so.
+  `scraper_api_client`'s `EXIT_API_ERROR` is now an alias of the shared
+  constant, so there is one definition of 5 instead of two that can drift.
+
+- **A broken parser reported itself as an empty category.** A page that was
+  served, that links to eighteen products, and that parses to zero rows is
+  this repo's bug — but it exited 4 with the same message as a genuinely thin
+  category, which sends the reader to check the URL instead of the JSON-LD.
+
+  `stop_reason` is now `parse_drift` in that case, the log says so in as many
+  words, and the canary fails on it by name. The exit code deliberately stays
+  4: the catalogue question really was answered, and inventing a seventh code
+  would diverge from the family contract. What changes is that the run says
+  WHOSE fault it is.
+
+  Not a hypothetical — the CSS fallback drops a product link whose tile
+  yields no price text, so a tile-scoping failure turns a full page into no
+  rows. That is the "junk-link data theft" shape this family has hit before,
+  seen from the other side. Both directions are pinned: a full-but-unparseable
+  page sets the flag, an empty one does not, and a page that parses fine does
+  not either.
+
+- **The canary interpreted exit codes it no longer matched.** Its table had
+  no entry for 5 or 6, so a fetch failure was announced as an unknown code,
+  and it explained 124 as "the page never became ready" — which is wrong
+  twice: 124 is Selenium's watchdog for *chromedriver failing to start*, and
+  the canary runs Playwright. Nothing executed that table, so it drifted
+  silently. It now lives in `.github/canary_check.py`, which imports the
+  constants and is asserted against them by the offline suite.
+
+- **The canary's proxy secret was a commented-out `--proxy` line**, so
+  enabling it meant setting a secret *and* remembering to edit the workflow —
+  and would have put a credential in `argv`. It goes through the environment
+  `env_config.py` already reads.
+
+### Changed
+
+- **The canary is two signals instead of one.** `reachability-no-proxy` runs
+  free every day and reports a *block* as a skip with a notice rather than a
+  failure: from a GitHub runner — a datacentre address — a refusal says
+  something about the address, not about Farfetch, and a check that is red
+  every morning is one everybody learns to ignore. Everything else still
+  fails it. `production-like` is the authoritative signal, runs only when
+  `FARFETCH_PROXY` is set, skips with a notice when it is not, and is strict
+  about a block too, because from a residential exit a block *is* news.
+
+- **An error status skips the readiness wait.** Playwright was discarding the
+  `Response` that `goto()` returns, and with it the most reliable signal a
+  refusing edge gives. It now records the status; a 4xx/5xx is not a page
+  waiting to paint, so the 20-second wait for product markers — previously
+  spent on every attempt of every page of a blocked run — is skipped. A 4xx
+  whose body names no known vendor is reported as a fetch failure rather than
+  as a block: we know it is not the listing, but not who refused us.
+
+- Selenium's `124` is now the named `EXIT_DRIVER_TIMEOUT` rather than a magic
+  number, which is how the canary came to describe it as something else.
+
+- All three engines describe a block through one shared `describe_block()`,
+  so a refusal is no longer logged as a "challenge page" — wording that sends
+  the reader looking for a widget that is not there.
+
+- **Every numeric CLI flag is range-checked**, and one of them was doing real
+  damage. `--retries 0` was accepted by all three browser engines, and the
+  attempt loop is `range(1, retries + 1)` — so zero attempts means
+  `page.goto()` is never called. The run parsed `about:blank` (39 bytes,
+  against 559 for the same URL with `--retries 1`) and exited 4: "the page
+  was fetched and held nothing". A wrong answer about the catalogue, reached
+  by typing a number.
+
+  Validators live in `arg_types.py` as argparse `type=` callables, so argparse
+  produces the usage message and exit 2 itself, before a browser launches.
+  Zero stays allowed where it names a real behaviour (`--delay 0`,
+  `--retry-delay 0`, `--proxy-block-retries 0`) and is refused where it names
+  none. `--min-score` becomes `choices=[0.3, 0.7, 0.9]` — the API accepts
+  exactly those three — and the Scraper API's `--timeout` is bounded to the
+  1-120 the API documents.
+
+- **A missing chromedriver exited 1 (crash) rather than 2 (setup).** It is
+  something the operator fixes in one command, and `cli_entry.py` answers the
+  equivalent question — an engine's driver library absent — with 2. The two
+  should not disagree about the same kind of problem.
+
+- **Three engines declared `def scrape(args) -> None`** while returning an
+  exit code that `main()` passes straight to `sys.exit`. Harmless at runtime,
+  and an annotation a reader would have trusted. Found by mypy, which is now
+  part of CI.
+
+### Added
+
+- **`--mode detail`: one row per SIZE.** The listing tells you a product
+  exists; the product page tells you which sizes are in stock and what each
+  costs. `--mode detail` fetches the listing as before, then opens each
+  product and emits a `ProductVariant` row per size — keyed on the variant
+  sku (`36899289-19`), with `product_id` grouping a product's sizes.
+
+  The detail page publishes the **whole discount chain** as structured data,
+  unlike the listing, which publishes the middle of it. So `price` and
+  `original_price` are facts there, `discount_pct` is arithmetic, and no DOM
+  price overlay is ported — it could not work anyway, because a detail page's
+  DOM holds zero rendered price strings.
+
+  `--max-products N` caps the crawl; a capped or partly-failed crawl is
+  reported as `partial` with `max_products_reached` / `detail_pages_failed`
+  rather than as a complete view.
+
+  The sidecar now records `mode`, and `diff_runs.py` refuses to compare a
+  listing run with a detail run — the one refusal `--force` does not override,
+  because the two have different row shapes and different keys, so every line
+  of that diff would be an artefact of the comparison.
+
+  Measured on seven captured product pages rather than assumed: there are no
+  ratings on a detail page (`aggregateRating` appears nowhere), no merchant or
+  boutique, and no shipping details, so none of those became columns.
+
+  Verified on a **second market**, which is what turns a guess about locales
+  into a measurement. The same four products were captured on a DE and a US
+  exit: the variant sku is byte-identical on both, while size, title, colour,
+  composition and category are all localised — so a cross-market comparison
+  joins on `sku` and `size` is display text. Prices are set per market rather
+  than converted (60 EUR / 90 USD; 1020 EUR / 598 USD), which is worth knowing
+  before anyone reads a cross-market difference as an arbitrage. Both markets
+  are pinned by real fixtures.
+
+- **`--resume`, and a checkpoint every multi-page run writes.** A run that
+  died on page 17 of 20 used to start again at page 1.
+  `<out>.progress.json` is written after every page and deleted by a run that
+  completes; `--resume` continues from it.
+
+  Not behind a flag on the first run, on purpose: nobody passes
+  `--checkpoint` on the run that is about to be killed, and by then the pages
+  are gone.
+
+  Two refusals, both deliberate. A checkpoint written for a **different** URL,
+  page count or category is refused with the difference named — resuming the
+  wrong one merges two categories into one file, which looks like a successful
+  scrape of something that was never scraped. And pages are only SKIPPED when
+  pagination is addressable (`?page=N`): where the site chains next-links,
+  page 17 is unreachable without fetching 16, so it says so rather than
+  silently producing a run missing its middle. Changing `--retries`,
+  `--proxy` or `--concurrency` between the two runs does not invalidate it —
+  none of them changes what a page contains.
+
+  Verified end-to-end against a local stand-in listing: run 1 hits a 503 on
+  page 3 and keeps pages 1-2; run 2 with `--resume` requests only pages 1, 3
+  and 4 — page 2 never appears in the server's access log.
+
+- **Run id, timings and quality metrics in the sidecar.** `run_id` (logged on
+  the first line too, so a log line and an artefact can be tied together),
+  `started_at`, `duration_s`, and a `quality` block giving the coverage of
+  every nullable column as a fraction. That last was previously computed only
+  inside `.github/canary_check.py`, so every other consumer had to recompute
+  it — or, in practice, not notice that a run returned the right NUMBER of
+  rows with a column silently empty.
+
+- **`--webhook URL`** POSTs the run summary plus the exit code when the run
+  finishes. It fires on **failure too**, which is the main use: a run that
+  gathers nothing deliberately writes no sidecar, so anything keyed on the
+  sidecar is silent for exactly the runs worth an alert. It never fails the
+  run, is bounded at 10s with no retries, and never logs the URL — most
+  webhook URLs carry their token in the path, and `requests` puts the full URL
+  into the text of every connection error. `FARFETCH_WEBHOOK` in `.env` is
+  preferred over the flag, because argv is readable by anything that can run
+  `ps`.
+
+- **Console scripts.** `pip install .[playwright]` now produces
+  `farfetch-scraper`, `farfetch-scraper-playwright`, `-selenium`,
+  `-puppeteer`, `-api`, `-diff`, `-fingerprint` and `-env`.
+  `python3 playwright_scraper.py ...` keeps working unchanged.
+
+  Installing one engine still puts all three engine commands on PATH, so the
+  other two now exit 2 with the pip line to run, via `cli_entry.py`. They used
+  to print a `ModuleNotFoundError` traceback for a command the install itself
+  had just created. The engines still import their drivers at module level —
+  that is how the offline suite detects an absent engine, and moving those
+  imports is how a sibling repo let CI run against a stub version.
+
+- **Ruff and mypy in CI**, both narrowly configured, with the boundaries
+  argued in `pyproject.toml`. Ruff is `F`/`E9`/`B`; its broader defaults
+  produce 205-311 findings here and the largest groups demand Python 3.10+
+  annotation syntax from a package that supports and tests 3.9 — advice that
+  would break a supported version. mypy gates the six shared-core modules,
+  which were already clean; the engines' 26/7/6 findings are pinned as a
+  measured known limitation rather than half-guarded.
+
+- **Dependabot**, weekly, for pip and github-actions. Linter pins moved into
+  `requirements-dev.txt` so they are visible to it — a pin written inline in a
+  workflow `run:` step is invisible to Dependabot and rots quietly.
+
+### Changed
+
+- **`engine-smoke` is a matrix of one venv per engine**, each installed from
+  its own requirements files, with `pip check` as a real gate and an assertion
+  that the installed version satisfies the pin. It used to be
+  `pip install playwright pyppeteer selenium` into a single environment, with
+  a comment saying `pip check` would complain and that this was "expected and
+  harmless". It is not: the three pin mutually unsatisfiable versions of
+  `pyee` and `urllib3`, so pip resolves the conflict by reaching for whatever
+  it can — on a sibling repo that meant pyppeteer 0.0.25, a stub, against a
+  requirements file asking for >=1.0.2, with CI green throughout.
+
+  Each leg also installs the package and checks the console scripts, including
+  that the two engines it did NOT install explain themselves.
+
+- **`pytest` reports 291 results instead of 1.** `tests/test_smoke.py` runs
+  the suite once and turns each `[PASS]`/`[FAIL]` line into its own pytest
+  result, so `-k` selects a check and a failure names it. Splitting
+  `smoke_test.py` itself into thematic pytest modules was deliberately not
+  done: the single-file design is an explicit invariant, and a second copy of
+  the checks is what this wrapper exists to avoid.
+
+- `smoke_test.py` prints a machine-readable `SKIPPED_ENGINES:` line, which is
+  what lets each matrix leg assert that ITS engine ran rather than grepping
+  prose.
+
+- **`smoke_test.py`'s `main()` was one 2,650-line function.** It is now a
+  preamble plus 27 section functions, one per the banner comments already in
+  the file. `python3 smoke_test.py` and `pytest` behave identically; the file
+  count, the runner and the no-pytest-required property are unchanged.
+
+  Splitting into separate pytest modules — the other half of what the audit
+  proposed — is still not done, and the reason is now measured rather than
+  asserted. The attempt showed the sections are not independent: 133 names
+  leaked across the boundaries. Most were things that belonged at module
+  scope anyway, but a real remainder was one fixture built once and asserted
+  across three sections, so those were merged back rather than forced apart.
+  A module split would need either a second copy of the checks or the loss of
+  `python3 smoke_test.py` — which runs with no pytest installed, and pytest
+  is not in `requirements.txt`.
+
+  The split is verified behaviour-preserving by diffing every check LABEL
+  before and after: 315 before, 315 after, none lost, none added. That
+  mattered — the first attempt left a `return ok` in the middle of a merged
+  body, which made 7 checks dead code and passed as 308 of 315. Four new
+  checks guard the shape: a floor on section count, a ceiling on `main()`,
+  every section called exactly once, and no section returning before its end.
+
+### Testing
+
+- Offline suite: **319 checks**, up from 232; `pytest` reports 321 results. New coverage includes the
+  Dockerfile's COPY list against the entrypoint's import graph — a check
+  CLAUDE.md §10 calls for after every repo in this family shipped an image
+  that died on every invocation, and which did not exist here. It failed on
+  its first run, catching a module added in this same batch.
+
 ## [0.4.3] — 2026-09-11
 
 ### Fixed

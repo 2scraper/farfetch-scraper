@@ -59,12 +59,14 @@ from selenium.webdriver.support.ui import WebDriverWait
 
 from captcha_solver import (detect_recaptcha_v3, detect_recaptcha_in_page,
                             reconcile_detections, solve_recaptcha,
-                            INJECT_TOKEN_JS, RECAPTCHA_DISCOVERY_JS)
+                            INJECT_TOKEN_JS)
 from product_parser import (parse_products, SELECTORS, detect_bot_challenge,
-                            page_url)
-from output_writer import dedupe_by_sku, finish_run
+                            describe_block, page_url)
+from output_writer import (dedupe_by_sku, finish_run,
+                           EXIT_DRIVER_TIMEOUT, new_run_id)
 from proxy_pool import mask as mask_proxy
 import env_config
+from arg_types import positive_int, nonneg_float
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger("selenium_scraper")
@@ -598,14 +600,25 @@ def build_driver(args) -> webdriver.Chrome:
         try:
             from webdriver_manager.chrome import ChromeDriverManager
         except ImportError:
-            raise SystemExit(
+            # `from None`: the message below IS the diagnosis, and chaining the
+            # raw ImportError under it buries it in a traceback about a package
+            # the user has never heard of.
+            #
+            # Exit 2, not 1. `SystemExit("...")` prints the string and exits 1,
+            # which the contract reserves for a CRASH — and a missing
+            # chromedriver is a setup problem the operator can fix, not this
+            # code falling over. cli_entry.py answers the equivalent question
+            # (an engine's driver library absent) with 2 as well; the two
+            # should not disagree about the same kind of problem.
+            print(
                 "Launching a local Chrome needs a chromedriver. Either pass one you\n"
                 "already have:\n"
                 "    --chromedriver /path/to/chromedriver\n"
                 "or install webdriver-manager so it can fetch a matching one:\n"
                 "    pip install webdriver-manager\n"
                 "(Neither is needed with --cdp-endpoint — that attaches to a browser\n"
-                "that's already running.)")
+                "that's already running.)", file=sys.stderr)
+            raise SystemExit(2) from None
         service = Service(ChromeDriverManager().install())
     driver = webdriver.Chrome(service=service, options=options)
 
@@ -675,7 +688,13 @@ def handle_captcha_if_present(driver, args) -> None:
     driver.refresh()
 
 
-def scrape(args) -> None:
+def scrape(args) -> int:
+    # One id per run, logged here and written into the sidecar, so a
+    # log line and an artefact can be tied together. "the run that
+    # failed" is not identifying for a scraper on a schedule.
+    run_id = new_run_id()
+    started_at = time.time()
+    logger.info("Run %s starting: %s", run_id, args.url)
     all_products = []
     seen_skus = set()
     blocked = False
@@ -689,7 +708,7 @@ def scrape(args) -> None:
         driver = build_driver_with_timeout(args)
     except DriverTimeout as e:
         logger.error("%s", e)
-        _leave_now(124)
+        _leave_now(EXIT_DRIVER_TIMEOUT)
     except Exception as e:  # noqa: BLE001
         # The alarm may have been laundered into someone else's exception type
         # on the way out (see _timed_out). If it was, report it as the timeout
@@ -698,7 +717,7 @@ def scrape(args) -> None:
             logger.error("%s", _timeout_message())
             logger.error("(surfaced as %s — Selenium re-raised the timeout as its own error)",
                          type(e).__name__)
-            _leave_now(124)
+            _leave_now(EXIT_DRIVER_TIMEOUT)
         raise
     wait = WebDriverWait(driver, 20)
 
@@ -749,9 +768,9 @@ def scrape(args) -> None:
                     driver.save_screenshot(f"{args.out}_page{page_num}_debug.png")
                 except Exception as e:
                     logger.warning("Could not capture screenshot: %s", e)
-                logger.error("Blocked by a %s challenge page before parsing (%d bytes) — "
+                logger.error("Blocked by %s before parsing (%d bytes) — "
                              "saved to %s. This is exit 3, distinct from a genuinely "
-                             "empty category (exit 4).", vendor, len(html), debug_html)
+                             "empty category (exit 4).", describe_block(html, vendor), len(html), debug_html)
                 blocked = True
                 stop_reason = f"blocked_{vendor}"
                 break
@@ -810,6 +829,8 @@ def scrape(args) -> None:
 
     return finish_run(all_products, args.out, args.format, args.allow_empty,
                       blocked=blocked, stop_reason=stop_reason,
+                      run_id=run_id, started_at=started_at,
+                      webhook=args.webhook,
                       pages_requested=args.pages, pages_completed=pages_completed,
                       start_url=args.url, final_url=final_url)
 
@@ -820,11 +841,11 @@ def parse_args():
                    help="Farfetch category/hub/search listing URL. Required, unless "
                         "FARFETCH_URL is set in the environment or in .env.")
     p.add_argument("--category", default=None, help="Label to tag output rows with. Defaults to the category segment of the URL, so the column is never empty just because the flag was omitted.")
-    p.add_argument("--pages", type=int, default=1, help="Number of listing pages to crawl")
-    p.add_argument("--delay", type=float, default=2.0, help="Delay between pages, seconds")
-    p.add_argument("--retries", type=int, default=3,
+    p.add_argument("--pages", type=positive_int, default=1, help="Number of listing pages to crawl")
+    p.add_argument("--delay", type=nonneg_float, default=2.0, help="Delay between pages, seconds")
+    p.add_argument("--retries", type=positive_int, default=3,
                    help="Attempts per page load before giving up (default 3)")
-    p.add_argument("--retry-delay", type=float, default=2.0,
+    p.add_argument("--retry-delay", type=nonneg_float, default=2.0,
                    help="Seconds before the first page-load retry, doubling "
                         "thereafter (default 2.0)")
     p.add_argument("--format", choices=["json", "csv", "both"], default="both")
@@ -848,7 +869,7 @@ def parse_args():
                         "remote browser's reported version, or when you suspect that "
                         "version is spoofed — which a managed antidetect browser may "
                         "well do.")
-    p.add_argument("--driver-timeout", type=int, default=None,
+    p.add_argument("--driver-timeout", type=positive_int, default=None,
                    help=f"Seconds to allow for creating the Selenium session before giving up. "
                         f"Default depends on the path: {DEFAULT_DRIVER_TIMEOUT_REMOTE}s with "
                         f"--cdp-endpoint (waiting longer there is pointless — chromedriver is "
@@ -856,6 +877,15 @@ def parse_args():
                         f"{DEFAULT_DRIVER_TIMEOUT_LOCAL}s locally (launching a real browser "
                         f"with a fresh profile took 48s on a live run).")
     p.add_argument("--twocaptcha-key", default=None, help="2captcha.com API key")
+    p.add_argument("--webhook", default=None, metavar="URL",
+                   help="POST the run summary (the same fields as the "
+                        ".meta.json sidecar, plus the exit code) to this "
+                        "URL when the run finishes — including when it "
+                        "fails, which is the case worth being told about. "
+                        "Never fails the run, never logged (the URL is "
+                        "usually the credential). Prefer FARFETCH_WEBHOOK "
+                        "in .env over this flag: argv is readable by "
+                        "anything that can run ps.")
     p.add_argument("--allow-empty", action="store_true",
                    help="Write output files even when 0 products were found. Off by "
                         "default so a failed run can't overwrite a good result; exit "
@@ -870,6 +900,7 @@ def parse_args():
                         "if the catalogue is not already readable. always: "
                         "solve whenever one is detected.")
     p.add_argument("--min-score", type=float, default=0.7,
+                   choices=[0.3, 0.7, 0.9],
                    help="reCAPTCHA v3 minimum score to request (0.3, 0.7 or 0.9 — "
                         "the API only accepts these three). Ignored for v2 widgets.")
     p.add_argument("--cdp-endpoint", default=None,
@@ -890,9 +921,14 @@ def parse_args():
     return args
 
 
-if __name__ == "__main__":
+def main() -> int:
+    """The entry point, as a callable — see playwright_scraper.main()."""
     args = parse_args()
     try:
-        sys.exit(scrape(args))
+        return scrape(args)
     except KeyboardInterrupt:
-        sys.exit(1)
+        return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

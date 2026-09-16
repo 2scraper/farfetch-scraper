@@ -23,6 +23,7 @@ import argparse
 import asyncio
 import logging
 import sys
+import time
 from urllib.parse import urlparse
 
 from pyppeteer import launch, connect
@@ -31,10 +32,11 @@ from captcha_solver import (detect_recaptcha_v3, detect_recaptcha_in_page,
                             reconcile_detections, solve_recaptcha,
                             INJECT_TOKEN_JS, RECAPTCHA_DISCOVERY_JS)
 from product_parser import (parse_products, SELECTORS, detect_bot_challenge,
-                            page_url)
-from output_writer import dedupe_by_sku, finish_run
+                            describe_block, page_url)
+from output_writer import dedupe_by_sku, finish_run, new_run_id
 from proxy_pool import mask as mask_proxy
 import env_config
+from arg_types import positive_int, nonneg_float
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger("puppeteer_scraper")
@@ -149,7 +151,13 @@ async def handle_captcha_if_present(page, args) -> None:
     await page.reload({"waitUntil": "domcontentloaded", "timeout": 60000})
 
 
-async def scrape(args) -> None:
+async def scrape(args) -> int:
+    # One id per run, logged here and written into the sidecar, so a
+    # log line and an artefact can be tied together. "the run that
+    # failed" is not identifying for a scraper on a schedule.
+    run_id = new_run_id()
+    started_at = time.time()
+    logger.info("Run %s starting: %s", run_id, args.url)
     all_products = []
     seen_skus = set()
     blocked = False
@@ -267,9 +275,9 @@ async def scrape(args) -> None:
                     await page.screenshot({"path": f"{args.out}_page{page_num}_debug.png", "fullPage": True})
                 except Exception as e:
                     logger.warning("Could not capture screenshot: %s", e)
-                logger.error("Blocked by a %s challenge page before parsing (%d bytes) — "
+                logger.error("Blocked by %s before parsing (%d bytes) — "
                              "saved to %s. This is exit 3, distinct from a genuinely "
-                             "empty category (exit 4).", vendor, len(html), debug_html)
+                             "empty category (exit 4).", describe_block(html, vendor), len(html), debug_html)
                 blocked = True
                 stop_reason = f"blocked_{vendor}"
                 break
@@ -330,6 +338,8 @@ async def scrape(args) -> None:
 
     return finish_run(all_products, args.out, args.format, args.allow_empty,
                       blocked=blocked, stop_reason=stop_reason,
+                      run_id=run_id, started_at=started_at,
+                      webhook=args.webhook,
                       pages_requested=args.pages, pages_completed=pages_completed,
                       start_url=args.url, final_url=final_url)
 
@@ -340,17 +350,26 @@ def parse_args():
                    help="Farfetch category/hub/search listing URL. Required, unless "
                         "FARFETCH_URL is set in the environment or in .env.")
     p.add_argument("--category", default=None, help="Label to tag output rows with. Defaults to the category segment of the URL, so the column is never empty just because the flag was omitted.")
-    p.add_argument("--pages", type=int, default=1, help="Number of listing pages to crawl")
-    p.add_argument("--delay", type=float, default=2.0, help="Delay between pages, seconds")
-    p.add_argument("--retries", type=int, default=3,
+    p.add_argument("--pages", type=positive_int, default=1, help="Number of listing pages to crawl")
+    p.add_argument("--delay", type=nonneg_float, default=2.0, help="Delay between pages, seconds")
+    p.add_argument("--retries", type=positive_int, default=3,
                    help="Attempts per page load before giving up (default 3)")
-    p.add_argument("--retry-delay", type=float, default=2.0,
+    p.add_argument("--retry-delay", type=nonneg_float, default=2.0,
                    help="Seconds before the first page-load retry, doubling "
                         "thereafter (default 2.0)")
     p.add_argument("--format", choices=["json", "csv", "both"], default="both")
     p.add_argument("--out", default="farfetch_products", help="Output file prefix")
     p.add_argument("--proxy", default=None, help="Proxy URL, e.g. http://HOST:9999 (2captcha.com/proxy)")
     p.add_argument("--twocaptcha-key", default=None, help="2captcha.com API key")
+    p.add_argument("--webhook", default=None, metavar="URL",
+                   help="POST the run summary (the same fields as the "
+                        ".meta.json sidecar, plus the exit code) to this "
+                        "URL when the run finishes — including when it "
+                        "fails, which is the case worth being told about. "
+                        "Never fails the run, never logged (the URL is "
+                        "usually the credential). Prefer FARFETCH_WEBHOOK "
+                        "in .env over this flag: argv is readable by "
+                        "anything that can run ps.")
     p.add_argument("--allow-empty", action="store_true",
                    help="Write output files even when 0 products were found. Off by "
                         "default so a failed run can't overwrite a good result; exit "
@@ -365,6 +384,7 @@ def parse_args():
                         "if the catalogue is not already readable. always: "
                         "solve whenever one is detected.")
     p.add_argument("--min-score", type=float, default=0.7,
+                   choices=[0.3, 0.7, 0.9],
                    help="reCAPTCHA v3 minimum score to request (0.3, 0.7 or 0.9 — "
                         "the API only accepts these three). Ignored for v2 widgets.")
     p.add_argument("--cdp-endpoint", default=None,
@@ -384,9 +404,19 @@ def parse_args():
     return args
 
 
-if __name__ == "__main__":
+def main() -> int:
+    """The entry point, as a callable — see playwright_scraper.main().
+
+    asyncio.run() is inside main() rather than around it so the console
+    script entry point is an ordinary sync callable, which is what a
+    [project.scripts] target has to be.
+    """
     args = parse_args()
     try:
-        sys.exit(asyncio.run(scrape(args)))
+        return asyncio.run(scrape(args))
     except KeyboardInterrupt:
-        sys.exit(1)
+        return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

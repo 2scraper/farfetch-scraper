@@ -23,8 +23,8 @@ RUN pip install --no-cache-dir -r requirements.txt -r requirements-playwright.tx
 # behind: proxy_pool.py was missing while the engine imports it at module
 # level, so the image died with ModuleNotFoundError on every invocation,
 # `--help` included. Nothing noticed, because CI never built the image.
-COPY captcha_solver.py env_config.py fingerprint_client.py output_writer.py \
-     playwright_scraper.py product_parser.py diff_runs.py proxy_pool.py ./
+COPY arg_types.py captcha_solver.py notify.py run_state.py env_config.py fingerprint_client.py output_writer.py \
+     playwright_scraper.py product_parser.py product_detail_parser.py diff_runs.py proxy_pool.py ./
 
 ENTRYPOINT ["python3", "playwright_scraper.py"]
 CMD ["--help"]

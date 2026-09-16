@@ -25,6 +25,7 @@ live_results.zip
 signup_modal_debug*.html
 signup_modal_debug*.png
 account_icon_search*.png
+*.progress.json
 *_debug.html
 *_debug.png
 

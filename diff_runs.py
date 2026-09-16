@@ -163,6 +163,31 @@ def _run_status(path: str) -> Tuple[Optional[str], Optional[dict]]:
     return meta.get("status"), meta
 
 
+def _check_same_mode(args) -> bool:
+    """Refuse to diff a listing run against a detail run.
+
+    NOT negotiable by --force, unlike the incomplete-run refusal below. That
+    one is a judgement about coverage, and the SKUs both runs saw are still
+    genuinely comparable. This one is a category error: a listing run has one
+    row per product, a detail run one row per SIZE keyed on a different id,
+    so every line of the diff would be an artefact of the comparison rather
+    than a fact about the site — and it would look like a result.
+    """
+    modes = {}
+    for label, path in (("--old", args.old), ("--new", args.new)):
+        _, meta = _run_status(path)
+        if meta:
+            modes[label] = meta.get("mode", "listing")
+    if len(set(modes.values())) < 2:
+        return True
+    print("[!] Refusing to diff: these runs are not the same KIND of output.")
+    for label, mode in modes.items():
+        print(f"      {label} is a {mode!r} run")
+    print("    A listing run has one row per product; a detail run has one "
+          "row per size, keyed on a different id. --force does not apply.")
+    return False
+
+
 def _check_comparable(args) -> bool:
     """Refuse an assortment diff between runs that are not both complete.
 
@@ -216,6 +241,10 @@ def parse_args():
 
 def main() -> int:
     args = parse_args()
+    # Mode first, and unconditionally: --force cannot make two
+    # different row kinds comparable.
+    if not _check_same_mode(args):
+        return 2
     if not args.force and not _check_comparable(args):
         return 2
 
