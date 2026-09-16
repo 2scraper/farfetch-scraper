@@ -11,9 +11,9 @@ a promise that every flag and exit code is contractually frozen.
 ### Fixed
 
 - **Eight occurrences of a banned product name shipped in the three
-  engines**, including in the `--cdp-endpoint` help text a user reads
-  (`"…or any antidetect browser that exposes a CDP URL"`) and in
-  `selenium_scraper.py`'s module docstring. The naming rule is that the
+  engines**, including in the `--cdp-endpoint` help text a user reads — it
+  offered the endpoint "or any …  browser that exposes a CDP URL", with the
+  banned word in the gap — and in `selenium_scraper.py`'s module docstring. The naming rule is that the
   product is the **2Captcha Scraping Browser API**; everything else is "a
   remote browser". This repo was the only one of the family's seventeen with
   the phrase in shipped code.
