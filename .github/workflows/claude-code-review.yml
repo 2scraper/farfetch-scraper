@@ -19,6 +19,14 @@ jobs:
     #   github.event.pull_request.author_association == 'FIRST_TIME_CONTRIBUTOR'
 
     runs-on: ubuntu-latest
+    # `secrets` is not available in a job-level `if`, so presence is tested
+    # through the job `env` and read in each step's `if`. Without this, a copy
+    # of this workflow in a repo with no CLAUDE_CODE_OAUTH_TOKEN fails the
+    # job on the action's own environment validation -- putting a permanently
+    # red check on every PR, and a check that is always red teaches everyone
+    # to ignore checks.
+    env:
+      HAS_CLAUDE_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN != '' }}
     permissions:
       contents: read
       pull-requests: read
@@ -46,6 +54,7 @@ jobs:
       # Remove both this step and path_to_claude_code_executable once `latest`
       # installs correctly again.
       - name: Install Claude Code (stable channel)
+        if: env.HAS_CLAUDE_TOKEN == 'true'
         run: |
           curl -fsSL https://claude.ai/install.sh | bash -s stable
           "$HOME/.local/bin/claude" --version
@@ -57,6 +66,7 @@ jobs:
           echo "CLAUDE_BIN=$HOME/.local/bin/claude" >> "$GITHUB_ENV"
 
       - name: Run Claude Code Review
+        if: env.HAS_CLAUDE_TOKEN == 'true'
         id: claude-review
         uses: anthropics/claude-code-action@v1
         with:

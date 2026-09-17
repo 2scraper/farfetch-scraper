@@ -10,8 +10,8 @@ Farfetch quirks.
 KNOWN LIMITATION, confirmed in a previous single-site scraper in this same
 family: Selenium's `debuggerAddress` capability was designed for a LOCAL,
 UNAUTHENTICATED debug port. It does NOT forward a `user:pass` embedded in
-a remote CDP URL — connecting to an authenticated remote antidetect/Scraping
-Browser this way fails with `SessionNotCreatedException: cannot connect to
+a remote CDP URL — connecting to an authenticated remote Scraping Browser
+API session this way fails with `SessionNotCreatedException: cannot connect to
 chrome at <host>:<port> from chrome not reachable`. Use
 playwright_scraper.py or puppeteer_scraper.py for that use case; this
 script's --cdp-endpoint is best-effort and works fine against a local,
@@ -499,7 +499,7 @@ def build_driver(args) -> webdriver.Chrome:
                 # chromedriver normally refuses to attach to a browser whose
                 # major version differs from its own. That check assumes the
                 # browser's self-reported version is meaningful — and a managed
-                # antidetect browser's whole job includes spoofing what it
+                # remote browser's whole job includes spoofing what it
                 # claims to be, so the version it reports may name nothing real.
                 # This skips the comparison and lets the protocol decide. If the
                 # protocol genuinely doesn't match you get an error naming the
@@ -867,7 +867,7 @@ def parse_args():
                    help="Pass --disable-build-check to chromedriver, so it attaches "
                         "without comparing versions. Use when no driver matches the "
                         "remote browser's reported version, or when you suspect that "
-                        "version is spoofed — which a managed antidetect browser may "
+                        "version is spoofed — which a managed remote browser may "
                         "well do.")
     p.add_argument("--driver-timeout", type=positive_int, default=None,
                    help=f"Seconds to allow for creating the Selenium session before giving up. "

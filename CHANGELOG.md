@@ -6,6 +6,47 @@ All notable changes to this project are documented here. Format follows
 library with a stable API) reasonably can — a patch bump means "fixes", not
 a promise that every flag and exit code is contractually frozen.
 
+## [0.5.1] — 2026-09-16
+
+### Fixed
+
+- **Eight occurrences of a banned product name shipped in the three
+  engines**, including in the `--cdp-endpoint` help text a user reads — it
+  offered the endpoint "or any …  browser that exposes a CDP URL", with the
+  banned word in the gap — and in `selenium_scraper.py`'s module docstring. The naming rule is that the
+  product is the **2Captcha Scraping Browser API**; everything else is "a
+  remote browser". This repo was the only one of the family's seventeen with
+  the phrase in shipped code.
+- **The check that exists to prevent exactly that had three holes**, and the
+  third is why the first two survived:
+  - it banned the two compound forms of the name but not the bare two-word
+    phrase — the gap the eight occurrences went through;
+  - matching was case-sensitive, patched by listing one capitalised variant
+    by hand, which covers exactly the casings someone thought of;
+  - `smoke_test.py` was excluded from the scan **wholesale**, so the file
+    most likely to pick up a stray phrase by copy-paste was the one file
+    nobody scanned. It is now scanned like any other, which works because
+    the phrases are assembled from pieces rather than written out.
+
+  The scan is also anchored to this file's directory rather than to the
+  working directory, and asserts a floor on how many files it saw: it used
+  `glob("*.py")` relative to CWD, so running the suite from anywhere else
+  scanned nothing and passed. A check that can quietly scan zero files is
+  not a check.
+
+  Verified by control: reintroducing the phrase into an engine — in a
+  capitalisation the old list would have missed — turns the suite red.
+
+### CI
+
+- **The two Claude workflows are guarded on their token.** Neither tested
+  whether `CLAUDE_CODE_OAUTH_TOKEN` is set, so a copy of this repo without
+  the secret fails the job on the action's own environment validation — a
+  permanently red check on every PR, and a check that is always red teaches
+  everyone to ignore checks. `secrets` is not available in a job-level `if`,
+  so presence is tested through the job `env` and read in each step's `if`,
+  which is the shape the rest of this family uses.
+
 ## [0.5.0] — 2026-09-15
 
 > **Read this before upgrading.** Two things change for an existing caller.

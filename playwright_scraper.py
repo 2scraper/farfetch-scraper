@@ -18,7 +18,7 @@ Features
   * Playwright (Chromium) with a real browser context.
   * Optional rotating proxy support via 2Captcha proxies (2captcha.com/proxy,
     also sold under the 2prx.com name — same product, same gateways).
-  * Connect to an existing antidetect/Scraping Browser via --cdp-endpoint
+  * Connect to an existing Scraping Browser API session via --cdp-endpoint
     instead of launching a bundled Chromium.
   * If a reCAPTCHA challenge is detected on ANY page (not just one specific
     URL — this check runs after every navigation), it is classified (v3 /
@@ -249,7 +249,7 @@ def _launch_local(pw, args, pool):
     browser = pw.chromium.launch(**launch_kwargs)
     # Only override the UA when we launched our own bundled Chromium.
     # Forcing a UA on a page reached via --cdp-endpoint mismatches
-    # the antidetect browser's real TLS/JS fingerprint on purpose-
+    # the remote browser's real TLS/JS fingerprint on purpose-
     # matched values — a mistake that broke a previous run in this
     # family with an Akamai "Access Denied."
     ctx_kwargs = {"user_agent": _chrome_ua(browser.version), "locale": "en-US"}
@@ -332,7 +332,7 @@ def _connect_remote(pw, args):
     # answers with HTTP 500 rather than stalling, so this mostly guards
     # against the endpoint going quiet.
     browser = pw.chromium.connect_over_cdp(args.cdp_endpoint, timeout=30000)
-    # Reuse the antidetect browser's existing context so its
+    # Reuse the remote browser's existing context so its
     # fingerprint/session/proxy settings stay intact.
     context = browser.contexts[0] if browser.contexts else browser.new_context()
     page = context.new_page()
@@ -1307,7 +1307,7 @@ def parse_args():
     p.add_argument("--cdp-endpoint", default=None,
                     help="Connect to an already-running browser over CDP instead of launching "
                          "Playwright's bundled Chromium, e.g. ws://user:pass@host:port "
-                         "e.g. the Scraping Browser API endpoint, or any antidetect "
+                         "e.g. the Scraping Browser API endpoint, or any "
                          "browser that exposes a CDP URL. "
                          "--proxy and --headless/--headful are ignored when this is set.")
     p.add_argument("--dump-html", default=None, metavar="PATH",
