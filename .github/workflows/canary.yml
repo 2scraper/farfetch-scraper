@@ -110,7 +110,7 @@ jobs:
         # products with no error is exactly the kind of regression that needs
         # the actual bytes the parser saw, not just a pass/fail badge.
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: canary-no-proxy-${{ github.run_id }}
           path: |
@@ -178,7 +178,7 @@ jobs:
 
       - name: Upload run artifacts (output, HTML snapshot, debug dumps)
         if: always() && env.HAVE_PROXY == 'true'
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: canary-production-like-${{ github.run_id }}
           path: |
