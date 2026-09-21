@@ -204,6 +204,12 @@ EXIT_DRIVER_TIMEOUT = 124
 # obtaining it and finding nothing on it. Kept as data next to the exit code
 # they map to, so an engine cannot invent a reason that silently falls
 # through to "no products" — the failure this list exists to prevent.
+# NOTE: this no longer decides the exit code -- see the `not complete`
+# branch in _finish_code. It remains the documented vocabulary of
+# transport reasons, and the suite asserts it shares no member with
+# COMPLETE_STOP_REASONS, which is exactly what keeps the rule that
+# replaced it honest: a reason cannot be both "we finished" and "we
+# never got there".
 FETCH_FAILURE_STOP_REASONS = ("page_load_timeout", "proxy_unusable",
                               "http_error")
 
@@ -470,9 +476,17 @@ def _finish_code(products, rc, blocked, stop_reason, complete,
         # empty" — the only one of the three that is really EXIT_NO_PRODUCTS.
         if blocked:
             return EXIT_BLOCKED
-        if stop_reason in FETCH_FAILURE_STOP_REASONS:
-            print(f"[!] The page was never fetched ({stop_reason}) — this is "
-                  f"exit {EXIT_FETCH_FAILED}, NOT an empty category "
+        # Keyed on `not complete` rather than on FETCH_FAILURE_STOP_REASONS,
+        # which this repo introduced and which turned out to be the weaker
+        # half of its own fix: a list cannot cover a reason nobody has added
+        # to it yet, so a new stop_reason falls silently through to "the
+        # category is empty" — the defect this branch exists to prevent.
+        # Seven sibling repos had independently keyed on `not complete`, and
+        # the family unified on their rule with this repo's exit code.
+        # See CLAUDE.md §25.
+        if not complete:
+            print(f"[!] The pages were never fetched ({stop_reason}) — this "
+                  f"is exit {EXIT_FETCH_FAILED}, NOT an empty category "
                   f"(exit {EXIT_NO_PRODUCTS}). Nothing can be concluded about "
                   f"the catalogue from this run.")
             return EXIT_FETCH_FAILED
