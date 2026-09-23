@@ -3965,6 +3965,58 @@ def check_x_debug_header_is_redacted(ok):
     return ok
 
 
+def check_scraper_api_waitfor_object_and_http_code(ok):
+    """Measured 2026-09-23 against the live Scraper API: `waitFor` sent as
+    a JSON-encoded string is refused with HTTP 422 and still billed, and
+    the response's `status` is the API's verdict ("success") while the
+    target's own code is `http_code`. Drives the real fetch_html with
+    requests.post replaced, so no network and no money."""
+    import argparse
+    import logging
+    import scraper_api_client as sac
+    captured = {}
+
+    class _Resp:
+        status_code = 200
+        headers = {}
+        text = ""
+
+        def json(self):
+            return {"status": "success", "http_code": 403, "body": "<html></html>"}
+
+    def _fake_post(url, **kw):
+        captured["json"] = kw.get("json")
+        return _Resp()
+
+    statuses = []
+
+    class _H(logging.Handler):
+        def emit(self, record):
+            if str(record.msg).startswith("Upstream page status"):
+                statuses.append(record.args[0])
+
+    h = _H()
+    real_post = sac.requests.post
+    sac.requests.post = _fake_post
+    sac.logger.addHandler(h)
+    try:
+        args = argparse.Namespace(url="https://www.farfetch.com/shopping/kids/items.aspx",
+                                  key="k", timeout=60, cdp_url=None, wait_text="$",
+                                  wait_element=None, wait_state=None)
+        sac.fetch_html(args)
+    finally:
+        sac.requests.post = real_post
+        sac.logger.removeHandler(h)
+    wf = (captured.get("json") or {}).get("waitFor")
+    ok &= check("Scraper API: --wait-text sends waitFor as an OBJECT, not a JSON string "
+                "(a string is HTTP 422 and still billed, measured 2026-09-23)",
+                isinstance(wf, dict) and wf.get("text") == "$")
+    ok &= check("Scraper API: the target status is read from http_code (403), not the "
+                "API's own 'success' verdict",
+                statuses == [403])
+    return ok
+
+
 def main() -> int:
     ok = True
 
@@ -4155,6 +4207,7 @@ def main() -> int:
     ok = check_sign_up_modal_selectors(ok)
     ok = check_empty_result_contract(ok)
     ok = check_x_debug_header_is_redacted(ok)
+    ok = check_scraper_api_waitfor_object_and_http_code(ok)
     ok = check_blocked_vs_empty_exit_code(ok)
     ok = check_akamai_s_refusal_page_the_2026_09_11_audit_s_p0(ok)
     ok = check_page_content_mid_navigation(ok)
