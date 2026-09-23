@@ -6,6 +6,17 @@ All notable changes to this project are documented here. Format follows
 library with a stable API) reasonably can — a patch bump means "fixes", not
 a promise that every flag and exit code is contractually frozen.
 
+## [Unreleased]
+
+### Changed
+
+- **README badges use the family's labels**: `licence` (was "License: MIT",
+  rendered "license"), `Python`, `engines` and "runs without an account" in
+  lower case, matching the sibling repos. Order and targets are unchanged;
+  the access badge stays "runs without an account" because this README
+  measures a plain local Chromium on a residential IP returning all 96
+  products with no key, no proxy and no account.
+
 ## [0.5.1] — 2026-09-16
 
 ### Fixed

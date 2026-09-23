@@ -3,10 +3,10 @@
 [![release](https://img.shields.io/github/v/release/2scraper/farfetch-scraper?style=flat-square)](https://github.com/2scraper/farfetch-scraper/releases)
 [![tests](https://github.com/2scraper/farfetch-scraper/actions/workflows/tests.yml/badge.svg)](https://github.com/2scraper/farfetch-scraper/actions/workflows/tests.yml)
 [![canary](https://github.com/2scraper/farfetch-scraper/actions/workflows/canary.yml/badge.svg)](https://github.com/2scraper/farfetch-scraper/actions/workflows/canary.yml)
-[![Python 3.9+](https://img.shields.io/badge/python-3.9%2B-blue?style=flat-square)](https://python.org)
-[![License: MIT](https://img.shields.io/badge/license-MIT-green?style=flat-square)](LICENSE)
-[![Playwright · Selenium · Puppeteer](https://img.shields.io/badge/engines-Playwright%20%C2%B7%20Selenium%20%C2%B7%20Puppeteer-orange?style=flat-square)](#engines)
-[![Runs without an account](https://img.shields.io/badge/runs%20without-an%20account-brightgreen?style=flat-square)](#do-you-need-a-paid-service-for-this)
+[![Python](https://img.shields.io/badge/python-3.9%2B-blue?style=flat-square)](https://python.org)
+[![licence](https://img.shields.io/badge/licence-MIT-green?style=flat-square)](LICENSE)
+[![engines](https://img.shields.io/badge/engines-Playwright%20%C2%B7%20Selenium%20%C2%B7%20Puppeteer-orange?style=flat-square)](#engines)
+[![runs without an account](https://img.shields.io/badge/runs%20without-an%20account-brightgreen?style=flat-square)](#do-you-need-a-paid-service-for-this)
 
 A working scraper for **farfetch.com** listing pages — category, hub, search and
 brand. Not a client for a hosted API: the code in this repo opens the site,
