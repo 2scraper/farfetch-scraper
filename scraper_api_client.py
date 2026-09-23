@@ -41,14 +41,24 @@ API surface used (per https://2captcha.com/scraper/scraper-api/api)
     Content-Type: application/json
     {"task_type": "scrape", "url": ..., "data_format": "raw",
      "format": "json", "timeout": 1..120,
-     "waitFor": "<JSON *string*, not an object>",
+     "waitFor": {"text": "..."},        # an OBJECT -- see below
      "cdpurl": "ws://user:pass@host:port"   # optional
     }
-  -> 200 {"status": 200, "headers": {...}, "body": "<!DOCTYPE html>..."}
+  -> 200 {"status": "success", "http_code": 200, "headers": {...},
+          "body": "<!DOCTYPE html>..."}
 
-Note `waitFor` must be a JSON *string* (double-encoded), and the param is
-spelled `cdpurl` (all lowercase) while `waitFor` is camelCase — that's
-the API's own inconsistency, not a typo here.
+Measured 2026-09-23 against the live endpoint: `waitFor` must be a JSON
+OBJECT. Sent as a JSON-encoded string (which this client did until then,
+following older docs) the API answers HTTP 422 "params.waitFor must be an
+object" -- and still bills the task ($0.0005). The same request with an
+object answers 200.
+
+`status` in the response is the API's own verdict string ("success"), NOT
+the target page's HTTP code; that is `http_code`. Reading `status` as the
+page status meant a target 403/503 was never seen.
+
+The param is spelled `cdpurl` (all lowercase) while `waitFor` is camelCase
+— that's the API's own inconsistency, not a typo here.
 
 Usage
 -----
@@ -150,9 +160,11 @@ def _redact_debug_header(value: str) -> str:
                                _CREDS_IN_TEXT_RE.sub(r"\1***:***@", value))
 
 
-def _build_wait_for(args) -> Optional[str]:
-    """`waitFor` must be a JSON STRING (double-encoded), per the API docs.
-    Passing a nested object is silently wrong.
+def _build_wait_for(args) -> Optional[dict]:
+    """`waitFor` is sent as a JSON OBJECT. Measured 2026-09-23: the
+    JSON-encoded-string form this client used before is refused with HTTP
+    422 ("params.waitFor must be an object") and still billed; the object
+    form answers 200.
 
     Default (no flag): wait for the DOM. On a challenge-protected page
     that resolves instantly against the challenge page itself — which is
@@ -160,11 +172,27 @@ def _build_wait_for(args) -> Optional[str]:
     --wait-text/--wait-element exist to wait on something only the real
     page can contain."""
     if args.wait_text:
-        return json.dumps({"text": args.wait_text})
+        return {"text": args.wait_text}
     if args.wait_element:
-        return json.dumps({"element": args.wait_element, "checkVisible": True})
+        return {"element": args.wait_element, "checkVisible": True}
     if args.wait_state:
-        return json.dumps({"state": args.wait_state})
+        return {"state": args.wait_state}
+    return None
+
+
+def _target_status(body: dict) -> Optional[int]:
+    """The TARGET page's HTTP status, or None.
+
+    Measured 2026-09-23: the response carries the target's code as
+    `http_code` (an int) and the API's own verdict as `status` ("success").
+    Reading `status` handed the string "success" onward and a target 403
+    was never seen. `status` is kept as a fallback only when it is an int,
+    for the older response shape. bool is excluded: it is an int to Python.
+    """
+    for key in ("http_code", "status"):
+        v = body.get(key)
+        if isinstance(v, int) and not isinstance(v, bool):
+            return v
     return None
 
 
@@ -173,14 +201,14 @@ def fetch_html(args) -> str:
         "task_type": "scrape",
         "url": args.url,
         "data_format": "raw",   # we want HTML; product_parser does the rest
-        "format": "json",       # so we get {"status", "headers", "body"}
+        "format": "json",       # so we get {"status", "http_code", "headers", "body"}
         "timeout": min(args.timeout, MAX_API_TIMEOUT),
     }
 
     wait_for = _build_wait_for(args)
     if wait_for:
         payload["waitFor"] = wait_for
-        logger.info("waitFor: %s", wait_for)
+        logger.info("waitFor: %s", json.dumps(wait_for))
 
     if args.cdp_url:
         payload["cdpurl"] = args.cdp_url
@@ -215,7 +243,7 @@ def fetch_html(args) -> str:
 
     body = resp.json()
     html = body.get("body") or ""
-    upstream_status = body.get("status")
+    upstream_status = _target_status(body)
     logger.info("Upstream page status %s, %d bytes of HTML.", upstream_status, len(html))
     return html
 
