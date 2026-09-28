@@ -49,7 +49,7 @@ jobs:
     name: reachability (no proxy, datacentre IP)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - uses: actions/setup-python@v5
         with:
@@ -135,7 +135,7 @@ jobs:
         if: env.HAVE_PROXY != 'true'
         run: echo "::notice::Skipped - no FARFETCH_PROXY secret is set, so there is no residential exit to run from. farfetch.com refuses GitHub's datacentre addresses, so running this job without one would be red every morning while saying nothing about the site. The reachability job above still runs for free. Set the secret to turn this signal on; it is read from the environment by env_config.py and never reaches a command line."
 
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         if: env.HAVE_PROXY == 'true'
 
       - uses: actions/setup-python@v5
