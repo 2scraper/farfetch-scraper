@@ -19,7 +19,7 @@ pytest>=7.0
 # default worth copying, because Ruff's defaults here would demand Python
 # 3.10+ syntax from a package that supports and tests 3.9.
 ruff~=0.14
-mypy~=1.18
+mypy>=1.18,<3.0
 
 # Type stubs for the one third-party library the mypy-gated modules
 # import (notify.py posts the run summary with requests). Without
