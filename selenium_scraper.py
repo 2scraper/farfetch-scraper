@@ -36,6 +36,7 @@ import signal
 import sys
 import tempfile
 import time
+from typing import Optional
 from urllib.parse import urlparse
 
 from selenium import webdriver
@@ -59,10 +60,12 @@ from selenium.webdriver.support.ui import WebDriverWait
 
 from captcha_solver import (detect_recaptcha_v3, detect_recaptcha_in_page,
                             reconcile_detections, solve_recaptcha,
+                            SolveBudget,
                             INJECT_TOKEN_JS)
 from product_parser import (parse_products, SELECTORS, detect_bot_challenge,
-                            describe_block, page_url)
-from output_writer import (dedupe_by_sku, finish_run,
+                            describe_block, page_url,
+                            count_product_links)
+from output_writer import (dedupe_by_sku, finish_run, stop_reason_for,
                            EXIT_DRIVER_TIMEOUT, new_run_id)
 from proxy_pool import mask as mask_proxy
 import env_config
@@ -639,7 +642,7 @@ def build_driver(args) -> webdriver.Chrome:
     return driver
 
 
-def handle_captcha_if_present(driver, args) -> None:
+def handle_captcha_if_present(driver, args, budget=None) -> None:
     """Runs after EVERY navigation, for ANY page — not scoped to one URL."""
     html = driver.page_source
     # Both detectors, always — see reconcile_detections in captcha_solver.py.
@@ -674,6 +677,11 @@ def handle_captcha_if_present(driver, args) -> None:
                        "solved — continuing with whatever the page already "
                        "holds. If it was blocking, the run reports exit 3.")
         return
+    # Checked BEFORE the purchase, against an allowance the caller holds
+    # for the whole page, so retries and exit rotations cannot each buy
+    # another token. Without a caller's budget, this call alone may buy one.
+    if not (budget if budget is not None else SolveBudget()).take():
+        return
     try:
         token = solve_recaptcha(challenge, args.twocaptcha_key,
                                api_version=args.captcha_api,
@@ -686,6 +694,25 @@ def handle_captcha_if_present(driver, args) -> None:
     logger.info("Token injected. Reloading page to continue.")
     time.sleep(1.5)
     driver.refresh()
+
+
+def _document_status(driver) -> Optional[int]:
+    """The HTTP status of the current document, or None if unknowable.
+
+    `driver.get()` returns nothing, so Selenium has no Response to read a
+    status from. The browser still knows it: Chromium exposes it as
+    PerformanceNavigationTiming.responseStatus. Without it, an HTTP 403
+    whose body names no known vendor was reported as an empty category
+    (exit 4) here while the Playwright engine said exit 5. None (an older
+    browser, or a 0 for an opaque response) leaves the old behaviour.
+    """
+    try:
+        status = driver.execute_script(
+            "const n = performance.getEntriesByType('navigation')[0];"
+            "return n && n.responseStatus ? n.responseStatus : null;")
+    except Exception:  # noqa: BLE001 — a missing signal, not a failure
+        return None
+    return status if isinstance(status, int) and status > 0 else None
 
 
 def scrape(args) -> int:
@@ -727,11 +754,13 @@ def scrape(args) -> int:
             logger.info("Fetching page %d/%d: %s", page_num, args.pages, url)
             # Retry a navigation failure rather than ending the run on it —
             # see playwright_scraper.py for why.
+            http_status = None
             for attempt in range(1, args.retries + 1):
                 load_failed = False
                 try:
                     driver.get(url)
                     wait.until(lambda d: d.execute_script("return document.readyState") == "complete")
+                    http_status = _document_status(driver)
                     break
                 except (TimeoutException, WebDriverException):
                     load_failed = True
@@ -746,7 +775,7 @@ def scrape(args) -> int:
                 stop_reason = "page_load_timeout"
                 break
 
-            handle_captcha_if_present(driver, args)
+            handle_captcha_if_present(driver, args, budget=SolveBudget())
 
             try:
                 WebDriverWait(driver, 20).until(
@@ -775,6 +804,22 @@ def scrape(args) -> int:
                 stop_reason = f"blocked_{vendor}"
                 break
 
+            if http_status is not None and http_status >= 400:
+                # An error status whose body names no vendor we recognise.
+                # Still not the listing, and "0 products" about it would be a
+                # claim about the catalogue this run cannot support — the
+                # same reading the Playwright engine gives it.
+                debug_html = f"{args.out}_page{page_num}_debug.html"
+                with open(debug_html, "w", encoding="utf-8") as f:
+                    f.write(html)
+                logger.error("HTTP %d for %s and nothing on the page names a "
+                             "known bot-check vendor — saved %d bytes to %s. "
+                             "Reported as a fetch failure, not an empty "
+                             "category.", http_status, url, len(html), debug_html)
+                stop_reason = stop_reason_for(load_failed=False, blocked_by=None,
+                                              http_status=http_status)
+                break
+
             products = parse_products(html, driver.current_url, category=args.category)
             logger.info("Parsed %d products from page %d.", len(products), page_num)
 
@@ -787,6 +832,19 @@ def scrape(args) -> int:
                     driver.save_screenshot(debug_png)
                 except Exception as e:
                     logger.warning("Could not capture screenshot: %s", e)
+                linked = count_product_links(html)
+                if linked >= MIN_CARD_MATCHES:
+                    # A page that LINKS to products and parses to none is a
+                    # broken parser, not an empty category — named as such,
+                    # as the Playwright engine names it.
+                    logger.error("PARSER DRIFT: the page links to %d product(s) "
+                                 "and the parser extracted 0. Saved what the "
+                                 "browser saw to %s and %s.", linked,
+                                 debug_html, debug_png)
+                    stop_reason = stop_reason_for(load_failed=False,
+                                                  blocked_by=None,
+                                                  parse_drift=True)
+                    break
                 logger.warning("0 products parsed — saved what the browser actually saw to "
                                 "%s and %s.", debug_html, debug_png)
 

@@ -30,11 +30,17 @@ from pyppeteer import launch, connect
 
 from captcha_solver import (detect_recaptcha_v3, detect_recaptcha_in_page,
                             reconcile_detections, solve_recaptcha,
+                            SolveBudget,
                             INJECT_TOKEN_JS, RECAPTCHA_DISCOVERY_JS)
 from product_parser import (parse_products, SELECTORS, detect_bot_challenge,
-                            describe_block, page_url)
-from output_writer import dedupe_by_sku, finish_run, new_run_id
+                            describe_block, page_url,
+                            count_product_links)
+from output_writer import (dedupe_by_sku, finish_run, new_run_id,
+                           stop_reason_for, EXIT_FETCH_FAILED)
 from proxy_pool import mask as mask_proxy
+from proxy_pool import (redact_url_credentials, describe_cdp_failure,
+                        cdp_failure_is_transient, CDP_CONNECT_ATTEMPTS,
+                        CDP_CONNECT_PAUSE_S)
 import env_config
 from arg_types import positive_int, nonneg_float
 
@@ -95,7 +101,7 @@ async def _content_when_settled(page, attempts: int = 4, pause: float = 0.7):
     return None
 
 
-async def handle_captcha_if_present(page, args) -> None:
+async def handle_captcha_if_present(page, args, budget=None) -> None:
     """Runs after EVERY navigation, for ANY page — not scoped to one URL."""
     html = await _content_when_settled(page)
     if html is None:
@@ -136,6 +142,11 @@ async def handle_captcha_if_present(page, args) -> None:
                        "solved — continuing with whatever the page already "
                        "holds. If it was blocking, the run reports exit 3.")
         return
+    # Checked BEFORE the purchase, against an allowance the caller holds
+    # for the whole page, so retries and exit rotations cannot each buy
+    # another token. Without a caller's budget, this call alone may buy one.
+    if not (budget if budget is not None else SolveBudget()).take():
+        return
     try:
         token = solve_recaptcha(challenge, args.twocaptcha_key,
                                api_version=args.captcha_api,
@@ -149,6 +160,37 @@ async def handle_captcha_if_present(page, args) -> None:
     logger.info("Token injected. Reloading page to continue.")
     await asyncio.sleep(1.5)
     await page.reload({"waitUntil": "domcontentloaded", "timeout": 60000})
+
+
+CDP_CONNECT_TIMEOUT_S = 30
+
+
+async def _connect_remote(args):
+    """connect() with a timeout, a short retry and a credential-free error.
+
+    pyppeteer's connect() has no timeout of its own and waits on a future a
+    rejected WebSocket handshake may never resolve, so it is bounded here.
+    A refused connect returns None and the run reports exit 5 (content never
+    obtained) instead of a traceback whose text carries the endpoint.
+    """
+    for attempt in range(1, CDP_CONNECT_ATTEMPTS + 1):
+        try:
+            return await asyncio.wait_for(
+                connect(browserWSEndpoint=args.cdp_endpoint),
+                timeout=CDP_CONNECT_TIMEOUT_S)
+        except asyncio.TimeoutError:
+            text = f"no answer within {CDP_CONNECT_TIMEOUT_S}s"
+        except Exception as e:  # noqa: BLE001 — reported, never re-raised raw
+            text = str(e) or type(e).__name__
+        if cdp_failure_is_transient(text) and attempt < CDP_CONNECT_ATTEMPTS:
+            logger.warning("CDP connect refused (%s) — retrying in %.0fs (%d/%d).",
+                           redact_url_credentials(text).splitlines()[0],
+                           CDP_CONNECT_PAUSE_S, attempt, CDP_CONNECT_ATTEMPTS)
+            await asyncio.sleep(CDP_CONNECT_PAUSE_S)
+            continue
+        logger.error("%s", describe_cdp_failure(text))
+        return None
+    return None
 
 
 async def scrape(args) -> int:
@@ -170,7 +212,9 @@ async def scrape(args) -> int:
 
     if args.cdp_endpoint:
         logger.info("Connecting to existing browser over CDP: %s", _mask_credentials(args.cdp_endpoint))
-        browser = await connect(browserWSEndpoint=args.cdp_endpoint)
+        browser = await _connect_remote(args)
+        if browser is None:
+            return EXIT_FETCH_FAILED
     else:
         launch_args = {
             "headless": args.headless,
@@ -234,9 +278,15 @@ async def scrape(args) -> int:
             logger.info("Fetching page %d/%d: %s", page_num, args.pages, url)
             # Retry a navigation failure rather than ending the run on it —
             # see playwright_scraper.py for why.
+            http_status = None
             for attempt in range(1, args.retries + 1):
                 try:
-                    await page.goto(url, {"waitUntil": "domcontentloaded", "timeout": 60000})
+                    # Keep the document's Response: its status is the one
+                    # signal a refusing edge always gives, and without it an
+                    # HTTP 403 with an unfamiliar body read as an empty
+                    # category (exit 4) here while Playwright said exit 5.
+                    resp = await page.goto(url, {"waitUntil": "domcontentloaded", "timeout": 60000})
+                    http_status = resp.status if resp else None
                     load_failed = False
                     break
                 except Exception:
@@ -252,17 +302,21 @@ async def scrape(args) -> int:
                 stop_reason = "page_load_timeout"
                 break
 
-            await handle_captcha_if_present(page, args)
+            await handle_captcha_if_present(page, args, budget=SolveBudget())
 
-            try:
-                await page.waitForFunction(
-                    f"document.querySelectorAll('{ITEM_LINK_SELECTOR}').length > {MIN_CARD_MATCHES}",
-                    {"timeout": 20000},
-                )
-                await asyncio.sleep(1)
-            except Exception:
-                logger.warning("No product markers appeared within 20s — "
-                                "parsing whatever loaded (may be a bot-check/consent page).")
+            if http_status is not None and http_status >= 400:
+                logger.warning("HTTP %d for %s — not waiting for products to "
+                               "paint.", http_status, url)
+            else:
+                try:
+                    await page.waitForFunction(
+                        f"document.querySelectorAll('{ITEM_LINK_SELECTOR}').length > {MIN_CARD_MATCHES}",
+                        {"timeout": 20000},
+                    )
+                    await asyncio.sleep(1)
+                except Exception:
+                    logger.warning("No product markers appeared within 20s — "
+                                    "parsing whatever loaded (may be a bot-check/consent page).")
 
             html = await page.content()
 
@@ -282,6 +336,22 @@ async def scrape(args) -> int:
                 stop_reason = f"blocked_{vendor}"
                 break
 
+            if http_status is not None and http_status >= 400:
+                # An error status whose body names no vendor we recognise.
+                # Still not the listing, and "0 products" about it would be a
+                # claim about the catalogue this run cannot support — the
+                # same reading the Playwright engine gives it.
+                debug_html = f"{args.out}_page{page_num}_debug.html"
+                with open(debug_html, "w", encoding="utf-8") as f:
+                    f.write(html)
+                logger.error("HTTP %d for %s and nothing on the page names a "
+                             "known bot-check vendor — saved %d bytes to %s. "
+                             "Reported as a fetch failure, not an empty "
+                             "category.", http_status, url, len(html), debug_html)
+                stop_reason = stop_reason_for(load_failed=False, blocked_by=None,
+                                              http_status=http_status)
+                break
+
             products = parse_products(html, page.url, category=args.category)
             logger.info("Parsed %d products from page %d.", len(products), page_num)
 
@@ -294,6 +364,19 @@ async def scrape(args) -> int:
                     await page.screenshot({"path": debug_png, "fullPage": True})
                 except Exception as e:
                     logger.warning("Could not capture screenshot: %s", e)
+                linked = count_product_links(html)
+                if linked >= MIN_CARD_MATCHES:
+                    # A page that LINKS to products and parses to none is a
+                    # broken parser, not an empty category — named as such,
+                    # as the Playwright engine names it.
+                    logger.error("PARSER DRIFT: the page links to %d product(s) "
+                                 "and the parser extracted 0. Saved what the "
+                                 "browser saw to %s and %s.", linked,
+                                 debug_html, debug_png)
+                    stop_reason = stop_reason_for(load_failed=False,
+                                                  blocked_by=None,
+                                                  parse_drift=True)
+                    break
                 logger.warning("0 products parsed — saved what the browser actually saw to "
                                 "%s and %s.", debug_html, debug_png)
 

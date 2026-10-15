@@ -738,7 +738,7 @@ def _kwonly_only(fn) -> bool:
     argument goes wrong quietly: tokopedia-scraper's classify(html, status,
     url) was called as classify(html, url=...) by two of its three engines
     and both crashed on their FIRST fetch, invisible to import, --help,
-    compileall and 400+ green assertions (CLAUDE.md §17). Keyword-only
+    compileall and 400+ green assertions. Keyword-only
     parameters make that shape impossible to write.
     """
     import inspect
@@ -1595,7 +1595,7 @@ def check_akamai_s_refusal_page_the_2026_09_11_audit_s_p0(ok: bool) -> bool:
                                                   "cloudflare"))
 
     # The negative half, and the half that matters more: a marker that fires
-    # on a good page is worse than no marker at all (CLAUDE.md §18, where a
+    # on a good page is worse than no marker at all (a sibling repo's
     # bare "akamai" marker made tokopedia-scraper report every served page as
     # blocked). Every real-capture fixture in this suite is checked, not just
     # the one listing sample.
@@ -1607,7 +1607,7 @@ def check_akamai_s_refusal_page_the_2026_09_11_audit_s_p0(ok: bool) -> bool:
 
     # "edgesuite" on its own is an ordinary Akamai ASSET domain. Matching it
     # bare would report a site serving its own images from one as blocked on
-    # every page — the exact shape of the §18 trap. Pinned so a future
+    # every page — the exact shape of the trap above. Pinned so a future
     # broadening of the marker is a decision rather than a surprise.
     ok &= check("a page merely SERVED from an edgesuite asset host is not a "
                 "refusal — only errors.edgesuite.net is",
@@ -2711,8 +2711,8 @@ def check_the_webhook(ok: bool) -> bool:
                 not set(FETCH_FAILURE_STOP_REASONS) & set(COMPLETE_STOP_REASONS))
 
     # stop_reason_for is the one place that names why a page yielded nothing.
-    # Ordered by how much each signal PROVES (CLAUDE.md §17's
-    # classification-order trap), so the specific reason outranks the general.
+    # Ordered by how much each signal PROVES (the classification-order
+    # trap), so the specific reason outranks the general.
     ok &= check("stop_reason_for: a named vendor outranks a bare status — "
                 "'blocked_akamai' says more than 'http_error'",
                 stop_reason_for(load_failed=False, blocked_by="akamai",
@@ -3535,6 +3535,55 @@ def check_naming_and_dead_feature_guards(ok: bool) -> bool:
                 + ("" if not offenders else " -> " + "; ".join(offenders[:4])),
                 not offenders)
 
+    # PRIVATE CITATIONS. The family's working notes are not public, so a
+    # pointer into them ("see <notes file> section N") is a reference no
+    # reader of this repository can follow. State the rule in this repo's own
+    # words instead. The tokens are ASSEMBLED so this file can be scanned like
+    # any other, and every tracked text file is read — the CHANGELOG
+    # included, because released notes are what visitors actually read.
+    _sect = "\u00a7"
+    _private = [
+        "CLAUDE" + ".md",
+        "claude_" + "2scraper",
+        "2scraper_" + "repo_rules",
+        "play" + "book",
+    ]
+    _cite_re = re.compile(re.escape(_sect) + r"\s?[0-9]")
+    try:
+        _tracked = subprocess.run(
+            ["git", "ls-files"], cwd=_root, capture_output=True, text=True,
+            check=True).stdout.split()
+    except (OSError, subprocess.CalledProcessError):
+        # Not a git checkout (a container, a tarball): read what is on disk.
+        _tracked = [os.path.relpath(os.path.join(d, n), _root)
+                    for d, dirs, names in os.walk(_root)
+                    if not any(x in (".git", "__pycache__")
+                               for x in os.path.relpath(d, _root).split(os.sep))
+                    and not os.path.exists(os.path.join(d, "pyvenv.cfg"))
+                    for n in names]
+    _cite_files = [f for f in _tracked
+                   if f.endswith((".py", ".md", ".yml", ".yaml", ".toml",
+                                  ".txt", ".example", ".cfg"))
+                   or os.path.basename(f) in ("Dockerfile", ".gitignore",
+                                              ".dockerignore")]
+    ok &= check(f"the private-citation scan read something "
+                f"({len(_cite_files)} files)", len(_cite_files) > 20)
+    _cites = []
+    for f in _cite_files:
+        try:
+            body = open(os.path.join(_root, f), encoding="utf-8",
+                        errors="replace").read()
+        except OSError:
+            continue
+        for n, line in enumerate(body.splitlines(), 1):
+            if _cite_re.search(line) or any(t.lower() in line.lower()
+                                            for t in _private):
+                _cites.append(f"{f}:{n}")
+    ok &= check("no shipped file cites the family's private notes or a "
+                "bare section number"
+                + ("" if not _cites else " -> " + "; ".join(_cites[:6])),
+                not _cites)
+
     ok &= check("solve_recaptcha no longer takes use_antidetect",
                 "use_antidetect" not in inspect.signature(_cs.solve_recaptcha).parameters)
     ok &= check("the placeholder local-API endpoint constant is gone",
@@ -3645,14 +3694,23 @@ def check_canary_yml_the_exit_code_table_it_prints_must_be(ok: bool) -> bool:
                      if not ln.lstrip().startswith("#")]
         ok &= check("the canary never puts the proxy credential in argv — it "
                     "goes through the environment env_config.py already "
-                    "reads (CLAUDE.md §3, §11)",
+                    "reads",
                     not any("--proxy" in ln for ln in _cwf_code)
                     and "FARFETCH_PROXY: ${{ secrets.FARFETCH_PROXY }}" in _cwf)
-        ok &= check("the proxy-backed job SKIPS rather than fails when the "
-                    "secret is absent — a check that is red every morning is "
-                    "a check nobody reads",
+        # Reversed on 2026-10-15. It used to SKIP green without the secret,
+        # and the no-proxy job was refused on every run, so for a month the
+        # badge was green while no run reached the site. A canary that never
+        # reaches the site must say so in red, naming what is missing.
+        ok &= check("the proxy-backed job FAILS with an error naming "
+                    "FARFETCH_PROXY when the secret is absent, rather than "
+                    "skipping green",
                     "HAVE_PROXY: ${{ secrets.FARFETCH_PROXY != '' }}" in _cwf
-                    and "::notice::Skipped" in _cwf)
+                    and "::error::The FARFETCH_PROXY secret is not set" in _cwf
+                    and "::notice::Skipped" not in _cwf)
+        ok &= check("only the job documented as 'datacentre refusal expected' "
+                    "may excuse a block (--allow-block appears once)",
+                    sum(1 for ln in _cwf_code if "--allow-block" in ln) == 1
+                    and "datacentre refusal expected" in _cwf)
         ok &= check("BOTH canary jobs exercise pagination (--pages 3): with "
                     "one page a dead next-link stays invisible, which is how "
                     "the silent-single-page bug survived once already",
@@ -3749,7 +3807,7 @@ def check_the_dockerfile_s_copy_list_vs_the_entrypoint_s_i(ok: bool) -> bool:
     # and no stray .env — but it falls behind, and CI is the only thing that
     # builds the image. Every repo in this family has shipped an image that
     # died with ModuleNotFoundError on every invocation, --help included,
-    # because one module was missing from that list (CLAUDE.md §10). This
+    # because one module was missing from that list. This
     # check needs no Docker, and it is what catches a module added today.
     _dockerfile = open(os.path.join(_repo_root, "Dockerfile"),
                        encoding="utf-8").read()
@@ -4017,19 +4075,411 @@ def check_scraper_api_waitfor_object_and_http_code(ok):
     return ok
 
 
+def _load_engine_with_fake_driver(filename: str, fakes: dict):
+    """Import an engine from disk with its driver library replaced by stubs.
+
+    Runs whether or not the real driver is installed, so the behaviour below
+    is checked in the core-only CI job too rather than skipping exactly where
+    nobody looks. sys.modules is restored afterwards.
+    """
+    import importlib.util as _ilu
+    import types as _types
+    saved = {k: sys.modules.get(k) for k in fakes}
+    try:
+        for name, attrs in fakes.items():
+            mod = _types.ModuleType(name)
+            for k, v in attrs.items():
+                setattr(mod, k, v)
+            sys.modules[name] = mod
+        spec = _ilu.spec_from_file_location(
+            "_fake_" + filename[:-3], os.path.join(_repo_root, filename))
+        mod = _ilu.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        return mod
+    finally:
+        for k, v in saved.items():
+            if v is None:
+                sys.modules.pop(k, None)
+            else:
+                sys.modules[k] = v
+
+
+def check_audit_2026_10_14_contract_fixes(ok: bool) -> bool:
+    """output, captcha budget, status parity, CDP connect (2026-10-14)"""
+    import output_writer as _ow
+    import env_config
+    from captcha_solver import CaptchaChallenge as _CC
+
+    # ---- atomic writes: a failed write leaves the previous file whole ------
+    with tempfile.TemporaryDirectory() as d:
+        target = os.path.join(d, "out.json")
+        good = [Product(url="https://x/a-item-1.aspx", sku="1", title="ok")]
+        _ow.write_json(good, target)
+        before = open(target, encoding="utf-8").read()
+
+        class _Boom(Exception):
+            pass
+
+        real_dump = _ow.json.dump
+
+        def _half_dump(obj, f, **kw):
+            f.write("[{\"truncated\": ")
+            raise _Boom()
+        _ow.json.dump = _half_dump
+        try:
+            try:
+                _ow.write_json(good * 3, target)
+            except _Boom:
+                pass
+        finally:
+            _ow.json.dump = real_dump
+        after = open(target, encoding="utf-8").read()
+        ok &= check("atomic write: a json.dump that fails part-way leaves the "
+                    "previous good file byte-identical", after == before)
+        ok &= check("atomic write: no temp file is left beside the target",
+                    sorted(os.listdir(d)) == ["out.json"])
+
+        # Modes: a NEW file gets 0o666 & ~umask, exactly what open() gives;
+        # an EXISTING file keeps its own mode. Three umasks, because the
+        # default 022 is the one value where every wrong rule agrees.
+        modes = {}
+        for um in (0o022, 0o002, 0o077):
+            old = os.umask(um)
+            try:
+                fresh = os.path.join(d, f"m{um:o}.json")
+                _ow.write_json(good, fresh)
+                modes[um] = os.stat(fresh).st_mode & 0o777
+            finally:
+                os.umask(old)
+        ok &= check(f"atomic write: a new file's mode honours the umask "
+                    f"({ {oct(k): oct(v) for k, v in modes.items()} })",
+                    modes == {0o022: 0o644, 0o002: 0o664, 0o077: 0o600})
+        os.chmod(target, 0o640)
+        _ow.write_json(good, target)
+        ok &= check("atomic write: an existing file keeps its own mode (0640)",
+                    os.stat(target).st_mode & 0o777 == 0o640)
+        _ow.write_run_meta(os.path.join(d, "out"), {"status": "complete"})
+        ok &= check("atomic write: the sidecar goes through the same writer",
+                    json.load(open(os.path.join(d, "out.meta.json"))) ==
+                    {"status": "complete"})
+
+    # ---- CSV formula neutralisation ----------------------------------------
+    with tempfile.TemporaryDirectory() as d:
+        prefix = os.path.join(d, "f")
+        rows = [Product(url="https://x/a-item-1.aspx", sku="1",
+                        title='=HYPERLINK("http://evil")', brand="+cmd",
+                        category="@SUM(1)", price=-5.0),
+                Product(url="https://x/a-item-2.aspx", sku="2",
+                        title="Plain title", brand="-dash", price=10.0)]
+        with contextlib.redirect_stdout(io.StringIO()):
+            rc = finish_run(rows, prefix, "both", False, blocked=False,
+                            stop_reason="completed", pages_requested=1,
+                            pages_completed=1, start_url="https://x/",
+                            final_url="https://x/")
+        with open(prefix + ".csv", newline="", encoding="utf-8") as fh:
+            got = list(csv.DictReader(fh))
+        js = json.load(open(prefix + ".json", encoding="utf-8"))
+        meta = json.load(open(prefix + ".meta.json", encoding="utf-8"))
+        ok &= check("CSV: formula-shaped strings get a leading apostrophe",
+                    rc == 0 and got[0]["title"].startswith("'=")
+                    and got[0]["brand"] == "'+cmd"
+                    and got[0]["category"] == "'@SUM(1)"
+                    and got[1]["brand"] == "'-dash")
+        ok &= check("CSV: numbers are not escaped (a negative stays a number)",
+                    got[0]["price"] == "-5.0")
+        ok &= check("CSV: an ordinary string is untouched",
+                    got[1]["title"] == "Plain title")
+        ok &= check("JSON keeps the site's bytes — escaping is CSV-only",
+                    js[0]["title"] == '=HYPERLINK("http://evil")')
+        ok &= check("sidecar records csv_cells_escaped (4 here)",
+                    meta.get("csv_cells_escaped") == 4)
+
+    # ---- the paid-solve budget ---------------------------------------------
+    # Every call site, in every engine, read off DISK (not behind an import
+    # that skips where the driver is absent) passes the page's budget.
+    for eng in ("playwright_scraper.py", "puppeteer_scraper.py",
+                "selenium_scraper.py"):
+        tree = _ast.parse(open(os.path.join(_repo_root, eng),
+                               encoding="utf-8").read())
+        calls = [n for n in _ast.walk(tree) if isinstance(n, _ast.Call)
+                 and getattr(n.func, "id", None) == "handle_captcha_if_present"]
+        ok &= check(f"{eng}: every handle_captcha_if_present call passes a "
+                    f"budget= ({len(calls)} call site(s))",
+                    calls and all(any(k.arg == "budget" for k in c.keywords)
+                                  for c in calls))
+
+    # And behaviour: a blocked page, a 3-exit pool, --solve-captcha always.
+    # Before the budget this bought one solve per exit — 3 for one page.
+    class _PWErr(Exception):
+        pass
+
+    class _PWTimeout(_PWErr):
+        pass
+
+    pw = _load_engine_with_fake_driver("playwright_scraper.py", {
+        "playwright": {},
+        "playwright.sync_api": {"sync_playwright": None, "Error": _PWErr,
+                                "TimeoutError": _PWTimeout}})
+    bought = []
+
+    class _Resp:
+        def __init__(self, status):
+            self.status = status
+
+    class _Page:
+        url = "https://www.farfetch.com/shopping/kids/items.aspx"
+
+        def goto(self, *a, **k):
+            return _Resp(200)
+
+        def content(self):
+            return SAMPLE_AKAMAI_DENIED_DOM_HTML
+
+        def evaluate(self, *a, **k):
+            return None
+
+        def query_selector_all(self, *a):
+            return []
+
+        def wait_for_function(self, *a, **k):
+            raise _PWTimeout("no products")
+
+        def wait_for_timeout(self, *a):
+            return None
+
+        def reload(self, *a, **k):
+            return None
+
+        def screenshot(self, *a, **k):
+            return None
+
+    class _Session:
+        page = _Page()
+
+        def relaunch(self):
+            return None
+
+    from proxy_pool import ProxyPool as _PP
+    _chal = _CC(kind="recaptcha_v2", sitekey="6Lx", page_url=_Page.url)
+    pw.detect_recaptcha_v3 = lambda html, url: _chal
+    pw.detect_recaptcha_in_page = lambda *a, **k: None
+    pw.reconcile_detections = lambda a, b: a or b
+    pw.solve_recaptcha = lambda *a, **k: bought.append(1) or "tok"
+    with tempfile.TemporaryDirectory() as d:
+        _a = argparse.Namespace(
+            pages=1, retries=1, retry_delay=0, proxy_block_retries=2,
+            solve_captcha="always", twocaptcha_key="offline-test",
+            captcha_api="v2", min_score=0.7, dump_html=None,
+            out=os.path.join(d, "o"), category=None)
+        _pool = _PP(["http://h1:1", "http://h2:2", "http://h3:3"])
+        with contextlib.redirect_stdout(io.StringIO()), \
+                contextlib.redirect_stderr(io.StringIO()):
+            _out = pw._fetch_one_page(_Session(), _a, _pool, 1, _Page.url)
+    ok &= check(f"captcha budget: a blocked page retried from 3 exits buys "
+                f"ONE solve, not one per exit (bought {len(bought)})",
+                len(bought) == 1 and _out.blocked_by is not None)
+
+    # ---- CDP connect: a refused endpoint is exit 5 with no credential ------
+    # Assembled so the credential scan does not read the fixture as a leak.
+    _secret = "ws://acct-zone-x:" + "hunter2pw" + "@cb.example.invalid:9222"
+
+    class _Chromium:
+        def connect_over_cdp(self, *a, **k):
+            raise _PWErr(f"BrowserType.connect_over_cdp: {_secret} 401 Unauthorized\n"
+                         f"Call log:\n  - <ws connecting> {_secret}\n"
+                         f"  - <ws error> {_secret} 401\n  - {_secret}")
+
+    class _PW:
+        chromium = _Chromium()
+    try:
+        pw._connect_remote(_PW(), argparse.Namespace(cdp_endpoint=_secret))
+        raised = None
+    except Exception as e:  # noqa: BLE001
+        raised = e
+    ok &= check("CDP connect: a refused endpoint raises CdpConnectError, "
+                "not the driver's own exception",
+                isinstance(raised, pw.CdpConnectError))
+    ok &= check("CDP connect: the error text carries no credential, though "
+                "the driver repeated the endpoint three times",
+                raised is not None and "hunter2pw" not in str(raised)
+                and "acct-zone-x" not in str(raised))
+    ok &= check("CDP connect: a 401 is explained as expired/wrong credentials",
+                raised is not None and "401" in str(raised))
+    from proxy_pool import redact_url_credentials as _ruc
+    ok &= check("redact_url_credentials masks EVERY occurrence, keeps the host",
+                _ruc(f"{_secret} and again {_secret}").count("***:***@cb.example."
+                                                            "invalid:9222") == 2
+                and "hunter2pw" not in _ruc(f"{_secret} {_secret}"))
+
+    # ---- env placeholders ---------------------------------------------------
+    _envs = {"FARFETCH_CDP_ENDPOINT":
+             "ws://{login}-zone-scraping_browser-country-xx-pid-{profileId}:"
+             "{password}" + "@cb.2captcha.com:9222",
+             "FARFETCH_PROXY": "http://{user}:{password}" + "@xx.proxy.example:2334",
+             "FARFETCH_URL": ""}
+    _saved_env = {k: os.environ.get(k) for k in _envs}
+    _log = io.StringIO()
+    _h = logging.StreamHandler(_log)
+    env_config.logger.addHandler(_h)
+    try:
+        os.environ.update(_envs)
+        _vals = {k: env_config.env_value(k) for k in _envs}
+    finally:
+        env_config.logger.removeHandler(_h)
+        for k, v in _saved_env.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+    ok &= check("env: a value still holding a {…} slot from the documented "
+                "format reads as unset", _vals["FARFETCH_CDP_ENDPOINT"] is None
+                and _vals["FARFETCH_PROXY"] is None)
+    ok &= check("env: the warning names the slot, never the value",
+                "{login}" in _log.getvalue() and "zone-scraping" not in _log.getvalue())
+    ok &= check("env: an EMPTY value is unset without a placeholder warning",
+                _vals["FARFETCH_URL"] is None
+                and "FARFETCH_URL" not in _log.getvalue())
+
+    # ---- the credential scan: relative exclusions, data files, no empty pass
+    import importlib.util as _ilu2
+    _spec = _ilu2.spec_from_file_location(
+        "_ci_checks_probe", os.path.join(_repo_root, ".github", "ci_checks.py"))
+    if os.path.exists(_spec.origin):
+        _cc = _ilu2.module_from_spec(_spec)
+        _spec.loader.exec_module(_cc)
+        _fake_key = "ab" * 16
+        with tempfile.TemporaryDirectory() as d:
+            # A clone living under a directory called `venv`.
+            root = os.path.join(d, "venv", "clone")
+            os.makedirs(os.path.join(root, "tests"))
+            open(os.path.join(root, "a.py"), "w").write("x = 1\n")
+            open(os.path.join(root, "tests", "fixture.json"), "w").write(
+                '{\\"apiKey\\": \\"' + _fake_key + '\\"}\n')
+            open(os.path.join(root, ".env.bak"), "w").write(
+                "TWOCAPTCHA_KEY=" + _fake_key + "\n")
+            _real_repo = _cc.REPO
+            _cc.REPO = _cc.Path(root)
+            try:
+                with contextlib.redirect_stdout(io.StringIO()):
+                    _fails = _cc.secret_check()
+                for n in os.listdir(root):
+                    if n != "a.py":
+                        p2 = os.path.join(root, n)
+                        (os.remove(p2) if os.path.isfile(p2)
+                         else __import__("shutil").rmtree(p2))
+                os.remove(os.path.join(root, "a.py"))
+                with contextlib.redirect_stdout(io.StringIO()):
+                    _empty = _cc.secret_check()
+            finally:
+                _cc.REPO = _real_repo
+        ok &= check("credential scan: a clone under a directory named `venv` "
+                    "is still scanned, and a key in a JSON fixture is found",
+                    any("fixture.json" in f for f in _fails))
+        ok &= check("credential scan: a renamed .env backup is read",
+                    any(".env.bak" in f for f in _fails))
+        ok &= check("credential scan: scanning 0 files is a failure, not "
+                    "'nothing credential-shaped'", bool(_empty))
+    else:
+        _skips.append("credential-scan checks (no .github/ in this tree)")
+
+    # ---- currency: never a defaulted USD on the DOM fallback ---------------
+    # Every shape _PRICE_RE accepts carries a symbol or an ISO code today, so
+    # the default was reachable only through a price whose currency is not
+    # recognised. Forced here: a tile price the reader could not attribute
+    # must reach the row as None, not as a guessed "USD".
+    import product_parser as _pp
+    _tile = ('<html><body><div><a href="/shopping/kids/x-item-12345678.aspx">'
+             '<img alt="Plain tee">{}</a></div></body></html>')
+    _real_prices_in = _pp._prices_in
+    _pp._prices_in = lambda text: ([120.0], None)
+    try:
+        _none = _pp.parse_products(_tile.format("120 €"),
+                                   "https://www.farfetch.com/shopping/kids/items.aspx")
+    finally:
+        _pp._prices_in = _real_prices_in
+    _eur = _pp.parse_products(_tile.format("120 €"),
+                              "https://www.farfetch.com/shopping/kids/items.aspx")
+    ok &= check("DOM fallback: a price whose currency is not stated yields "
+                "currency None, not a defaulted USD",
+                len(_none) == 1 and _none[0].price == 120.0
+                and _none[0].currency is None)
+    ok &= check("DOM fallback: a stated symbol still gives its currency (EUR)",
+                len(_eur) == 1 and _eur[0].currency == "EUR")
+
+    # ---- mirror parity: HTTP 403 with an unrecognised body is exit 5 -------
+    import asyncio as _asyncio
+
+    class _PPage:
+        url = "https://www.farfetch.com/shopping/kids/items.aspx"
+
+        async def goto(self, *a, **k):
+            return _Resp(403)
+
+        async def content(self):
+            return "<html><body>Something went wrong</body></html>"
+
+        async def evaluate(self, *a, **k):
+            return None
+
+        async def waitForFunction(self, *a, **k):
+            raise RuntimeError("timeout")
+
+        async def screenshot(self, *a, **k):
+            return None
+
+        async def setUserAgent(self, *a):
+            return None
+
+        async def close(self):
+            return None
+
+    class _PBrowser:
+        async def pages(self):
+            return [_PPage()]
+
+        async def version(self):
+            return "HeadlessChrome/124.0.0.0"
+
+        async def close(self):
+            return None
+
+    async def _launch(**k):
+        return _PBrowser()
+
+    async def _connect(**k):
+        raise RuntimeError("unused")
+    pp = _load_engine_with_fake_driver("puppeteer_scraper.py", {
+        "pyppeteer": {"launch": _launch, "connect": _connect}})
+    with tempfile.TemporaryDirectory() as d:
+        _pa = argparse.Namespace(
+            url=_PPage.url, pages=1, retries=1, retry_delay=0, delay=0,
+            headless=True, proxy=None, cdp_endpoint=None,
+            solve_captcha="when-blocked", twocaptcha_key=None,
+            captcha_api="v2", min_score=0.7, out=os.path.join(d, "o"),
+            format="json", allow_empty=False, category=None, webhook=None)
+        with contextlib.redirect_stdout(io.StringIO()), \
+                contextlib.redirect_stderr(io.StringIO()):
+            _rc = _asyncio.run(pp.scrape(_pa))
+    ok &= check(f"pyppeteer: HTTP 403 with an unrecognised body is exit 5 "
+                f"(content never obtained), as in Playwright — not 4 (got {_rc})",
+                _rc == 5)
+    return ok
+
+
 def main() -> int:
     ok = True
 
     # Checks that could not run because an optional engine library is absent.
     # Reported at the end: a suite that silently skips part of itself and still
     # says "all passed" is the same defect as code that reports success without
-    # checking that what it wanted actually happened.
-    _skips = []
+    # checking that what it wanted actually happened. The list is the
+    # MODULE-LEVEL `_skips` the section functions append to — a local of the
+    # same name here once shadowed it, so the report always printed empty.
     # Which engine LIBRARIES were absent, as names rather than prose. The
     # engine-smoke CI job runs one venv per engine and has to assert that THIS
     # engine did not skip while the other two did — which a free-text line
-    # cannot answer. Printed as one machine-readable line at the end.
-    _skipped_engines = set()
+    # cannot answer. Printed as one machine-readable line at the end, from the
+    # module-level set (never rebound here — see above).
 
     ok &= check("parser extracts exactly 2 real products (junk link excluded)", len(products) == 2)
     ok &= check("first product has correct title/price",
@@ -4228,6 +4678,21 @@ def main() -> int:
     ok = check_canary_yml_the_exit_code_table_it_prints_must_be(ok)
     ok = check_numeric_flags_are_range_checked_in_every_cli(ok)
     ok = check_the_dockerfile_s_copy_list_vs_the_entrypoint_s_i(ok)
+    ok = check_audit_2026_10_14_contract_fixes(ok)
+
+    # The report below is only worth something if it reflects what the
+    # sections recorded: an engine whose driver library is absent must appear
+    # in it. A local rebinding of `_skips`/`_skipped_engines` inside main()
+    # once made this line print empty whatever happened, and the CI job that
+    # reads it could then never see a skipped engine.
+    import importlib.util as _ilu
+    _absent = {name for name, lib in (("playwright", "playwright"),
+                                      ("pyppeteer", "pyppeteer"),
+                                      ("selenium", "selenium"))
+               if _ilu.find_spec(lib) is None}
+    ok &= check("skip report: every engine whose driver is absent is listed in "
+                "SKIPPED_ENGINES (the report reads the module-level record)",
+                _absent <= _skipped_engines)
 
     print()
     if _skips:

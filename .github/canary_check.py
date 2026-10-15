@@ -14,9 +14,9 @@ canary runs Playwright, which cannot return it. A table nobody can execute
 drifts silently; this one is imported by the offline suite, which asserts it
 against output_writer's constants.
 
-Two callers, deliberately the same implementation (CLAUDE.md §17: one
-implementation invoked from both CI and the offline suite, not a workflow
-reimplementing a narrower copy of a shipped script):
+Two callers, deliberately the same implementation (one implementation
+invoked from both CI and the offline suite, not a workflow reimplementing a
+narrower copy of a shipped script):
 
     python3 .github/canary_check.py --exit-code 3 --allow-block
     python3 .github/canary_check.py --data canary_run
@@ -24,7 +24,7 @@ reimplementing a narrower copy of a shipped script):
 `--allow-block` is what separates the two canary signals. From a GitHub
 runner — a datacentre address — Akamai refusing us says something about the
 runner's IP, not about Farfetch or about this code, and a check that is red
-every morning teaches everyone to ignore checks (CLAUDE.md §11). So the free
+every morning teaches everyone to ignore checks. So the free
 no-proxy signal treats a block as a SKIP and stays green, while the
 proxy-backed signal treats the same code as a failure, because from a
 residential exit a block IS news.
@@ -85,7 +85,7 @@ EXIT_MEANINGS = {
 # run, so three pages clear this comfortably. Deliberately far below the real
 # figure rather than tracking it: a floor guards against a near-empty render,
 # and a threshold that tracks a number which legitimately varies between runs
-# is a check that goes stale on its own (CLAUDE.md §17, check 4).
+# is a check that goes stale on its own.
 PAGES_REQUESTED = 3
 MIN_PRODUCTS = 120
 MIN_PRICED_SHARE = 0.9
@@ -102,10 +102,9 @@ def check_exit_code(code: int, allow_block: bool) -> int:
         print(f"::notice::{meaning} This canary runs from a GitHub runner, "
               f"which is a datacentre address, and no proxy secret is set — so "
               f"this says the runner's IP was refused, NOT that the site or "
-              f"this code changed. Reported as a skip rather than a failure, "
-              f"because a check that is red every morning is a check nobody "
-              f"reads. Set the FARFETCH_PROXY secret for a signal that can "
-              f"tell the two apart.")
+              f"this code changed. This job is documented as 'datacentre "
+              f"refusal expected'; the production-like job, which needs the "
+              f"FARFETCH_PROXY secret, is the one that tests real data.")
         return 0
 
     if not fails:

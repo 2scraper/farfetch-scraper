@@ -8,7 +8,75 @@ a promise that every flag and exit code is contractually frozen.
 
 ## [Unreleased]
 
+> **Behaviour changes.** (1) The pyppeteer and Selenium engines now report an
+> HTTP 4xx/5xx page whose body names no known bot-check vendor as exit 5
+> (content never obtained) instead of exit 4 (empty category), and a page that
+> links to products but parses to none as exit 5 (`stop_reason: parse_drift`,
+> exit 6 if earlier pages were gathered) — the same codes the Playwright
+> engine already gave. (2) The CSV output now prefixes a string cell that
+> begins with `=`, `+`, `-`, `@`, a tab or a line break with an apostrophe,
+> so a spreadsheet reads it as text; JSON is unchanged and the sidecar
+> records how many cells were escaped as `csv_cells_escaped`. (3) A refused
+> `--cdp-endpoint` connect now exits 5 with a one-line, credential-free
+> message instead of a traceback (exit 1).
+> (4) The canary's production-like job now FAILS with an error naming
+> `FARFETCH_PROXY` when that secret is absent, instead of skipping green. The
+> no-proxy job was refused (exit 3) on every one of the last 10 runs, so for a
+> month the badge was green while no run reached the site. The canary will
+> stay red until the secret is set.
+
 ### Fixed
+
+- **One paid captcha solve per page, across every retry and exit rotation.**
+  The Playwright engine called its captcha handler once per block-retry with
+  nothing counting purchases, so with a 3-exit proxy pool and
+  `--solve-captcha always` one blocked page bought three solves (reproduced
+  with the solver stubbed). A per-page `SolveBudget` is now checked before
+  every purchase in all three engines and is not reset by a rotation.
+- **Output files are written atomically.** `write_json`, `write_csv` and the
+  `.meta.json` sidecar went through `open(path, "w")`, which truncates first:
+  a `json.dump` failing part-way turned a 433-byte good file into 12 bytes of
+  invalid JSON. They now write a temp file beside the target, fsync it and
+  rename it over the target. A new file gets the same mode `open()` would
+  have given it (`0o666 & ~umask`); an existing file keeps its own.
+- **A failed `--cdp-endpoint` connect no longer prints the endpoint.**
+  Playwright's connect error repeats the endpoint, `user:pass` included, in
+  its message and call log, and nothing caught it. It is now caught, every
+  occurrence redacted, a 401 explained as wrong or expired credentials, and a
+  `profile_locked`/HTTP 500 answer retried up to three times, 3 s apart. The
+  pyppeteer connect is bounded at 30 s (it had no timeout).
+- **pyppeteer keeps the HTTP status of the page it loaded, and Selenium reads
+  it from the browser** (`PerformanceNavigationTiming.responseStatus`), so the
+  mirrors classify an error page the way Playwright does. Both now also name
+  parser drift.
+- **The suite's skip report printed empty whatever happened.** `main()`
+  rebound `_skips` and `_skipped_engines` locally, shadowing the records the
+  sections wrote to, so the `SKIPPED_ENGINES:` line the engine-smoke CI job
+  reads could never name a skipped engine. A check now asserts every engine
+  whose driver is absent is listed.
+- **The credential scan reported clean after reading nothing.** Exclusions
+  were tested against the ABSOLUTE path, so a clone under any directory
+  called `venv` scanned 0 files and printed "nothing credential-shaped". They
+  are now tested on the path relative to the repo, a scan of 0 files fails,
+  and JSON/CSV/HTML/TOML/CFG files and renamed `.env.*` backups are read too.
+- **A value still holding a `{…}` slot from the documented format** (the
+  Scraping Browser endpoint or proxy shape in `.env.example`) now reads as
+  unset instead of being sent as a real credential, and an empty value no
+  longer logs a "still set to the placeholder" warning.
+- **The DOM fallback no longer defaults a missing currency to USD.** A tile
+  price whose currency the reader could not attribute was written as `USD`;
+  it is now `null`. Currency comes only from structured data, a written ISO
+  code, or a prefixed or bare symbol on the tile. Every price shape the
+  fallback recognises today carries one of those, so current output is
+  unchanged; the default could only have fired on an unrecognised shape.
+- `.gitignore` covers the capture shapes the engines write themselves
+  (`X.page2`, `X.page3` from `--dump-html`), a bare `.html` at the repo root,
+  and `live/`, `captures/`, `dumps/`, `scratch/`.
+- The README exit-code table and the `stop_reason_for` docstring said parser
+  drift exits 4; it exits 5 (6 with earlier pages gathered).
+- Comments, docs and the v0.4.3 notes no longer point at private notes or
+  bare section numbers that no reader of this repository can open; a suite
+  check keeps them out.
 
 - **Scraper API: `waitFor` is now sent as a JSON object.** Measured
   2026-09-23 against `scraper.2captcha.com/tasks/sync`: the JSON-encoded
@@ -372,7 +440,7 @@ PR. Of P2, three of four.
 
 - Offline suite: **319 checks**, up from 232; `pytest` reports 321 results. New coverage includes the
   Dockerfile's COPY list against the entrypoint's import graph — a check
-  CLAUDE.md §10 calls for after every repo in this family shipped an image
+  worth having after every repo in this family shipped an image
   that died on every invocation, and which did not exist here. It failed on
   its first run, catching a module added in this same batch.
 
@@ -382,9 +450,9 @@ PR. Of P2, three of four.
 
 - **`fingerprint_client.py` could not read the key from `.env`.** `--key`
   defaulted to `os.environ.get("TWOCAPTCHA_KEY")` and only that, so a key put
-  in `.env` — exactly as §3, the README and `.env.example` instruct — worked
+  in `.env` — exactly as the README and `.env.example` instruct — worked
   for every engine and failed HERE with "No API key". A documented mechanism
-  not applied on one path, which is the shape of half the defects §16 lists.
+  not applied on one path.
 
   It now reads through `env_config.env_value`, calling `load_env()` itself
   because this is a standalone entry point that no engine has necessarily run
@@ -396,7 +464,7 @@ PR. Of P2, three of four.
   "still set to the placeholder from .env.example" instead.
 
   Found on a sibling repo's first live `--fingerprint` run, then checked
-  across the family before patching, per §16: five repos had it and one had
+  across the family before patching: five repos had it and one had
   already fixed it. Pinned by a check verified to fail on the old code —
   including that the help string does not interpolate its default, which is
   one substring away from printing a live credential to anyone who types

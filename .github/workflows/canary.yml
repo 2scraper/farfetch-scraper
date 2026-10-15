@@ -14,21 +14,22 @@ name: canary
 # listed a code (124) no engine returns and had no entry for the codes they
 # do. A check that is red every morning is a check everyone learns to ignore.
 #
-#   reachability-no-proxy  — free, no secret, every day. Answers "can an
-#                            ordinary browser on a datacentre IP still get
-#                            this page, and does the parser still work on it?"
-#                            A BLOCK here is reported as a skip, not a
-#                            failure: it says something about the runner's
-#                            address, not about Farfetch. Anything else —
+#   reachability-no-proxy  — free, no secret, every day, and DOCUMENTED AS
+#                            "datacentre refusal expected": farfetch.com
+#                            refused the GitHub runner (exit 3) on every one
+#                            of the last 10 runs before 2026-10-15. A block
+#                            here is a notice, not a failure. Anything else —
 #                            0 products, a fetch failure, a partial run —
-#                            still fails, because those are real news.
+#                            still fails. This job is NOT the data test.
 #
-#   production-like        — the authoritative signal. Runs only when the
-#                            FARFETCH_PROXY secret is set, and is strict about
-#                            everything including a block, because from a
-#                            residential exit a block IS news. Skips with a
-#                            notice when the secret is absent (CLAUDE.md §11:
-#                            a canary that cannot pass must SKIP, not fail).
+#   production-like        — THE data test. Needs the FARFETCH_PROXY secret
+#                            (a residential exit) and is strict about
+#                            everything, a block included. When the secret is
+#                            absent the job FAILS with an error naming it:
+#                            a canary that never reaches the site must not
+#                            show green. Until 2026-10-15 it skipped green
+#                            instead, so the badge was green for a month
+#                            while no run reached the site.
 #
 # The proxy secret is passed through the ENVIRONMENT, never as a --proxy
 # argument. env_config.py already reads FARFETCH_PROXY, an unset secret
@@ -46,7 +47,7 @@ on:
 
 jobs:
   reachability-no-proxy:
-    name: reachability (no proxy, datacentre IP)
+    name: reachability (no proxy, datacentre refusal expected)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
@@ -131,9 +132,15 @@ jobs:
     env:
       HAVE_PROXY: ${{ secrets.FARFETCH_PROXY != '' }}
     steps:
-      - name: Explain the skip
+      - name: Require the proxy secret
+        # Fails, not skips: without a residential exit this canary cannot
+        # reach the site, and a job that never reaches the site must not
+        # end green. The reachability job is no substitute for this one —
+        # from a datacentre address it is refused every day.
         if: env.HAVE_PROXY != 'true'
-        run: echo "::notice::Skipped - no FARFETCH_PROXY secret is set, so there is no residential exit to run from. farfetch.com refuses GitHub's datacentre addresses, so running this job without one would be red every morning while saying nothing about the site. The reachability job above still runs for free. Set the secret to turn this signal on; it is read from the environment by env_config.py and never reaches a command line."
+        run: |
+          echo "::error::The FARFETCH_PROXY secret is not set, so this canary cannot reach farfetch.com: the site refuses GitHub's datacentre addresses. Add a residential proxy URL as the repository secret FARFETCH_PROXY (read from the environment by env_config.py, never put on a command line)."
+          exit 1
 
       - uses: actions/checkout@v7
         if: env.HAVE_PROXY == 'true'
@@ -157,8 +164,8 @@ jobs:
         env:
           # Read by env_config.py, exactly as a local .env would be. NOT
           # passed as --proxy: a credential in argv is readable by anything
-          # that can run `ps` and is the rule this repo states in §3 of its
-          # own docs.
+          # that can run `ps`, which is why the README tells users to keep
+          # credentials in .env.
           FARFETCH_PROXY: ${{ secrets.FARFETCH_PROXY }}
         run: |
           set +e

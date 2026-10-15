@@ -589,6 +589,37 @@ def solve_recaptcha(challenge: CaptchaChallenge, twocaptcha_api_key: Optional[st
     return solver(twocaptcha_api_key, challenge, min_score=min_score)
 
 
+# How many paid solves one page may buy, across every attempt and every exit
+# rotation. One: a challenge that survives a solved token is not one this run
+# can pass, and a second solve is a second charge for the same answer.
+SOLVES_PER_PAGE = 1
+
+
+class SolveBudget:
+    """The one allowance every paid solve on a page goes through.
+
+    Created once per PAGE, outside the retry and rotation loops, and checked
+    BEFORE each purchase. Before it existed the Playwright engine called its
+    captcha handler once per block-retry with nothing counting, so with a
+    3-exit proxy pool one page bought three solves (reproduced with the
+    solver stubbed). It deliberately does NOT reset on rotation: a fresh exit
+    is a reason to re-fetch, not a fresh allowance to spend.
+    """
+
+    def __init__(self, limit: int = SOLVES_PER_PAGE):
+        self.limit = limit
+        self.spent = 0
+
+    def take(self) -> bool:
+        """Reserve one solve. False, with a log line, once the page is spent."""
+        if self.spent >= self.limit:
+            logger.info("Not buying another solve for this page: %d of %d "
+                        "already bought.", self.spent, self.limit)
+            return False
+        self.spent += 1
+        return True
+
+
 INJECT_TOKEN_JS = """
 (token) => {
   let el = document.getElementById('g-recaptcha-response');

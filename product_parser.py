@@ -230,7 +230,7 @@ _DENY_TITLE_RE = re.compile(r"<title[^>]*>\s*Access Denied\s*</title>", re.I)
 # bare string "edgesuite": edgesuite.net is also an ordinary Akamai asset
 # domain, so a site whose own images are served from it would report every
 # page as blocked. That is the trap tokopedia-scraper fell into with a bare
-# "akamai" marker (see CLAUDE.md §18) — a marker that matches a good page is
+# "akamai" marker — a marker that matches a good page is
 # worse than no marker. "errors.edgesuite.net" appears only on the error page.
 _DENY_ERROR_HOST = "errors.edgesuite.net"
 
@@ -548,7 +548,10 @@ def _parse_css_fallback(html: str, base_url: str, category: Optional[str]) -> Li
             sku=_sku_from_url(full_url),
             title=title,
             price=price,
-            currency=currency or "USD",
+            # Only what the tile itself states (ISO code, prefixed or bare
+            # symbol, via _prices_in). Nothing stated is null — never a
+            # defaulted "USD", which would present a guess as a fact.
+            currency=currency,
             original_price=original_price,
             discount_pct=discount_pct,
             rating=rating,

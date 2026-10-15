@@ -282,8 +282,8 @@ A contract, not decoration — the harness and any pipeline can branch on these.
 | `1` | Unhandled error |
 | `2` | Bad usage |
 | `3` | **Blocked before parsing** — a challenge page, or an outright refusal |
-| `4` | Fetched the page fine, parsed **0 products** |
-| `5` | **Never got the page** — navigation timeout, dead proxy, 4xx/5xx, or a Scraper API error |
+| `4` | Fetched the page fine, parsed **0 products**, and the page links to no products either |
+| `5` | **No content obtained** — navigation timeout, dead proxy, 4xx/5xx, a failed `--cdp-endpoint` connect, a Scraper API error, or a page that links to products and parsed to none (`stop_reason: parse_drift` — a parser problem, not a network one) |
 | `6` | **Partial run** — products written, but the page loop stopped early |
 | `124` | Selenium only: chromedriver could not be **started** within the watchdog |
 

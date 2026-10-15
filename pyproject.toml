@@ -143,11 +143,11 @@ select = ["F", "E9", "B"]
 # narrowed. Fixing it is real work on code that demonstrably runs, and doing
 # it under a deadline is how churn gets introduced into three near-identical
 # files at once. Pinned as a known limitation with its measurement rather
-# than half-guarded (CLAUDE.md §10), so widening the gate is a decision
+# than half-guarded, so widening the gate is a decision
 # someone makes deliberately.
 #
 # smoke_test.py is excluded entirely: it is one long function that rebinds
-# loop variables on purpose, and §10 says not to restructure it.
+# loop variables on purpose, and is deliberately not restructured.
 files = [
     "arg_types.py",
     "cli_entry.py",
