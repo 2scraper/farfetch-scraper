@@ -4382,6 +4382,30 @@ def check_audit_2026_10_14_contract_fixes(ok: bool) -> bool:
     else:
         _skips.append("credential-scan checks (no .github/ in this tree)")
 
+    # ---- currency: never a defaulted USD on the DOM fallback ---------------
+    # Every shape _PRICE_RE accepts carries a symbol or an ISO code today, so
+    # the default was reachable only through a price whose currency is not
+    # recognised. Forced here: a tile price the reader could not attribute
+    # must reach the row as None, not as a guessed "USD".
+    import product_parser as _pp
+    _tile = ('<html><body><div><a href="/shopping/kids/x-item-12345678.aspx">'
+             '<img alt="Plain tee">{}</a></div></body></html>')
+    _real_prices_in = _pp._prices_in
+    _pp._prices_in = lambda text: ([120.0], None)
+    try:
+        _none = _pp.parse_products(_tile.format("120 €"),
+                                   "https://www.farfetch.com/shopping/kids/items.aspx")
+    finally:
+        _pp._prices_in = _real_prices_in
+    _eur = _pp.parse_products(_tile.format("120 €"),
+                              "https://www.farfetch.com/shopping/kids/items.aspx")
+    ok &= check("DOM fallback: a price whose currency is not stated yields "
+                "currency None, not a defaulted USD",
+                len(_none) == 1 and _none[0].price == 120.0
+                and _none[0].currency is None)
+    ok &= check("DOM fallback: a stated symbol still gives its currency (EUR)",
+                len(_eur) == 1 and _eur[0].currency == "EUR")
+
     # ---- mirror parity: HTTP 403 with an unrecognised body is exit 5 -------
     import asyncio as _asyncio
 

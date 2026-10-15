@@ -548,7 +548,10 @@ def _parse_css_fallback(html: str, base_url: str, category: Optional[str]) -> Li
             sku=_sku_from_url(full_url),
             title=title,
             price=price,
-            currency=currency or "USD",
+            # Only what the tile itself states (ISO code, prefixed or bare
+            # symbol, via _prices_in). Nothing stated is null — never a
+            # defaulted "USD", which would present a guess as a fact.
+            currency=currency,
             original_price=original_price,
             discount_pct=discount_pct,
             rating=rating,

@@ -63,6 +63,12 @@ a promise that every flag and exit code is contractually frozen.
   Scraping Browser endpoint or proxy shape in `.env.example`) now reads as
   unset instead of being sent as a real credential, and an empty value no
   longer logs a "still set to the placeholder" warning.
+- **The DOM fallback no longer defaults a missing currency to USD.** A tile
+  price whose currency the reader could not attribute was written as `USD`;
+  it is now `null`. Currency comes only from structured data, a written ISO
+  code, or a prefixed or bare symbol on the tile. Every price shape the
+  fallback recognises today carries one of those, so current output is
+  unchanged; the default could only have fired on an unrecognised shape.
 - `.gitignore` covers the capture shapes the engines write themselves
   (`X.page2`, `X.page3` from `--dump-html`), a bare `.html` at the repo root,
   and `live/`, `captures/`, `dumps/`, `scratch/`.
