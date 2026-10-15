@@ -8,6 +8,8 @@ a promise that every flag and exit code is contractually frozen.
 
 ## [Unreleased]
 
+## [0.6.0] — 2026-10-15
+
 > **Behaviour changes.** (1) The pyppeteer and Selenium engines now report an
 > HTTP 4xx/5xx page whose body names no known bot-check vendor as exit 5
 > (content never obtained) instead of exit 4 (empty category), and a page that
@@ -90,22 +92,6 @@ a promise that every flag and exit code is contractually frozen.
   this client. `http_code` (an int) is read now, with `status` kept as a
   fallback only when it is an int.
 
-### Changed
-
-- **README badges use the family's labels**: `licence` (was "License: MIT",
-  rendered "license"), `Python`, `engines` and "runs without an account" in
-  lower case, matching the sibling repos. Order and targets are unchanged;
-  the access badge stays "runs without an account" because this README
-  measures a plain local Chromium on a residential IP returning all 96
-  products with no key, no proxy and no account.
-
-- `SECURITY.md` said this project has no releases or version tags; it has
-  both. "Supported versions" now names the latest release and `main`.
-
-## [0.5.1] — 2026-09-16
-
-### Fixed
-
 - **Eight occurrences of a banned product name shipped in the three
   engines**, including in the `--cdp-endpoint` help text a user reads — it
   offered the endpoint "or any …  browser that exposes a CDP URL", with the
@@ -132,6 +118,18 @@ a promise that every flag and exit code is contractually frozen.
 
   Verified by control: reintroducing the phrase into an engine — in a
   capitalisation the old list would have missed — turns the suite red.
+
+### Changed
+
+- **README badges use the family's labels**: `licence` (was "License: MIT",
+  rendered "license"), `Python`, `engines` and "runs without an account" in
+  lower case, matching the sibling repos. Order and targets are unchanged;
+  the access badge stays "runs without an account" because this README
+  measures a plain local Chromium on a residential IP returning all 96
+  products with no key, no proxy and no account.
+
+- `SECURITY.md` said this project has no releases or version tags; it has
+  both. "Supported versions" now names the latest release and `main`.
 
 ### CI
 
