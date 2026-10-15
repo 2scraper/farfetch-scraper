@@ -3697,11 +3697,20 @@ def check_canary_yml_the_exit_code_table_it_prints_must_be(ok: bool) -> bool:
                     "reads",
                     not any("--proxy" in ln for ln in _cwf_code)
                     and "FARFETCH_PROXY: ${{ secrets.FARFETCH_PROXY }}" in _cwf)
-        ok &= check("the proxy-backed job SKIPS rather than fails when the "
-                    "secret is absent — a check that is red every morning is "
-                    "a check nobody reads",
+        # Reversed on 2026-10-15. It used to SKIP green without the secret,
+        # and the no-proxy job was refused on every run, so for a month the
+        # badge was green while no run reached the site. A canary that never
+        # reaches the site must say so in red, naming what is missing.
+        ok &= check("the proxy-backed job FAILS with an error naming "
+                    "FARFETCH_PROXY when the secret is absent, rather than "
+                    "skipping green",
                     "HAVE_PROXY: ${{ secrets.FARFETCH_PROXY != '' }}" in _cwf
-                    and "::notice::Skipped" in _cwf)
+                    and "::error::The FARFETCH_PROXY secret is not set" in _cwf
+                    and "::notice::Skipped" not in _cwf)
+        ok &= check("only the job documented as 'datacentre refusal expected' "
+                    "may excuse a block (--allow-block appears once)",
+                    sum(1 for ln in _cwf_code if "--allow-block" in ln) == 1
+                    and "datacentre refusal expected" in _cwf)
         ok &= check("BOTH canary jobs exercise pagination (--pages 3): with "
                     "one page a dead next-link stays invisible, which is how "
                     "the silent-single-page bug survived once already",

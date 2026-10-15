@@ -102,10 +102,9 @@ def check_exit_code(code: int, allow_block: bool) -> int:
         print(f"::notice::{meaning} This canary runs from a GitHub runner, "
               f"which is a datacentre address, and no proxy secret is set — so "
               f"this says the runner's IP was refused, NOT that the site or "
-              f"this code changed. Reported as a skip rather than a failure, "
-              f"because a check that is red every morning is a check nobody "
-              f"reads. Set the FARFETCH_PROXY secret for a signal that can "
-              f"tell the two apart.")
+              f"this code changed. This job is documented as 'datacentre "
+              f"refusal expected'; the production-like job, which needs the "
+              f"FARFETCH_PROXY secret, is the one that tests real data.")
         return 0
 
     if not fails:

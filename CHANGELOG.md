@@ -19,6 +19,11 @@ a promise that every flag and exit code is contractually frozen.
 > records how many cells were escaped as `csv_cells_escaped`. (3) A refused
 > `--cdp-endpoint` connect now exits 5 with a one-line, credential-free
 > message instead of a traceback (exit 1).
+> (4) The canary's production-like job now FAILS with an error naming
+> `FARFETCH_PROXY` when that secret is absent, instead of skipping green. The
+> no-proxy job was refused (exit 3) on every one of the last 10 runs, so for a
+> month the badge was green while no run reached the site. The canary will
+> stay red until the secret is set.
 
 ### Fixed
 
