@@ -12,7 +12,7 @@ module, and a sibling repo once moved `launch`/`connect` inside the launch
 path, which made the module import cleanly with no pyppeteer installed: the
 engine group never skipped, the CI job that exists to fail on unexpected
 skips could not have caught a broken import, and CI ran against a stub
-version for a while with nothing noticing (CLAUDE.md §10). So the import
+version for a while with nothing noticing. So the import
 stays where it is.
 
 But `pip install .[playwright]` — installing exactly one engine, which is

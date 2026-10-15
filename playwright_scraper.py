@@ -56,6 +56,7 @@ from playwright.sync_api import (sync_playwright, Error as PWError,
 
 from captcha_solver import (detect_recaptcha_v3, detect_recaptcha_in_page,
                             reconcile_detections, solve_recaptcha,
+                            SolveBudget,
                             INJECT_TOKEN_JS)
 from product_parser import (parse_products, SELECTORS, detect_bot_challenge,
                             describe_block, page_url,
@@ -63,9 +64,12 @@ from product_parser import (parse_products, SELECTORS, detect_bot_challenge,
 from product_detail_parser import parse_product_detail
 from output_writer import (dedupe_by_sku, finish_run, stop_reason_for,
                            COMPLETE_STOP_REASONS, new_run_id,
-                           ProductVariant)
+                           ProductVariant, EXIT_FETCH_FAILED)
 from run_state import Checkpoint
 from proxy_pool import (from_args as proxy_pool_from_args, to_playwright, mask,
+                        redact_url_credentials, describe_cdp_failure,
+                        cdp_failure_is_transient, CDP_CONNECT_ATTEMPTS,
+                        CDP_CONNECT_PAUSE_S,
                         ROTATE_MODES, ProxyError, ProxyPool)
 import env_config
 from arg_types import positive_int, nonneg_int, nonneg_float
@@ -107,8 +111,8 @@ class PageOutcome:
     # The response status for the document itself, where the driver exposes
     # one (Playwright and pyppeteer return a Response from goto(); Selenium
     # has no equivalent without a CDP session, so it stays None there and the
-    # HTML markers carry the whole job — see CLAUDE.md §8 on needing a
-    # STRUCTURAL secondary signal for exactly that case).
+    # HTML markers carry the whole job — which is why a STRUCTURAL
+    # secondary signal is needed for exactly that case).
     http_status: Optional[int] = None
     # Chromium's own error text when the EXIT was unusable
     # (ERR_PROXY_CONNECTION_FAILED and friends), as opposed to the site being
@@ -321,6 +325,12 @@ class _BrowserSession:
             logger.debug("Ignoring error during browser teardown: %s", e)
 
 
+class CdpConnectError(RuntimeError):
+    """A --cdp-endpoint that could not be attached to. The message is already
+    free of credentials; the run reports it as exit 5 (content never
+    obtained), not as a traceback."""
+
+
 def _connect_remote(pw, args):
     """Attach to an already-running browser over CDP; return (browser, context, page)."""
     logger.info("Connecting to existing browser over CDP: %s",
@@ -331,7 +341,25 @@ def _connect_remote(pw, args):
     # ten-minute hang. A Scraping Browser session that is still held
     # answers with HTTP 500 rather than stalling, so this mostly guards
     # against the endpoint going quiet.
-    browser = pw.chromium.connect_over_cdp(args.cdp_endpoint, timeout=30000)
+    browser = None
+    for attempt in range(1, CDP_CONNECT_ATTEMPTS + 1):
+        try:
+            browser = pw.chromium.connect_over_cdp(args.cdp_endpoint,
+                                                   timeout=30000)
+            break
+        except (PWTimeout, PWError) as e:
+            # Playwright's message repeats the endpoint, `user:pass` and all,
+            # in the message and again in its call log, so nothing from it
+            # is printed or re-raised unredacted.
+            text = str(e)
+            if cdp_failure_is_transient(text) and attempt < CDP_CONNECT_ATTEMPTS:
+                logger.warning("CDP connect refused (%s) — retrying in %.0fs "
+                               "(%d/%d).", redact_url_credentials(text).splitlines()[0]
+                               if text else "no message", CDP_CONNECT_PAUSE_S,
+                               attempt, CDP_CONNECT_ATTEMPTS)
+                time.sleep(CDP_CONNECT_PAUSE_S)
+                continue
+            raise CdpConnectError(describe_cdp_failure(text)) from None
     # Reuse the remote browser's existing context so its
     # fingerprint/session/proxy settings stay intact.
     context = browser.contexts[0] if browser.contexts else browser.new_context()
@@ -439,7 +467,7 @@ def _content_when_settled(page, attempts: int = 4, pause_ms: int = 700):
     return None
 
 
-def handle_captcha_if_present(page, args) -> None:
+def handle_captcha_if_present(page, args, budget=None) -> None:
     """Runs after EVERY navigation, for ANY page — not scoped to one URL.
 
     Two detectors, in order:
@@ -501,6 +529,11 @@ def handle_captcha_if_present(page, args) -> None:
                        "holds. Pass --twocaptcha-key or set TWOCAPTCHA_KEY if "
                        "the run comes back blocked (exit 3).")
         return
+    # Checked BEFORE the purchase, against an allowance the caller holds
+    # for the whole page, so retries and exit rotations cannot each buy
+    # another token. Without a caller's budget, this call alone may buy one.
+    if not (budget if budget is not None else SolveBudget()).take():
+        return
     try:
         token = solve_recaptcha(challenge, args.twocaptcha_key,
                                api_version=args.captcha_api,
@@ -538,6 +571,9 @@ def _fetch_one_page(session, args, pool, page_num: int, url: str) -> PageOutcome
     block_retries = args.proxy_block_retries if (pool and len(pool) > 1) else 0
     html, vendor, load_failed = None, None, False
     http_status = None
+    # One paid-solve allowance for this PAGE, created outside the rotation
+    # loop so a fresh exit does not bring a fresh allowance with it.
+    budget = SolveBudget()
 
     for block_attempt in range(block_retries + 1):
         logger.info("Fetching page %d/%d: %s", page_num, args.pages, url)
@@ -553,7 +589,7 @@ def _fetch_one_page(session, args, pool, page_num: int, url: str) -> PageOutcome
                 # reliable signal a refusing edge gives us: Farfetch's
                 # "Access Denied" page arrives under HTTP 403 (measured
                 # 2026-09-14), while every marker on it was unknown to the
-                # parser. Taking the status first is CLAUDE.md §8.
+                # parser. So the status is taken first.
                 resp = session.page.goto(url, wait_until="domcontentloaded",
                                          timeout=60000)
                 http_status = resp.status if resp else None
@@ -588,7 +624,7 @@ def _fetch_one_page(session, args, pool, page_num: int, url: str) -> PageOutcome
         if load_failed:
             break
 
-        handle_captcha_if_present(session.page, args)
+        handle_captcha_if_present(session.page, args, budget=budget)
 
         if http_status is not None and http_status >= 400:
             # An error status is not a page that has yet to paint, so the
@@ -674,7 +710,7 @@ def _fetch_one_page(session, args, pool, page_num: int, url: str) -> PageOutcome
         # know this is not the listing, and saying "0 products" about it
         # would be a claim about the catalogue that this run cannot support.
         # Reported separately from `blocked` precisely because we CANNOT name
-        # who refused us — "never present a guess as a fact" (CLAUDE.md §8).
+        # who refused us — a guess is never presented as a fact.
         debug_html = f"{args.out}_page{page_num}_debug.html"
         with open(debug_html, "w", encoding="utf-8") as f:
             f.write(html)
@@ -972,8 +1008,15 @@ def scrape(args) -> int:
                            "memory for it.", concurrency, concurrency)
 
     with sync_playwright() as pw:
-        session = _BrowserSession(pw, args, pool,
-                                  remote=bool(args.cdp_endpoint)).open()
+        try:
+            session = _BrowserSession(pw, args, pool,
+                                      remote=bool(args.cdp_endpoint)).open()
+        except CdpConnectError as e:
+            # No page was requested, so nothing can be said about the
+            # catalogue: the same exit as any other run that never got its
+            # content, and no output is written.
+            logger.error("%s", e)
+            return EXIT_FETCH_FAILED
         try:
             # Page 1 is always fetched on its own: its content is what decides
             # whether pages 2..N can be addressed independently at all.
@@ -1333,8 +1376,7 @@ def main() -> int:
     It was inline under `if __name__ == "__main__"`, which meant two things:
     the console script declared in pyproject had nothing to point at, and the
     offline suite could only ever test the helpers underneath it — the exact
-    gap CLAUDE.md §10 names ("test the public entry point, not only its
-    internals"), which is how a signature once drifted away from its callers
+    gap "test the public entry point, not only its internals" names, which is how a signature once drifted away from its callers
     with every check still green.
     """
     args = parse_args()

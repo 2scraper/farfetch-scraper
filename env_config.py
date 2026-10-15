@@ -28,6 +28,7 @@ scripts behave exactly as before.
 
 import logging
 import os
+import re
 import sys
 from pathlib import Path
 
@@ -56,8 +57,14 @@ _PLACEHOLDERS = {
     "your_2captcha_api_key_here",
     "your_api_key_here",
     "changeme",
-    "",
 }
+
+# A value still holding a `{…}` slot from the documented shape — e.g. the
+# Scraping Browser endpoint `ws://{login}-zone-…:{password}@…` — is the
+# example, not a configuration. Sent as-is it reaches the remote end as a
+# username of literally `{login}-zone-…` and comes back as a 401 a long way
+# from its cause.
+_BRACED_PLACEHOLDER = re.compile(r"\{[A-Za-z_][A-Za-z0-9_]*\}")
 
 _loaded_from = None
 
@@ -151,12 +158,24 @@ def env_value(name):
     value = os.environ.get(name)
     if value is None:
         return None
+    if not value.strip():
+        # Empty is simply unset — the shipped .env.example leaves every value
+        # empty, and an unset CI secret arrives as "". Nothing to warn about.
+        return None
     if value.strip().lower() in _PLACEHOLDERS:
         logger.warning(
             "%s is still set to the placeholder from .env.example — treating it "
             "as unset. Put your real value in .env.", name)
         return None
-    return value.strip() or None
+    slot = _BRACED_PLACEHOLDER.search(value)
+    if slot:
+        # Name the slot, never the value: the value may be a credentialled URL.
+        logger.warning(
+            "%s still contains the placeholder %s from the documented format — "
+            "treating it as unset. Fill in the real value in .env.",
+            name, slot.group(0))
+        return None
+    return value.strip()
 
 
 def apply(args, keys=None, quiet=False):

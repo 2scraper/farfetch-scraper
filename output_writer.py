@@ -4,8 +4,11 @@ output_writer.py
 Shared product model + JSON/CSV writers used by all three scrapers.
 """
 
+import contextlib
 import csv
 import json
+import os
+import tempfile
 import uuid
 
 import notify
@@ -120,13 +123,107 @@ def dedupe_by_sku(products: List[Product], seen: Set[str]) -> List[Product]:
     return fresh
 
 
+@contextlib.contextmanager
+def _atomic(path: str, newline: Optional[str] = None):
+    """Write to a temporary file beside `path`, then rename over it.
+
+    `open(path, "w")` truncates before a single byte is written, so a crash,
+    a kill, a full disk or a Ctrl-C halfway through `json.dump` leaves a
+    SHORTER file where a complete one was. That breaks the promise `save()`
+    keeps by refusing to overwrite good output with an empty result: the
+    previous good run would be destroyed by the ATTEMPT to replace it rather
+    than by its outcome. Reproduced here before the fix: a 433-byte good
+    `out.json` came back as 12 bytes of invalid JSON when `json.dump` failed
+    part-way through.
+
+    The sidecar matters most: `<out>.meta.json` is the file a consumer
+    branches on, so a truncated one beside good rows reads as a broken run
+    over data that is fine.
+
+    * the temp file goes in the target's OWN directory, because `os.replace`
+      is atomic only within one filesystem;
+    * `fsync` before the rename makes the bytes durable, not merely visible;
+    * `newline` is passed through because the csv module needs `newline=""`
+      and that has to survive the move into the temp file.
+    """
+    directory = os.path.dirname(os.path.abspath(path)) or "."
+    handle = tempfile.NamedTemporaryFile(
+        mode="w", encoding="utf-8", newline=newline, dir=directory,
+        prefix=os.path.basename(path) + ".", suffix=".tmp", delete=False)
+    try:
+        with handle:
+            yield handle
+            handle.flush()
+            os.fsync(handle.fileno())
+        # `NamedTemporaryFile` creates at 0600 and `os.replace` keeps that
+        # mode, so without this every output would be owner-readable only —
+        # a regression from `open(path, "w")`, which honours the umask. An
+        # existing target keeps its OWN mode (someone may have tightened it
+        # on purpose); a new one gets exactly what `open()` would have given
+        # it. Never a flat 0o644: that narrows 0664 under umask 002.
+        try:
+            mode = os.stat(path).st_mode & 0o777
+        except OSError:
+            umask = os.umask(0)
+            os.umask(umask)
+            mode = 0o666 & ~umask
+        os.chmod(handle.name, mode)
+        os.replace(handle.name, path)
+    except BaseException:
+        # Including KeyboardInterrupt: an interrupted run must not leave
+        # `out.json.ab12cd.tmp` behind beside the good file.
+        try:
+            os.unlink(handle.name)
+        except OSError:
+            pass
+        raise
+
+
+# A spreadsheet treats a cell beginning with one of these as a FORMULA rather
+# than as text, and every string in these rows was written by whoever listed
+# the product — a title, a brand, a colour. The tab and the two newlines are
+# here because some readers strip a leading one and execute what follows.
+CSV_FORMULA_LEADS = ("=", "+", "-", "@", "\t", "\r", "\n")
+
+# Excel, Google Sheets and LibreOffice read a leading apostrophe as "the rest
+# of this cell is text" and do not display it. A consumer parsing the file
+# with the `csv` module DOES see it, which is why the count goes into the
+# sidecar as `csv_cells_escaped` rather than staying silent.
+CSV_FORMULA_ESCAPE = "'"
+
+
+def _csv_escape(v):
+    """Neutralise a formula-shaped cell. Returns (value, was_escaped).
+
+    Only STRINGS are touched: escaping a number would turn `-5` into text and
+    break every sum over the column. CSV only — the JSON output keeps the
+    site's bytes exactly as served.
+    """
+    if isinstance(v, str) and v.startswith(CSV_FORMULA_LEADS):
+        return CSV_FORMULA_ESCAPE + v, True
+    return v, False
+
+
+def _csv_value(v):
+    # Every column in both row classes is already flat (image_urls is
+    # "|"-joined by the parser), but a list reaching the writer is joined
+    # here, BEFORE the formula escape — a joined cell is text too and can
+    # start with a formula character while the list itself is not a string.
+    if isinstance(v, (list, tuple)):
+        return "|".join(str(x) for x in v)
+    if isinstance(v, dict):
+        return json.dumps(v, ensure_ascii=False)
+    return v
+
+
 def write_json(products: List[Product], path: str) -> None:
-    with open(path, "w", encoding="utf-8") as f:
+    with _atomic(path) as f:
         json.dump([asdict(p) for p in products], f, ensure_ascii=False, indent=2)
 
 
 def write_csv(products: List[Product], path: str,
-              row_type=None) -> None:
+              row_type=None) -> int:
+    """Write the CSV and return how many cells were formula-escaped."""
     # An empty result still gets the header row. A zero-byte file makes a
     # consumer fail on read (no columns to parse) instead of reading a valid
     # table with zero rows — and "an empty result is still a well-formed
@@ -137,16 +234,23 @@ def write_csv(products: List[Product], path: str,
     # would give an empty detail run a listing header — a file whose columns
     # describe something it does not contain.
     if not products:
-        with open(path, "w", encoding="utf-8", newline="") as f:
+        with _atomic(path, newline="") as f:
             csv.DictWriter(f, fieldnames=list(
                 asdict((row_type or Product)()).keys())).writeheader()
-        return
+        return 0
     fieldnames = list(asdict(products[0]).keys())
-    with open(path, "w", encoding="utf-8", newline="") as f:
+    escaped = 0
+    with _atomic(path, newline="") as f:
         writer = csv.DictWriter(f, fieldnames=fieldnames)
         writer.writeheader()
         for p in products:
-            writer.writerow(asdict(p))
+            row = {}
+            for k, v in asdict(p).items():
+                value, was_escaped = _csv_escape(_csv_value(v))
+                row[k] = value
+                escaped += was_escaped
+            writer.writerow(row)
+    return escaped
 
 
 # Exit code used when a run completes but produced nothing. Distinct from 1
@@ -226,8 +330,8 @@ def stop_reason_for(*, load_failed: bool, blocked_by: Optional[str],
     page. Keyword-only so adding a signal later cannot silently re-bind an
     existing caller's positional argument.
 
-    Ordered by how much each signal PROVES, not by how cheap it is to test
-    (CLAUDE.md §17): naming the vendor that refused us is a stronger
+    Ordered by how much each signal PROVES, not by how cheap it is to test:
+    naming the vendor that refused us is a stronger
     statement than "the status was 403", which is stronger than "it timed
     out", so the specific reason wins over the general one.
     """
@@ -241,12 +345,13 @@ def stop_reason_for(*, load_failed: bool, blocked_by: Optional[str],
         return "page_load_timeout"
     if parse_drift:
         # Last, because everything above says the page never arrived while
-        # this one says it arrived and we failed to read it. Not a fetch
-        # failure — the run's exit code stays EXIT_NO_PRODUCTS, since the
-        # catalogue question genuinely was answered with "nothing" — but the
-        # sidecar and the log name it as OUR bug rather than the site's
-        # answer, which is the thing a reader needs in order to look in the
-        # right place.
+        # this one says it arrived and we failed to read it. It is not a
+        # complete run, so with nothing gathered the exit code is
+        # EXIT_FETCH_FAILED (5) — no content was obtained — and with earlier
+        # pages gathered it is EXIT_PARTIAL (6). Never EXIT_NO_PRODUCTS: the
+        # page linked to products, so "the catalogue is empty" is false. The
+        # sidecar and the log name it as OUR bug rather than the network's,
+        # which is what a reader needs in order to look in the right place.
         return "parse_drift"
     return "completed"
 
@@ -264,7 +369,7 @@ def write_run_meta(out_prefix: str, meta: dict) -> str:
     partial run's un-fetched pages being reported as delisted products.
     """
     path = f"{out_prefix}.meta.json"
-    with open(path, "w", encoding="utf-8") as f:
+    with _atomic(path) as f:
         json.dump(meta, f, ensure_ascii=False, indent=2)
     print(f"[+] Wrote run metadata -> {path} (status={meta.get('status')})")
     return path
@@ -372,7 +477,8 @@ def quality_metrics(products: List[Product]) -> dict:
 
 
 def save(products: List[Product], out_prefix: str, fmt: str,
-         allow_empty: bool = False, row_type=None) -> int:
+         allow_empty: bool = False, row_type=None,
+         stats: Optional[dict] = None) -> int:
     """Write JSON/CSV and return a process exit code.
 
     Returns 0 when products were written, EXIT_NO_PRODUCTS when there were
@@ -399,8 +505,17 @@ def save(products: List[Product], out_prefix: str, fmt: str,
         write_json(products, f"{out_prefix}.json")
         print(f"[+] Saved {len(products)} products -> {out_prefix}.json")
     if fmt in ("csv", "both"):
-        write_csv(products, f"{out_prefix}.csv", row_type=row_type)
+        escaped = write_csv(products, f"{out_prefix}.csv", row_type=row_type)
         print(f"[+] Saved {len(products)} products -> {out_prefix}.csv")
+        # Through `stats`, not the return value, because the return value is
+        # an EXIT CODE. finish_run threads it into the sidecar.
+        if stats is not None:
+            stats["csv_cells_escaped"] = escaped
+        if escaped:
+            print(f"[!] {escaped} CSV cell(s) began with a formula character "
+                  f"and were prefixed with {CSV_FORMULA_ESCAPE!r} so a "
+                  f"spreadsheet reads them as text. The JSON output is "
+                  f"unchanged — see csv_cells_escaped in the sidecar.")
     return 0 if products else EXIT_NO_PRODUCTS
 
 
@@ -451,8 +566,9 @@ def finish_run(products: List[Product], out_prefix: str, fmt: str,
     # unification this file already carries — a rule keyed on a list of
     # names has a hole for every name nobody added to it.
     complete = stop_reason in COMPLETE_STOP_REASONS and not pages_failed
+    write_stats: dict = {}
     rc = save(products, out_prefix, fmt, allow_empty=allow_empty,
-              row_type=row_type)
+              row_type=row_type, stats=write_stats)
     wrote_output = bool(products) or allow_empty
 
     status = "complete" if (products and complete) else (
@@ -469,6 +585,10 @@ def finish_run(products: List[Product], out_prefix: str, fmt: str,
         start_url=start_url, final_url=final_url, products=len(products),
         run_id=run_id, started_at=started_at, rows=products,
         mode=mode)
+    # UNDER what the run already recorded, never over it: housekeeping must
+    # not overwrite a key the run itself set.
+    for k, v in write_stats.items():
+        meta.setdefault(k, v)
     if wrote_output:
         write_run_meta(out_prefix, meta)
 
@@ -496,7 +616,6 @@ def _finish_code(products, rc, blocked, stop_reason, complete,
         # category is empty" — the defect this branch exists to prevent.
         # Seven sibling repos had independently keyed on `not complete`, and
         # the family unified on their rule with this repo's exit code.
-        # See CLAUDE.md §25.
         if not complete:
             print(f"[!] The pages were never fetched ({stop_reason}) — this "
                   f"is exit {EXIT_FETCH_FAILED}, NOT an empty category "

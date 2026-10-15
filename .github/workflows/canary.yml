@@ -27,8 +27,8 @@ name: canary
 #                            FARFETCH_PROXY secret is set, and is strict about
 #                            everything including a block, because from a
 #                            residential exit a block IS news. Skips with a
-#                            notice when the secret is absent (CLAUDE.md §11:
-#                            a canary that cannot pass must SKIP, not fail).
+#                            notice when the secret is absent (a canary
+#                            that cannot pass must SKIP, not fail).
 #
 # The proxy secret is passed through the ENVIRONMENT, never as a --proxy
 # argument. env_config.py already reads FARFETCH_PROXY, an unset secret
@@ -157,8 +157,8 @@ jobs:
         env:
           # Read by env_config.py, exactly as a local .env would be. NOT
           # passed as --proxy: a credential in argv is readable by anything
-          # that can run `ps` and is the rule this repo states in §3 of its
-          # own docs.
+          # that can run `ps`, which is why the README tells users to keep
+          # credentials in .env.
           FARFETCH_PROXY: ${{ secrets.FARFETCH_PROXY }}
         run: |
           set +e

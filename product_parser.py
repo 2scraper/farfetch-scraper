@@ -230,7 +230,7 @@ _DENY_TITLE_RE = re.compile(r"<title[^>]*>\s*Access Denied\s*</title>", re.I)
 # bare string "edgesuite": edgesuite.net is also an ordinary Akamai asset
 # domain, so a site whose own images are served from it would report every
 # page as blocked. That is the trap tokopedia-scraper fell into with a bare
-# "akamai" marker (see CLAUDE.md §18) — a marker that matches a good page is
+# "akamai" marker — a marker that matches a good page is
 # worse than no marker. "errors.edgesuite.net" appears only on the error page.
 _DENY_ERROR_HOST = "errors.edgesuite.net"
 

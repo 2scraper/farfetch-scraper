@@ -19,6 +19,16 @@ test_farfetch*.*
 # --- the live-test harness's working directory ---------------------------
 live_results/
 live_results.zip
+# By KIND of directory, not by one chosen name: a raw capture reaches
+# `git add -A` through whatever directory nobody listed.
+live/
+captures/
+dumps/
+scratch/
+# `--dump-html X --pages N` writes X.page2, X.page3 …, which `*.json` does not
+# cover when X ends in .json, and a bare page capture at the repo root.
+*.page[0-9]*
+/*.html
 
 # --- debug artifacts the diagnostics drop next to themselves -------------
 # check_signup_captcha*.py write these on purpose, for manual inspection.
@@ -66,7 +76,6 @@ secrets*
 # recoverable only because that repo was private at the time. On 2026-09-17
 # a sibling had an untracked `.env.bak` holding a 32-hex key in a PUBLIC
 # repository, one `git add -A` from publication. Craigslist was fixed then
-# and the fix never reached anyone else, which is §16's rule unapplied: when
-# you fix one, check the siblings.
+# and the fix never reached anyone else: when you fix one, check the siblings.
 .env*
 !.env.example

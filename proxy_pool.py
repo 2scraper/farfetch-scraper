@@ -25,6 +25,7 @@ down and relaunches rather than swapping the proxy under a live session.
 
 from __future__ import annotations
 
+import re
 import logging
 import random
 from typing import List, Optional
@@ -148,6 +149,57 @@ def mask(url: Optional[str]) -> str:
         # vague one. Something is already wrong with this value; say so
         # without repeating it.
         return "(unparseable proxy URL, redacted)"
+
+
+_URL_CREDENTIALS_RE = re.compile(r"([a-z][a-z0-9+.-]*://)[^/\s@'\"]+@", re.I)
+
+
+def redact_url_credentials(text) -> str:
+    """Every `scheme://user:pass@` in free text, credentials replaced.
+
+    For EXCEPTION MESSAGES, not single URLs: Playwright repeats a CDP
+    endpoint several times in one error (the message plus its call log), so
+    a masker that handles the first occurrence prints the password the other
+    times. Host and port stay. Never raises.
+    """
+    try:
+        return _URL_CREDENTIALS_RE.sub(r"\1***:***@", str(text))
+    except Exception:  # noqa: BLE001
+        return "(unprintable error, redacted)"
+
+
+# How a managed CDP endpoint refuses, as far as the text of the error says.
+# A Scraping Browser profile stays `profile_locked` for a second or two after
+# a clean disconnect and answers HTTP 500 meanwhile, so those are retried a
+# few times; a 401 means the endpoint's credentials are wrong or expired and
+# no retry helps.
+CDP_CONNECT_ATTEMPTS = 3
+CDP_CONNECT_PAUSE_S = 3.0
+
+
+def cdp_failure_is_transient(text: str) -> bool:
+    t = str(text).lower()
+    return "profile_locked" in t or " 500" in t or "500 " in t
+
+
+def describe_cdp_failure(text: str) -> str:
+    """A one-line, credential-free explanation of a failed CDP connect."""
+    safe = redact_url_credentials(text).strip().splitlines()
+    first = safe[0] if safe else "(no message)"
+    t = str(text).lower()
+    if "401" in t or "unauthori" in t:
+        cause = ("the endpoint refused the credentials (HTTP 401): the "
+                 "profile's login or password is wrong or has expired — get "
+                 "fresh credentials for the endpoint")
+    elif "profile_locked" in t:
+        cause = ("the profile is held by another live connection "
+                 "(profile_locked) — wait for it to close, or use another pid")
+    elif cdp_failure_is_transient(text):
+        cause = ("the service answered HTTP 500 on the WebSocket upgrade — a "
+                 "service-side failure, not this run's")
+    else:
+        cause = "the endpoint could not be reached"
+    return f"Could not connect to --cdp-endpoint: {cause}. ({first})"
 
 
 def to_playwright(url: Optional[str]) -> Optional[dict]:
