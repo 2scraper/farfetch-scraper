@@ -8,6 +8,12 @@ a promise that every flag and exit code is contractually frozen.
 
 ## [Unreleased]
 
+### Changed
+
+- CI only: the canary's paid `production-like` job now runs weekly (Mondays
+  06:17 UTC) and on a manual dispatch; the free `reachability-no-proxy` job still
+  runs daily.
+
 ## [0.6.0] — 2026-10-15
 
 > **Behaviour changes.** (1) The pyppeteer and Selenium engines now report an

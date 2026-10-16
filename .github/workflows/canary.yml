@@ -23,7 +23,8 @@ name: canary
 #                            still fails. This job is NOT the data test.
 #
 #   production-like        — THE data test. Needs the FARFETCH_PROXY secret
-#                            (a residential exit) and is strict about
+#                            (a residential exit), so it bills, and runs
+#                            weekly (Mondays) and on dispatch only. Strict about
 #                            everything, a block included. When the secret is
 #                            absent the job FAILS with an error naming it:
 #                            a canary that never reaches the site must not
@@ -43,6 +44,9 @@ on:
     # Once a day, off the hour, so it isn't competing with everyone else's
     # on-the-hour cron jobs for runner availability.
     - cron: "17 6 * * *"
+    # Mondays only: the paid job (production-like) runs on this
+    # schedule (each run bills); the free jobs keep the daily one above.
+    - cron: "17 6 * * 1"
   workflow_dispatch:
 
 jobs:
@@ -125,6 +129,8 @@ jobs:
 
   production-like:
     name: production-like (residential proxy)
+    # Paid path: weekly schedule or a manual dispatch only.
+    if: github.event_name != 'schedule' || github.event.schedule == '17 6 * * 1'
     runs-on: ubuntu-latest
     # `secrets` is not available in a job-level `if`, so presence is tested
     # through the job env and read in each step's `if` — the same shape the
