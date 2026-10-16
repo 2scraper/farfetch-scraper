@@ -14,7 +14,7 @@ name: canary
 # listed a code (124) no engine returns and had no entry for the codes they
 # do. A check that is red every morning is a check everyone learns to ignore.
 #
-#   reachability-no-proxy  — free, no secret, every day, and DOCUMENTED AS
+#   reachability-no-proxy  — free, no secret, every Monday, and DOCUMENTED AS
 #                            "datacentre refusal expected": farfetch.com
 #                            refused the GitHub runner (exit 3) on every one
 #                            of the last 10 runs before 2026-10-15. A block
@@ -23,8 +23,7 @@ name: canary
 #                            still fails. This job is NOT the data test.
 #
 #   production-like        — THE data test. Needs the FARFETCH_PROXY secret
-#                            (a residential exit), so it bills, and runs
-#                            weekly (Mondays) and on dispatch only. Strict about
+#                            (a residential exit) and is strict about
 #                            everything, a block included. When the secret is
 #                            absent the job FAILS with an error naming it:
 #                            a canary that never reaches the site must not
@@ -41,11 +40,8 @@ name: canary
 # line, which would have put it in argv the moment anyone uncommented it.
 on:
   schedule:
-    # Once a day, off the hour, so it isn't competing with everyone else's
+    # Once a week (Mondays), off the hour, so it isn't competing with everyone else's
     # on-the-hour cron jobs for runner availability.
-    - cron: "17 6 * * *"
-    # Mondays only: the paid job (production-like) runs on this
-    # schedule (each run bills); the free jobs keep the daily one above.
     - cron: "17 6 * * 1"
   workflow_dispatch:
 
@@ -78,7 +74,7 @@ jobs:
         # all, so a renamed next-page attribute (or the ?page= fallback
         # breaking) would stay invisible here — which is precisely the kind
         # of silent decay this workflow exists to catch. Three pages is
-        # enough to cross the page boundary twice while keeping the daily
+        # enough to cross the page boundary twice while keeping the weekly
         # request count trivial.
         #
         # set +e: GitHub Actions runs `run:` steps as `bash -e ...` by
@@ -129,8 +125,6 @@ jobs:
 
   production-like:
     name: production-like (residential proxy)
-    # Paid path: weekly schedule or a manual dispatch only.
-    if: github.event_name != 'schedule' || github.event.schedule == '17 6 * * 1'
     runs-on: ubuntu-latest
     # `secrets` is not available in a job-level `if`, so presence is tested
     # through the job env and read in each step's `if` — the same shape the
@@ -142,7 +136,7 @@ jobs:
         # Fails, not skips: without a residential exit this canary cannot
         # reach the site, and a job that never reaches the site must not
         # end green. The reachability job is no substitute for this one —
-        # from a datacentre address it is refused every day.
+        # from a datacentre address it is refused on every run.
         if: env.HAVE_PROXY != 'true'
         run: |
           echo "::error::The FARFETCH_PROXY secret is not set, so this canary cannot reach farfetch.com: the site refuses GitHub's datacentre addresses. Add a residential proxy URL as the repository secret FARFETCH_PROXY (read from the environment by env_config.py, never put on a command line)."

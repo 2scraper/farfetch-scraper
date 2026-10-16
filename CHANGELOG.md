@@ -10,9 +10,7 @@ a promise that every flag and exit code is contractually frozen.
 
 ### Changed
 
-- CI only: the canary's paid `production-like` job now runs weekly (Mondays
-  06:17 UTC) and on a manual dispatch; the free `reachability-no-proxy` job still
-  runs daily.
+- CI only: the whole canary, free and paid jobs alike, now runs weekly (Mondays 06:17 UTC) and on a manual dispatch; the daily schedule is removed.
 
 ## [0.6.0] — 2026-10-15
 
