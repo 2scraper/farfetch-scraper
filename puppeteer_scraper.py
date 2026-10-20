@@ -36,11 +36,15 @@ from product_parser import (parse_products, SELECTORS, detect_bot_challenge,
                             describe_block, page_url,
                             count_product_links)
 from output_writer import (dedupe_by_sku, finish_run, new_run_id,
-                           stop_reason_for, EXIT_FETCH_FAILED)
+                           stop_reason_for, EXIT_FETCH_FAILED,
+                           write_failed_attempt)
 from proxy_pool import mask as mask_proxy
 from proxy_pool import (redact_url_credentials, describe_cdp_failure,
                         cdp_failure_is_transient, CDP_CONNECT_ATTEMPTS,
-                        CDP_CONNECT_PAUSE_S)
+                        CDP_CONNECT_PAUSE_S,
+                        precheck_proxy, robots_url, precheck_message,
+                        ProxyPrecheckError, PROXY_PRECHECK_STOP_REASON,
+                        should_block_media, pyppeteer_block_media)
 import env_config
 from arg_types import positive_int, nonneg_float
 
@@ -210,6 +214,19 @@ async def scrape(args) -> int:
     pages_completed = 0
     final_url = args.url
 
+    if args.proxy and not args.cdp_endpoint:
+        # One HEAD for robots.txt through the proxy BEFORE the browser
+        # starts — see playwright_scraper.py. Only a gateway 407/402 stops.
+        try:
+            precheck_proxy(args.proxy, robots_url(args.url), timeout=20)
+        except ProxyPrecheckError as exc:
+            print(precheck_message(exc, "FARFETCH_PROXY", "farfetch.com"),
+                  file=sys.stderr)
+            write_failed_attempt(args.out, stop_reason=PROXY_PRECHECK_STOP_REASON,
+                                 start_url=args.url, pages_requested=args.pages,
+                                 transport_error="proxy pre-check: %s" % exc)
+            return EXIT_FETCH_FAILED
+
     if args.cdp_endpoint:
         logger.info("Connecting to existing browser over CDP: %s", _mask_credentials(args.cdp_endpoint))
         browser = await _connect_remote(args)
@@ -247,6 +264,14 @@ async def scrape(args) -> int:
             await page.authenticate({"username": creds.username or "",
                                      "password": creds.password or ""})
             logger.info("Proxy credentials sent over CDP, not via the command line.")
+    if should_block_media(args, proxy_in_use=bool(args.proxy),
+                          over_cdp=bool(args.cdp_endpoint)):
+        # CDP Fetch with resource-type patterns: only images, media and fonts
+        # are paused, and each is failed. setRequestInterception relies on a
+        # CDP method current Chromium no longer implements.
+        await pyppeteer_block_media(page)
+        logger.info("Blocking images/media/fonts "
+                    "(--load-media keeps them).")
     if not args.cdp_endpoint:
         # Only override the UA when we launched our own bundled Chromium —
         # see playwright_scraper.py for why this matters when connected via
@@ -444,6 +469,12 @@ def parse_args():
     p.add_argument("--out", default="farfetch_products", help="Output file prefix")
     p.add_argument("--proxy", default=None, help="Proxy URL, e.g. http://HOST:9999 (2captcha.com/proxy)")
     p.add_argument("--twocaptcha-key", default=None, help="2captcha.com API key")
+    p.add_argument("--load-media", action="store_true",
+                   help="Load images, video and web fonts. By default they are "
+                        "aborted while a LOCAL browser goes through --proxy "
+                        "(no parser reads them, and a proxy bills per byte); "
+                        "never blocked with --cdp-endpoint or with no proxy.")
+    p.add_argument("--force-block-media", action="store_true", help=argparse.SUPPRESS)
     p.add_argument("--webhook", default=None, metavar="URL",
                    help="POST the run summary (the same fields as the "
                         ".meta.json sidecar, plus the exit code) to this "

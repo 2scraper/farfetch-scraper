@@ -66,8 +66,12 @@ from product_parser import (parse_products, SELECTORS, detect_bot_challenge,
                             describe_block, page_url,
                             count_product_links)
 from output_writer import (dedupe_by_sku, finish_run, stop_reason_for,
-                           EXIT_DRIVER_TIMEOUT, new_run_id)
+                           EXIT_DRIVER_TIMEOUT, EXIT_FETCH_FAILED, new_run_id,
+                           write_failed_attempt)
 from proxy_pool import mask as mask_proxy
+from proxy_pool import (precheck_proxy, robots_url, precheck_message,
+                        ProxyPrecheckError, PROXY_PRECHECK_STOP_REASON,
+                        should_block_media, selenium_block_media)
 import env_config
 from arg_types import positive_int, nonneg_float
 
@@ -450,6 +454,13 @@ def build_driver_with_timeout(args) -> webdriver.Chrome:
         signal.signal(signal.SIGALRM, previous)
 
 
+def _bare_proxy(proxy: str) -> str:
+    """`scheme://host:port` of a proxy URL — what --proxy-server is given."""
+    parsed = urlparse(proxy)
+    port = f":{parsed.port}" if parsed.port else ""
+    return f"{parsed.scheme}://{parsed.hostname}{port}"
+
+
 def build_driver(args) -> webdriver.Chrome:
     options = Options()
 
@@ -573,8 +584,7 @@ def build_driver(args) -> webdriver.Chrome:
         # authentication needs Selenium-Wire or an extension rather than
         # letting a user believe a user:pass URL is doing something.
         parsed = urlparse(args.proxy)
-        port = f":{parsed.port}" if parsed.port else ""
-        options.add_argument(f"--proxy-server={parsed.scheme}://{parsed.hostname}{port}")
+        options.add_argument(f"--proxy-server={_bare_proxy(args.proxy)}")
         logger.info("Using proxy %s", mask_proxy(args.proxy))
         if parsed.username or parsed.password:
             logger.warning(
@@ -639,6 +649,15 @@ def build_driver(args) -> webdriver.Chrome:
     driver.execute_cdp_cmd("Page.addScriptToEvaluateOnNewDocument", {
         "source": "Object.defineProperty(navigator, 'webdriver', {get: () => undefined})"
     })
+    driver.media_blocked = False
+    if should_block_media(args, proxy_in_use=bool(args.proxy)):
+        # By URL pattern: Selenium has no request events, only
+        # Network.setBlockedURLs, so an image served without a file
+        # extension still loads. --load-media keeps everything.
+        selenium_block_media(driver)
+        driver.media_blocked = True
+        logger.info("Blocking images/media/fonts by file extension "
+                    "(--load-media keeps them).")
     return driver
 
 
@@ -731,6 +750,26 @@ def scrape(args) -> int:
     stop_reason = "completed"
     pages_completed = 0
     final_url = args.url
+    if args.proxy and not args.cdp_endpoint:
+        # One HEAD for robots.txt BEFORE chromedriver starts — see
+        # playwright_scraper.py. Sent exactly as this browser will use the
+        # proxy: WITHOUT credentials, because Chromium's --proxy-server
+        # cannot carry them (see build_driver). A proxy that needs them
+        # refuses this browser anyway, and is told so here, once.
+        bare = _bare_proxy(args.proxy)
+        try:
+            precheck_proxy(bare, robots_url(args.url), timeout=20)
+        except ProxyPrecheckError as exc:
+            print(precheck_message(exc, "FARFETCH_PROXY", "farfetch.com"),
+                  file=sys.stderr)
+            if bare != args.proxy:
+                print("    selenium_scraper.py sends NO proxy credentials (Chromium's "
+                      "--proxy-server cannot carry them); playwright_scraper.py "
+                      "authenticates properly.", file=sys.stderr)
+            write_failed_attempt(args.out, stop_reason=PROXY_PRECHECK_STOP_REASON,
+                                 start_url=args.url, pages_requested=args.pages,
+                                 transport_error="proxy pre-check: %s" % exc)
+            return EXIT_FETCH_FAILED
     try:
         driver = build_driver_with_timeout(args)
     except DriverTimeout as e:
@@ -909,6 +948,13 @@ def parse_args():
     p.add_argument("--format", choices=["json", "csv", "both"], default="both")
     p.add_argument("--out", default="farfetch_products", help="Output file prefix")
     p.add_argument("--proxy", default=None, help="Proxy URL, e.g. http://HOST:9999 (2captcha.com/proxy)")
+    p.add_argument("--load-media", action="store_true",
+                   help="Load images, video and web fonts. By default they are "
+                        "blocked by file extension while a LOCAL browser goes "
+                        "through --proxy "
+                        "(no parser reads them, and a proxy bills per byte); "
+                        "never blocked with --cdp-endpoint or with no proxy.")
+    p.add_argument("--force-block-media", action="store_true", help=argparse.SUPPRESS)
     p.add_argument("--chrome-binary", default=None,
                    help="Path to the Chrome/Chromium binary to launch locally. Only "
                         "needed when it isn't in one of chromedriver's default "
