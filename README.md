@@ -248,7 +248,8 @@ The three browser engines share these:
 | `--out` | `farfetch_products` | Output prefix, also used for debug dumps |
 | `--delay` | `2.0` | Seconds between pages |
 | `--cdp-endpoint` | – | Attach to a running browser instead of launching one |
-| `--proxy` | – | Proxy for a self-launched browser; ignored with `--cdp-endpoint` |
+| `--proxy` | – | Proxy for a self-launched browser; ignored with `--cdp-endpoint`. Pre-checked before the browser starts ([traffic savers](#traffic-savers-pre-check-and-media-blocking)) |
+| `--load-media` | off | Load images, video and web fonts behind `--proxy` too (by default they are blocked there) |
 | `--retries` | `3` | Attempts per page load, pause doubling each time |
 | `--concurrency` | `1` | Playwright only — fetch pages through N parallel workers ([details](#concurrency)) |
 | `--twocaptcha-key` | – | 2Captcha API key (or set `TWOCAPTCHA_KEY`) |
@@ -283,7 +284,7 @@ A contract, not decoration — the harness and any pipeline can branch on these.
 | `2` | Bad usage |
 | `3` | **Blocked before parsing** — a challenge page, or an outright refusal |
 | `4` | Fetched the page fine, parsed **0 products**, and the page links to no products either |
-| `5` | **No content obtained** — navigation timeout, dead proxy, 4xx/5xx, a failed `--cdp-endpoint` connect, a Scraper API error, or a page that links to products and parsed to none (`stop_reason: parse_drift` — a parser problem, not a network one) |
+| `5` | **No content obtained** — navigation timeout, dead proxy, a proxy gateway that refused the pre-check with 407/402 (`stop_reason: proxy_auth_failed`), 4xx/5xx, a failed `--cdp-endpoint` connect, a Scraper API error, or a page that links to products and parsed to none (`stop_reason: parse_drift` — a parser problem, not a network one) |
 | `6` | **Partial run** — products written, but the page loop stopped early |
 | `124` | Selenium only: chromedriver could not be **started** within the watchdog |
 
@@ -801,6 +802,53 @@ all (use Selenium-Wire or an extension); and both flags are ignored with
 
 **Match the proxy's country to your fingerprint's.** A US fingerprint arriving on
 a German IP is a contradiction that is cheap to detect.
+
+#### Traffic savers: pre-check and media blocking
+
+Both apply only to a browser this repo launches itself behind `--proxy` /
+`--proxy-file`. Neither applies with `--cdp-endpoint` (the remote browser has
+its own exit and is configured on its own side), or with no proxy at all,
+where nothing is metered.
+
+**Pre-check.** Before any browser starts, each of the three engines sends ONE
+`HEAD https://www.farfetch.com/robots.txt` through the proxy it is about to
+use: the first exit of the pool for Playwright, the `--proxy` value for
+pyppeteer, and the bare `scheme://host:port` for Selenium. Selenium sends no
+credentials because its browser cannot send them either (see above), so the
+pre-check sees exactly what the browser will see.
+
+- A gateway `407` (the credential was refused, or the traffic balance is
+  exhausted) or `402` (traffic/balance exhausted) ends the run with **exit 5**.
+  The message names `FARFETCH_PROXY` and never prints its value.
+- No browser is started, and `<out>.latest_attempt.meta.json` records
+  `status: failed`, `stop_reason: proxy_auth_failed`. The data files and
+  `<out>.meta.json` from an earlier run are left as they were.
+- Any other answer, a 403 from the site, a timeout or a DNS error is not a
+  verdict on the proxy, and the run continues exactly as before. A `socks5://`
+  proxy is not pre-checked.
+
+**Media blocking.** Behind a local proxy, images, video/audio and web fonts
+are not downloaded. No parser here reads them: `image_url` comes from the
+markup and the JSON-LD, not from a loaded image. `--load-media` turns this
+off.
+
+| Engine | How | Limitation |
+|---|---|---|
+| Playwright | `context.route` aborts the `image`, `media` and `font` resource types | While a route is installed Playwright turns off its HTTP cache, so a run of many pages re-fetches the scripts and styles it would otherwise have cached |
+| pyppeteer | CDP `Fetch.enable` pauses only `Image`/`Media`/`Font` requests, and fails each one | – |
+| Selenium | CDP `Network.setBlockedURLs` by file extension (`*.jpg`, `*.webp`, `*.mp4`, `*.woff2`, …) | An image served from a URL without an extension still loads |
+
+Debug screenshots (`*_debug.png`) taken while blocking is on show the page
+without its images.
+
+Measured 2026-10-20 against a local stub page holding a png, a jpg, a woff2,
+an mp4 and a script. Without blocking, every engine fetched all of them. With
+blocking, Playwright and Selenium fetched only the page and the script, and
+pyppeteer fetched the page, the script and `/favicon.ico`. A live
+comparison against farfetch.com was not possible that day: from a
+datacentre address, both the plain run and the run with blocking forced
+(Playwright, no proxy, one listing page) got Akamai's 403 `Access Denied`
+(exit 3), the same refusal described in the exit-code section.
 
 ### 4. Fingerprints
 

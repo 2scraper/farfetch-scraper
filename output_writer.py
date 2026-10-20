@@ -315,7 +315,7 @@ EXIT_DRIVER_TIMEOUT = 124
 # replaced it honest: a reason cannot be both "we finished" and "we
 # never got there".
 FETCH_FAILURE_STOP_REASONS = ("page_load_timeout", "proxy_unusable",
-                              "http_error")
+                              "http_error", "proxy_auth_failed")
 
 
 def stop_reason_for(*, load_failed: bool, blocked_by: Optional[str],
@@ -372,6 +372,37 @@ def write_run_meta(out_prefix: str, meta: dict) -> str:
     with _atomic(path) as f:
         json.dump(meta, f, ensure_ascii=False, indent=2)
     print(f"[+] Wrote run metadata -> {path} (status={meta.get('status')})")
+    return path
+
+
+# Beside `<out>.meta.json`, never instead of it: that file describes the data
+# beside it and is written only with that data. This one records an attempt
+# that ended before any data could be written.
+ATTEMPT_META_SUFFIX = ".latest_attempt.meta.json"
+
+
+def write_failed_attempt(out_prefix: str, *, stop_reason: str,
+                         start_url: Optional[str], pages_requested: int,
+                         transport_error: str, mode: str = "listing") -> str:
+    """Record a run that ended before `finish_run` could run at all.
+
+    Used when the proxy gateway refused the pre-check, so no browser was
+    started. Writes ONLY `<out>.latest_attempt.meta.json`: the data files and
+    `<out>.meta.json` from an earlier good run stay exactly as they were, so
+    the two never contradict each other.
+    """
+    meta = run_meta(status="failed", stop_reason=stop_reason,
+                    pages_requested=pages_requested, pages_completed=0,
+                    start_url=start_url or "", final_url=start_url or "",
+                    products=0, mode=mode)
+    meta.update(blocked=False, transport_error=transport_error,
+                data_updated=False)
+    path = f"{out_prefix}{ATTEMPT_META_SUFFIX}"
+    with _atomic(path) as f:
+        json.dump(meta, f, ensure_ascii=False, indent=2)
+    print(f"[+] Wrote attempt metadata -> {path} (status=failed, "
+          f"stop_reason={stop_reason}); the data and {out_prefix}.meta.json "
+          f"were left as they were.")
     return path
 
 

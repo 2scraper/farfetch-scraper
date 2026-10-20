@@ -4466,6 +4466,465 @@ def check_audit_2026_10_14_contract_fixes(ok: bool) -> bool:
     return ok
 
 
+# Proxy URLs for the checks below, assembled so that no line of this file is
+# a credentialled URL for the shipped secret scan to flag.
+_UP = "u" + ":p@"
+_SECRET_UP = "user" + ":S3cretPw@"
+
+
+def _label(argv):
+    return " ".join(a.replace(_UP, "") for a in argv) or "(no proxy)"
+
+
+def _status_proxy(status):
+    """A local stand-in for a proxy gateway that answers every request,
+    CONNECT included, with `status`. Returns (server, port, hits)."""
+    import http.server
+    import socketserver
+    import threading
+    hits = []
+
+    class Handler(http.server.BaseHTTPRequestHandler):
+        def log_message(self, *a):
+            pass
+
+        def _answer(self):
+            hits.append((self.command, self.path))
+            self.send_response(status)
+            self.send_header("Content-Length", "0")
+            self.send_header("Proxy-Authenticate", 'Basic realm="stub"')
+            self.end_headers()
+        do_CONNECT = do_GET = do_HEAD = _answer
+
+    server = socketserver.ThreadingTCPServer(("127.0.0.1", 0), Handler)
+    server.daemon_threads = True
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    return server, server.server_address[1], hits
+
+
+@contextlib.contextmanager
+def _captured_output():
+    """stdout, stderr AND log records into one buffer, so a check can assert
+    that a credential appears in none of them."""
+    buf = io.StringIO()
+    root = logging.getLogger()
+    saved = root.handlers[:]
+    handler = logging.StreamHandler(buf)
+    root.handlers = [handler]
+    try:
+        with contextlib.redirect_stdout(buf), contextlib.redirect_stderr(buf):
+            yield buf
+    finally:
+        root.handlers = saved
+
+
+def _engine_args(mod, argv):
+    """An engine's real parse_args() on `argv`, with no FARFETCH_* or
+    TWOCAPTCHA_* value from the environment or a .env leaking in."""
+    import env_config
+    saved_argv, saved_load = sys.argv, env_config.load_env
+    saved_env = {k: os.environ.pop(k) for k in list(os.environ)
+                 if k.startswith(("FARFETCH_", "TWOCAPTCHA_"))}
+    sys.argv = ["engine"] + list(argv)
+    env_config.load_env = lambda *a, **k: None
+    try:
+        return mod.parse_args()
+    finally:
+        sys.argv, env_config.load_env = saved_argv, saved_load
+        os.environ.update(saved_env)
+
+
+def check_proxy_traffic_savers(ok: bool) -> bool:
+    """proxy pre-check before a browser starts, and media blocking"""
+    import asyncio as _asyncio
+    import proxy_pool as _pp
+
+    class _Started(Exception):
+        """Raised by a fake browser launch: the run got past the pre-check."""
+
+    started = []
+
+    class _PWErr(Exception):
+        pass
+
+    class _PWTimeout(_PWErr):
+        pass
+
+    def _sync_playwright():
+        started.append("playwright")
+        raise _Started()
+
+    async def _pyp_launch(**k):
+        started.append("pyppeteer")
+        raise _Started()
+
+    async def _pyp_connect(**k):
+        started.append("pyppeteer-cdp")
+        raise _Started()
+
+    class _SelErr(Exception):
+        pass
+
+    _sel_fakes = {
+        "selenium": {}, "selenium.webdriver": {"Chrome": None},
+        "selenium.webdriver.chrome": {},
+        "selenium.webdriver.chrome.options": {"Options": None},
+        "selenium.webdriver.chrome.service": {"Service": None},
+        "selenium.webdriver.common": {}, "selenium.webdriver.common.by": {"By": None},
+        "selenium.common": {},
+        "selenium.common.exceptions": {"TimeoutException": _SelErr,
+                                       "NoSuchElementException": _SelErr,
+                                       "WebDriverException": _SelErr},
+        "selenium.webdriver.support": {},
+        "selenium.webdriver.support.ui": {"WebDriverWait": None},
+    }
+    engines = {
+        "playwright": _load_engine_with_fake_driver("playwright_scraper.py", {
+            "playwright": {},
+            "playwright.sync_api": {"sync_playwright": _sync_playwright,
+                                    "Error": _PWErr, "TimeoutError": _PWTimeout}}),
+        "pyppeteer": _load_engine_with_fake_driver("puppeteer_scraper.py", {
+            "pyppeteer": {"launch": _pyp_launch, "connect": _pyp_connect}}),
+        "selenium": _load_engine_with_fake_driver("selenium_scraper.py", _sel_fakes),
+    }
+
+    def _sel_build(args):
+        started.append("selenium")
+        raise _Started()
+    engines["selenium"].build_driver_with_timeout = _sel_build
+
+    def _run(name, argv):
+        """(rc or "started", captured text) for one engine's scrape()."""
+        mod = engines[name]
+        args = _engine_args(mod, argv)
+        with _captured_output() as buf:
+            try:
+                rc = mod.scrape(args)
+                if name == "pyppeteer":
+                    rc = _asyncio.run(rc)
+            except _Started:
+                rc = "started"
+        return rc, buf.getvalue()
+
+    listing = "https://www.farfetch.com/shopping/women/dresses-1/items.aspx"
+    for name in engines:
+        for status, words in ((407, "refused the credential"),
+                              (402, "balance exhausted")):
+            server, port, hits = _status_proxy(status)
+            del started[:]
+            with tempfile.TemporaryDirectory() as d:
+                out = os.path.join(d, "run")
+                try:
+                    rc, text = _run(name, [
+                        "--url", listing, "--out", out,
+                        "--proxy", "http://" + _SECRET_UP + "127.0.0.1:%d" % port])
+                finally:
+                    server.shutdown()
+                    server.server_close()
+                ok &= check(f"pre-check ({name}): a proxy {status} exits 5 (got {rc})",
+                            rc == EXIT_FETCH_FAILED)
+                ok &= check(f"pre-check ({name}): ...before the browser is started ({status})",
+                            started == [])
+                ok &= check(f"pre-check ({name}): ...after ONE request, for "
+                            f"robots.txt ({status}, saw {hits})",
+                            hits == [("CONNECT", "www.farfetch.com:443")])
+                ok &= check(f"pre-check ({name}): ...says why and names FARFETCH_PROXY ({status})",
+                            words in text and "FARFETCH_PROXY" in text)
+                ok &= check(f"pre-check ({name}): ...and never prints the credential ({status})",
+                            "S3cretPw" not in text)
+                _ap = out + ".latest_attempt.meta.json"
+                _meta = json.load(open(_ap, encoding="utf-8")) if os.path.exists(_ap) else {}
+                ok &= check(f"pre-check ({name}): ...attempt sidecar is "
+                            f"failed/proxy_auth_failed ({status})",
+                            (_meta.get("status"), _meta.get("stop_reason"),
+                             _meta.get("data_updated")) == ("failed", "proxy_auth_failed", False)
+                            and "S3cretPw" not in json.dumps(_meta))
+                ok &= check(f"pre-check ({name}): ...and no data or dataset "
+                            f"sidecar is written ({status}: {sorted(os.listdir(d))})",
+                            sorted(os.listdir(d)) == ["run.latest_attempt.meta.json"])
+                if name == "selenium":
+                    ok &= check("pre-check (selenium): ...says this engine sends "
+                                "no proxy credentials, since that is why its "
+                                "gateway refuses it",
+                                "sends NO proxy credentials" in text)
+
+        # Not a gateway verdict: the run goes on exactly as before.
+        server, port, hits = _status_proxy(403)
+        del started[:]
+        try:
+            rc, _t = _run(name, ["--url", listing, "--out", "/nonexistent/x",
+                                 "--proxy", "http://" + _UP + "127.0.0.1:%d" % port])
+        finally:
+            server.shutdown()
+            server.server_close()
+        ok &= check(f"pre-check ({name}): a 403 through the tunnel is not a "
+                    f"proxy failure — the browser starts",
+                    rc == "started" and len(hits) == 1)
+        del started[:]
+        rc, _t = _run(name, ["--url", listing, "--out", "/nonexistent/x",
+                             "--proxy", "http://" + _UP + "127.0.0.1:1"])
+        ok &= check(f"pre-check ({name}): an unreachable proxy is not a verdict "
+                    f"either — the existing transport handling decides",
+                    rc == "started")
+
+        real = engines[name].precheck_proxy
+
+        def _forbidden(*a, **k):
+            raise AssertionError("pre-check sent")
+        engines[name].precheck_proxy = _forbidden
+        try:
+            del started[:]
+            rc, _t = _run(name, ["--url", listing, "--out", "/nonexistent/x"])
+            ok &= check(f"pre-check ({name}): no proxy, no pre-check", rc == "started")
+            del started[:]
+            try:
+                rc, _t = _run(name, ["--url", listing, "--out", "/nonexistent/x",
+                                     "--proxy", "http://" + _UP + "127.0.0.1:1",
+                                     "--cdp-endpoint", "ws://127.0.0.1:1"])
+            except AssertionError:
+                rc = "pre-checked"
+            ok &= check(f"pre-check ({name}): never with --cdp-endpoint (the remote "
+                        f"browser brings its own exit) (got {rc})",
+                        rc != "pre-checked" and bool(started))
+        finally:
+            engines[name].precheck_proxy = real
+
+    ok &= check("pre-check: robots.txt of the start URL, credentials stripped",
+                _pp.robots_url("https://" + _UP + "www.farfetch.com/shopping/x/items.aspx?page=2")
+                == "https://www.farfetch.com/robots.txt")
+    ok &= check("pre-check: no proxy means no request",
+                _pp.precheck_proxy(None, "https://www.farfetch.com/robots.txt") is None)
+    ok &= check("pre-check: a socks5 proxy is not probed (requests cannot "
+                "without an extra), so it keeps its old path",
+                _pp.precheck_proxy("socks5://127.0.0.1:1",
+                                   "https://www.farfetch.com/robots.txt") is None)
+
+    # ---- media blocking: the policy ---------------------------------------
+    ns = argparse.Namespace
+    ok &= check("media: blocked behind a local proxy",
+                _pp.should_block_media(ns(load_media=False), proxy_in_use=True))
+    ok &= check("media: --load-media keeps it",
+                not _pp.should_block_media(ns(load_media=True), proxy_in_use=True))
+    ok &= check("media: no proxy, nothing metered, nothing blocked",
+                not _pp.should_block_media(ns(load_media=False), proxy_in_use=False))
+    ok &= check("media: never over CDP",
+                not _pp.should_block_media(ns(load_media=False), proxy_in_use=True,
+                                           over_cdp=True))
+    ok &= check("media: the hidden test switch forces it without a proxy",
+                _pp.should_block_media(ns(load_media=False, force_block_media=True),
+                                       proxy_in_use=False))
+
+    class _Route:
+        def __init__(self, kind):
+            self.request = ns(resource_type=kind)
+            self.done = None
+
+        def abort(self, reason=None):
+            self.done = "abort"
+
+        def continue_(self):
+            self.done = "continue"
+    for kind, want in (("image", "abort"), ("media", "abort"), ("font", "abort"),
+                       ("document", "continue"), ("script", "continue"),
+                       ("xhr", "continue"), ("fetch", "continue"),
+                       ("stylesheet", "continue")):
+        _r = _Route(kind)
+        _pp.playwright_media_route(_r)
+        ok &= check(f"media: playwright {kind} -> {want}", _r.done == want)
+
+    # ---- media blocking: each engine applies it, behaviourally -------------
+    class _Ctx:
+        def __init__(self):
+            self.routes = []
+
+        def route(self, pattern, handler):
+            self.routes.append((pattern, handler))
+
+        def add_init_script(self, *a):
+            pass
+
+        def new_page(self):
+            return "page"
+
+    class _Browser:
+        version = "124.0.6367.60"
+
+        def __init__(self):
+            self.ctx = _Ctx()
+
+        def new_context(self, **k):
+            return self.ctx
+
+    class _Chromium:
+        def launch(self, **k):
+            self.browser = _Browser()
+            return self.browser
+
+    pwm = engines["playwright"]
+    for argv, want in ((["--proxy", "http://" + _UP + "127.0.0.1:1"], True),
+                       (["--proxy", "http://" + _UP + "127.0.0.1:1", "--load-media"], False),
+                       ([], False), (["--force-block-media"], True)):
+        _args = _engine_args(pwm, ["--url", listing] + argv)
+        _fake = ns(chromium=_Chromium())
+        with _captured_output():
+            pwm._launch_local(_fake, _args, _pp.from_args(_args))
+        _routes = _fake.chromium.browser.ctx.routes
+        ok &= check(f"media: playwright {_label(argv)} -> "
+                    f"{'route installed' if want else 'nothing blocked'}",
+                    _routes == ([("**/*", _pp.playwright_media_route)] if want else []))
+
+    class _Client:
+        def __init__(self):
+            self.sent, self.handlers = [], {}
+
+        def on(self, name, fn):
+            self.handlers[name] = fn
+
+        async def send(self, cmd, params=None):
+            self.sent.append((cmd, params))
+
+    class _Stop(BaseException):
+        pass
+
+    class _PPage:
+        url = listing
+
+        def __init__(self, client):
+            self.target = ns(createCDPSession=self._session)
+            self._client = client
+
+        async def _session(self):
+            return self._client
+
+        async def authenticate(self, *a):
+            return None
+
+        async def setUserAgent(self, *a):
+            return None
+
+        async def goto(self, *a, **k):
+            raise _Stop()
+
+        async def close(self):
+            return None
+
+    class _PBrowser:
+        def __init__(self, page):
+            self.page = page
+
+        async def pages(self):
+            return [self.page]
+
+        async def version(self):
+            return "HeadlessChrome/124.0.0.0"
+
+        async def close(self):
+            return None
+
+        async def disconnect(self):
+            return None
+
+    ppm = engines["pyppeteer"]
+    for argv, want in ((["--proxy", "http://" + _UP + "127.0.0.1:1"], True),
+                       (["--proxy", "http://" + _UP + "127.0.0.1:1", "--load-media"], False),
+                       ([], False), (["--force-block-media"], True),
+                       (["--cdp-endpoint", "ws://127.0.0.1:1"], False)):
+        _client = _Client()
+        _browser = _PBrowser(_PPage(_client))
+
+        async def _give(_b=_browser, **k):
+            return _b
+        ppm.launch, ppm.connect = _give, _give
+        _args = _engine_args(ppm, ["--url", listing, "--out", "/nonexistent/x"] + argv)
+        with _captured_output():
+            try:
+                _asyncio.run(ppm.scrape(_args))
+            except _Stop:
+                pass
+        _enabled = [p for c, p in _client.sent if c == "Fetch.enable"]
+        ok &= check(f"media: pyppeteer {_label(argv)} -> "
+                    f"{'Fetch pauses images/media/fonts' if want else 'no interception'}",
+                    (len(_enabled) == 1
+                     and sorted(x["resourceType"] for x in _enabled[0]["patterns"])
+                     == ["Font", "Image", "Media"])
+                    if want else not _enabled)
+        if want and "Fetch.requestPaused" in _client.handlers:
+            async def _pause(_c=_client):
+                _c.handlers["Fetch.requestPaused"](
+                    {"requestId": "r1", "resourceType": "Image"})
+                await _asyncio.sleep(0)
+            _asyncio.run(_pause())
+            ok &= check("media: pyppeteer ...and fails what it paused",
+                        _client.sent[-1] == ("Fetch.failRequest",
+                                             {"requestId": "r1",
+                                              "errorReason": "BlockedByClient"}))
+
+    class _Opts:
+        def __init__(self):
+            self.arguments = []
+            self.binary_location = None
+
+        def add_argument(self, a):
+            self.arguments.append(a)
+
+    class _SelDriver:
+        def __init__(self, **k):
+            self.capabilities = {}
+            self.cdp = []
+            self.options = k.get("options")
+
+        def execute_cdp_cmd(self, cmd, params):
+            self.cdp.append((cmd, params))
+
+    import shutil as _shutil
+    selm = engines["selenium"]
+    selm.Options, selm.Service = _Opts, (lambda **k: ns(**k))
+    selm.webdriver = ns(Chrome=_SelDriver)
+    for argv, want in ((["--proxy", "http://" + _UP + "127.0.0.1:1"], True),
+                       (["--proxy", "http://" + _UP + "127.0.0.1:1", "--load-media"], False),
+                       ([], False), (["--force-block-media"], True)):
+        _args = _engine_args(selm, ["--url", listing, "--chromedriver", sys.executable] + argv)
+        with _captured_output():
+            _drv = selm.build_driver(_args)
+        for a in _drv.options.arguments:
+            if a.startswith("--user-data-dir="):
+                _shutil.rmtree(a.split("=", 1)[1], ignore_errors=True)
+        _blocked = dict(_drv.cdp).get("Network.setBlockedURLs", {}).get("urls", [])
+        ok &= check(f"media: selenium {_label(argv)} -> "
+                    f"{'images/video/fonts blocked by URL' if want else 'nothing blocked'}",
+                    (all(p in _blocked for p in ("*.jpg", "*.webp?*", "*.mp4", "*.woff2"))
+                     and not any(p.startswith(("*.js", "*.css")) for p in _blocked)
+                     and _drv.media_blocked is True)
+                    if want else (not _blocked and _drv.media_blocked is False))
+
+    # A source check as well, so removing a blocker call cannot hide behind a
+    # fake that happens not to exercise it.
+    for fname, call in (("playwright_scraper.py", "playwright_media_route"),
+                        ("selenium_scraper.py", "selenium_block_media("),
+                        ("puppeteer_scraper.py", "pyppeteer_block_media(")):
+        src = open(os.path.join(_repo_root, fname), encoding="utf-8").read()
+        ok &= check(f"media: {fname} consults the policy and calls its blocker",
+                    "should_block_media(" in src and call in src)
+
+    for name, mod in engines.items():
+        buf = io.StringIO()
+        saved_argv = sys.argv
+        sys.argv = ["engine", "--help"]
+        try:
+            with contextlib.redirect_stdout(buf):
+                try:
+                    mod.parse_args()
+                except SystemExit:
+                    pass
+        finally:
+            sys.argv = saved_argv
+        _help = buf.getvalue()
+        ok &= check(f"media: {name} documents --load-media in --help and hides "
+                    f"the test switch",
+                    "--load-media" in _help and "--force-block-media" not in _help)
+    return ok
+
+
 def main() -> int:
     ok = True
 
@@ -4679,6 +5138,7 @@ def main() -> int:
     ok = check_numeric_flags_are_range_checked_in_every_cli(ok)
     ok = check_the_dockerfile_s_copy_list_vs_the_entrypoint_s_i(ok)
     ok = check_audit_2026_10_14_contract_fixes(ok)
+    ok = check_proxy_traffic_savers(ok)
 
     # The report below is only worth something if it reflects what the
     # sections recorded: an engine whose driver library is absent must appear

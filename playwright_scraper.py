@@ -64,13 +64,17 @@ from product_parser import (parse_products, SELECTORS, detect_bot_challenge,
 from product_detail_parser import parse_product_detail
 from output_writer import (dedupe_by_sku, finish_run, stop_reason_for,
                            COMPLETE_STOP_REASONS, new_run_id,
-                           ProductVariant, EXIT_FETCH_FAILED)
+                           ProductVariant, EXIT_FETCH_FAILED,
+                           write_failed_attempt)
 from run_state import Checkpoint
 from proxy_pool import (from_args as proxy_pool_from_args, to_playwright, mask,
                         redact_url_credentials, describe_cdp_failure,
                         cdp_failure_is_transient, CDP_CONNECT_ATTEMPTS,
                         CDP_CONNECT_PAUSE_S,
-                        ROTATE_MODES, ProxyError, ProxyPool)
+                        ROTATE_MODES, ProxyError, ProxyPool,
+                        precheck_proxy, robots_url, precheck_message,
+                        ProxyPrecheckError, PROXY_PRECHECK_STOP_REASON,
+                        should_block_media, playwright_media_route)
 import env_config
 from arg_types import positive_int, nonneg_int, nonneg_float
 
@@ -275,6 +279,13 @@ def _launch_local(pw, args, pool):
     if init_script:
         # Must be installed on the context, before any page script runs.
         context.add_init_script(init_script)
+    if should_block_media(args, proxy_in_use=bool(proxy)):
+        # Behind a metered proxy: abort images, video/audio and web fonts.
+        # No parser reads them (image_url comes from the markup, not from a
+        # loaded image). --load-media keeps them.
+        context.route("**/*", playwright_media_route)
+        logger.info("Blocking images/media/fonts "
+                    "(--load-media keeps them).")
     return browser, context, context.new_page()
 
 
@@ -983,6 +994,22 @@ def scrape(args) -> int:
                        "proxy on top would contradict it.")
         pool = None
 
+    if pool:
+        # One HEAD for robots.txt through the proxy BEFORE any browser
+        # starts: a gateway 407/402 ends the run here with exit 5 instead of
+        # launching browsers whose every request would be refused the same
+        # way. Any other answer, or a transport error, changes nothing.
+        try:
+            precheck_proxy(pool.current, robots_url(args.url), timeout=20)
+        except ProxyPrecheckError as exc:
+            print(precheck_message(exc, "FARFETCH_PROXY", "farfetch.com"),
+                  file=sys.stderr)
+            write_failed_attempt(args.out, stop_reason=PROXY_PRECHECK_STOP_REASON,
+                                 start_url=args.url, pages_requested=args.pages,
+                                 transport_error="proxy pre-check: %s" % exc,
+                                 mode=args.mode)
+            return EXIT_FETCH_FAILED
+
     concurrency = max(1, args.concurrency)
     if concurrency > 1:
         if args.cdp_endpoint:
@@ -1258,6 +1285,12 @@ def parse_args():
     p.add_argument("--format", choices=["json", "csv", "both"], default="both")
     p.add_argument("--out", default="farfetch_products", help="Output file prefix")
     p.add_argument("--proxy", default=None, help="Proxy URL, e.g. http://ACCOUNT:PASSWORD@HOST:9999 (2captcha.com/proxy)")
+    p.add_argument("--load-media", action="store_true",
+                   help="Load images, video and web fonts. By default they are "
+                        "aborted while a LOCAL browser goes through --proxy / --proxy-file "
+                        "(no parser reads them, and a proxy bills per byte); "
+                        "never blocked with --cdp-endpoint or with no proxy.")
+    p.add_argument("--force-block-media", action="store_true", help=argparse.SUPPRESS)
     p.add_argument("--proxy-file", default=None,
                    help="File with one proxy URL per line (# comments and blank "
                         "lines skipped) to rotate across. Wins over --proxy.")

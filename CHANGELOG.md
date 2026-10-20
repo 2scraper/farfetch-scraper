@@ -8,6 +8,27 @@ a promise that every flag and exit code is contractually frozen.
 
 ## [Unreleased]
 
+> **Behaviour changes.** (1) Behind `--proxy` / `--proxy-file`, every browser
+> engine now sends one `HEAD https://www.farfetch.com/robots.txt` through the
+> proxy before starting a browser. A gateway `407` or `402` ends the run with
+> exit 5 and `stop_reason: proxy_auth_failed` in the new
+> `<out>.latest_attempt.meta.json`, and no browser is started. The data
+> files and `<out>.meta.json` are left untouched. (2) Behind a local proxy,
+> the browser no longer downloads images, video/audio or web fonts.
+> `--load-media` restores the old behaviour. Nothing changes with
+> `--cdp-endpoint` or without a proxy.
+
+### Added
+
+- Proxy pre-check in `playwright_scraper.py`, `puppeteer_scraper.py` and
+  `selenium_scraper.py`. Selenium pre-checks the proxy without credentials,
+  exactly as its browser uses it, and says so when a 407 follows. A 403, a
+  timeout or an unreachable proxy is not treated as a verdict.
+- Media blocking behind a local proxy: by resource type in Playwright
+  (`context.route`) and pyppeteer (CDP `Fetch`), and by file extension in
+  Selenium (`Network.setBlockedURLs`). `--load-media` opts out on all three.
+  Playwright turns off its HTTP cache while a route is installed.
+
 ### Changed
 
 - CI only: the whole canary, free and paid jobs alike, now runs weekly (Mondays 06:17 UTC) and on a manual dispatch; the daily schedule is removed.
