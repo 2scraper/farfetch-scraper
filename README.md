@@ -250,6 +250,7 @@ The three browser engines share these:
 | `--cdp-endpoint` | – | Attach to a running browser instead of launching one |
 | `--proxy` | – | Proxy for a self-launched browser; ignored with `--cdp-endpoint`. Pre-checked before the browser starts ([traffic savers](#traffic-savers-pre-check-and-media-blocking)) |
 | `--load-media` | off | Load images, video and web fonts behind `--proxy` too (by default they are blocked there) |
+| `--proxy-budget-mb` | 10 | Stop once this many MB have gone through `--proxy` / `--proxy-file`; `0` = unlimited (see [Traffic budget](#traffic-budget)) |
 | `--retries` | `3` | Attempts per page load, pause doubling each time |
 | `--concurrency` | `1` | Playwright only — fetch pages through N parallel workers ([details](#concurrency)) |
 | `--twocaptcha-key` | – | 2Captcha API key (or set `TWOCAPTCHA_KEY`) |
@@ -284,8 +285,8 @@ A contract, not decoration — the harness and any pipeline can branch on these.
 | `2` | Bad usage |
 | `3` | **Blocked before parsing** — a challenge page, or an outright refusal |
 | `4` | Fetched the page fine, parsed **0 products**, and the page links to no products either |
-| `5` | **No content obtained** — navigation timeout, dead proxy, a proxy gateway that refused the pre-check with 407/402 (`stop_reason: proxy_auth_failed`), 4xx/5xx, a failed `--cdp-endpoint` connect, a Scraper API error, or a page that links to products and parsed to none (`stop_reason: parse_drift` — a parser problem, not a network one) |
-| `6` | **Partial run** — products written, but the page loop stopped early |
+| `5` | **No content obtained** — navigation timeout, dead proxy, a proxy gateway that refused the pre-check with 407/402 (`stop_reason: proxy_auth_failed`), 4xx/5xx, a failed `--cdp-endpoint` connect, a Scraper API error, or a page that links to products and parsed to none (`stop_reason: parse_drift` — a parser problem, not a network one), or the proxy budget ran out before any product was read (`stop_reason: proxy_budget_exceeded`) |
+| `6` | **Partial run** — products written, but the page loop stopped early (including at `--proxy-budget-mb`: `stop_reason: proxy_budget_exceeded`) |
 | `124` | Selenium only: chromedriver could not be **started** within the watchdog |
 
 **Exit 4 means the page loaded.** This is the one code that says something
@@ -840,6 +841,39 @@ off.
 
 Debug screenshots (`*_debug.png`) taken while blocking is on show the page
 without its images.
+
+#### Traffic budget
+
+Also only for a browser this repo launches behind `--proxy` / `--proxy-file`:
+every byte that browser sends or receives through the proxy is counted, and
+`--proxy-budget-mb` (default `10`; `0` = unlimited) caps a run. Once the
+running total passes the budget:
+
+- no further listing page, worker page or product page is opened, and the
+  browser aborts any request it still tries;
+- the products already read are kept, and the run ends with
+  `stop_reason: proxy_budget_exceeded` — exit 6 with products, exit 5
+  without. It never goes on silently, and a block or an empty page seen on
+  the way does not change that code.
+
+The sidecar records `proxy_bytes`, `proxy_budget_bytes` and
+`proxy_budget_exceeded` (`null` / `null` / `false` when no local proxy was
+used). A proxied run that writes no products records them in
+`<out>.latest_attempt.meta.json` beside the untouched data. A proxied run
+ends with one line such as `Proxy traffic: 3.2 MB of 10 MB budget`.
+
+The count is an estimate of the tunnelled payload — request line, headers
+and body sent, response headers and body as received — not the proxy's
+invoice: TLS records, the `CONNECT` exchange, WebSocket frames and the
+browser's own background requests are not visible to it, so the bill is a
+few per cent higher. 1 MB = 1,000,000 bytes.
+
+| Engine | Counted from |
+|---|---|
+| Playwright | `request.sizes()` of every finished or failed request |
+| pyppeteer | CDP `Network.loadingFinished.encodedDataLength` of every `http(s)` response that came over the network, plus each request's line, headers and body (`Network.requestWillBeSent`) |
+| Selenium | the same CDP events, read from Chrome's performance log |
+| pre-check | the `HEAD` itself (request + response headers) |
 
 Measured 2026-10-20 against a local stub page holding a png, a jpg, a woff2,
 an mp4 and a script. Without blocking, every engine fetched all of them. With

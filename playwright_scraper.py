@@ -76,6 +76,7 @@ from proxy_pool import (from_args as proxy_pool_from_args, to_playwright, mask,
                         ProxyPrecheckError, PROXY_PRECHECK_STOP_REASON,
                         should_block_media, playwright_media_route)
 import env_config
+import proxy_meter
 from arg_types import positive_int, nonneg_int, nonneg_float
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
@@ -286,6 +287,10 @@ def _launch_local(pw, args, pool):
         context.route("**/*", playwright_media_route)
         logger.info("Blocking images/media/fonts "
                     "(--load-media keeps them).")
+    if proxy:
+        # Counted for --proxy-budget-mb. Registered after the media route, so
+        # it is asked first and aborts every request once the budget is spent.
+        proxy_meter.current().attach_playwright(context)
     return browser, context, context.new_page()
 
 
@@ -587,6 +592,10 @@ def _fetch_one_page(session, args, pool, page_num: int, url: str) -> PageOutcome
     budget = SolveBudget()
 
     for block_attempt in range(block_retries + 1):
+        if proxy_meter.exceeded():
+            # --proxy-budget-mb is spent: no new navigation through the proxy.
+            outcome.load_failed = True
+            return outcome
         logger.info("Fetching page %d/%d: %s", page_num, args.pages, url)
         # Retry a navigation timeout rather than ending the run on it.
         # One network flap on page 12 of 50 used to break the loop, and
@@ -827,7 +836,7 @@ def _fetch_pages_concurrently(args, pool, specs, concurrency: int,
                 session = _BrowserSession(pw, args, _worker_pool(pool, index)).open()
                 try:
                     first = True
-                    while not exhausted.is_set():
+                    while not exhausted.is_set() and not proxy_meter.exceeded():
                         try:
                             page_num, url = work.get_nowait()
                         except queue.Empty:
@@ -912,6 +921,8 @@ def _crawl_details(session, args, listing_rows, checkpoint):
     for i, url in enumerate(urls, start=1):
         if checkpoint.has(i):
             continue
+        if proxy_meter.exceeded():
+            break  # --proxy-budget-mb: no further product page through the proxy
         if i > 1:
             time.sleep(args.delay)
         try:
@@ -993,6 +1004,9 @@ def scrape(args) -> int:
                        "remote browser has its own exit, and layering a second "
                        "proxy on top would contradict it.")
         pool = None
+    # Meters what goes through a LOCAL proxy (none over --cdp-endpoint or
+    # without a proxy) and stops the run at --proxy-budget-mb.
+    proxy_meter.start(getattr(args, "proxy_budget_mb", None), active=bool(pool))
 
     if pool:
         # One HEAD for robots.txt through the proxy BEFORE any browser
@@ -1128,6 +1142,8 @@ def scrape(args) -> int:
                     url = (planned[0] if planned else
                            _next_url_from_page(session.page, args, 1))
                     for page_num in range(2, args.pages + 1):
+                        if proxy_meter.exceeded():
+                            break  # --proxy-budget-mb; finish_run names the stop
                         # A new exit per page is what actually spreads a run's
                         # volume, and it costs a browser relaunch: see
                         # _launch_local for why carrying the session across
@@ -1207,7 +1223,13 @@ def scrape(args) -> int:
                  if ok_pages else args.url)
 
     rows, row_type = all_products, None
-    if args.mode == "detail":
+    if args.mode == "detail" and proxy_meter.exceeded():
+        # The budget ran out on the listing: no product page is opened, and
+        # listing rows are not written as if they were size rows.
+        logger.warning("The proxy budget was spent on the listing pages — no "
+                       "product page opened (--proxy-budget-mb).")
+        rows, row_type = [], ProductVariant
+    elif args.mode == "detail":
         # A fresh session for the crawl. The listing session is closed by now
         # — and under --concurrency it was closed before the workers even
         # started — so reopening is the consistent choice rather than
@@ -1291,6 +1313,7 @@ def parse_args():
                         "(no parser reads them, and a proxy bills per byte); "
                         "never blocked with --cdp-endpoint or with no proxy.")
     p.add_argument("--force-block-media", action="store_true", help=argparse.SUPPRESS)
+    proxy_meter.add_budget_argument(p)
     p.add_argument("--proxy-file", default=None,
                    help="File with one proxy URL per line (# comments and blank "
                         "lines skipped) to rotate across. Wins over --proxy.")

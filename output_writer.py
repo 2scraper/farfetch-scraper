@@ -12,6 +12,7 @@ import tempfile
 import uuid
 
 import notify
+import proxy_meter
 from dataclasses import dataclass, asdict, field
 from datetime import datetime, timezone
 from typing import Optional, List, Set
@@ -397,12 +398,15 @@ def write_failed_attempt(out_prefix: str, *, stop_reason: str,
                     products=0, mode=mode)
     meta.update(blocked=False, transport_error=transport_error,
                 data_updated=False)
+    # proxy_bytes / proxy_budget_bytes / proxy_budget_exceeded
+    meta.update(proxy_meter.sidecar())
     path = f"{out_prefix}{ATTEMPT_META_SUFFIX}"
     with _atomic(path) as f:
         json.dump(meta, f, ensure_ascii=False, indent=2)
     print(f"[+] Wrote attempt metadata -> {path} (status=failed, "
           f"stop_reason={stop_reason}); the data and {out_prefix}.meta.json "
           f"were left as they were.")
+    proxy_meter.report()
     return path
 
 
@@ -596,6 +600,11 @@ def finish_run(products: List[Product], out_prefix: str, fmt: str,
     # fix: 28 of 32 repos behaved this way. Same shape as the exit-code
     # unification this file already carries — a rule keyed on a list of
     # names has a hole for every name nobody added to it.
+    meter = proxy_meter.current()
+    if meter.exceeded:
+        # The run stopped itself at --proxy-budget-mb. That outranks whatever
+        # the pages it did fetch said: rows kept -> 6, none -> 5 (never 3/4).
+        stop_reason, blocked = proxy_meter.STOP_REASON, False
     complete = stop_reason in COMPLETE_STOP_REASONS and not pages_failed
     write_stats: dict = {}
     rc = save(products, out_prefix, fmt, allow_empty=allow_empty,
@@ -620,8 +629,17 @@ def finish_run(products: List[Product], out_prefix: str, fmt: str,
     # not overwrite a key the run itself set.
     for k, v in write_stats.items():
         meta.setdefault(k, v)
+    for k, v in proxy_meter.sidecar().items():
+        meta.setdefault(k, v)
     if wrote_output:
         write_run_meta(out_prefix, meta)
+    elif meter.active:
+        # Nothing written, but what the proxy carried is still recorded
+        # beside the untouched data: <out>.latest_attempt.meta.json.
+        attempt = dict(meta, data_updated=False)
+        with _atomic(f"{out_prefix}{ATTEMPT_META_SUFFIX}") as f:
+            json.dump(attempt, f, ensure_ascii=False, indent=2)
+    proxy_meter.report()
 
     rc = _finish_code(products, rc, blocked, stop_reason, complete,
                       out_prefix, pages_completed, pages_requested)
