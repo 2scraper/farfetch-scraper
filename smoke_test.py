@@ -5005,6 +5005,20 @@ def check_proxy_traffic_meter(ok: bool) -> bool:
         rc, out, last = _summarise()
         ok &= check("canary summary: a missing sidecar is reported, not a crash",
                     rc == 0 and "not recorded" in last)
+        # This repo writes finished_at as ISO-8601: the newer of the two
+        # sidecars must be chosen by time, also beside one with no timestamp.
+        rc, out, last = _summarise({"proxy_bytes": 1, "proxy_budget_exceeded": False,
+                                    "finished_at": "2026-10-21T00:00:01+00:00"},
+                                   {"proxy_bytes": 10_200_000, "proxy_budget_exceeded": True,
+                                    "finished_at": "2026-10-21T00:00:05+00:00"})
+        ok &= check("canary summary: of two sidecars with ISO finished_at the newer one is "
+                    "the run's (got rc %s)" % rc, rc == 1)
+        rc, out, last = _summarise({"proxy_bytes": 10_200_000, "proxy_budget_exceeded": True,
+                                    "finished_at": "2026-10-21T00:00:09+00:00"},
+                                   {"proxy_bytes": 1, "proxy_budget_exceeded": False})
+        ok &= check("canary summary: an ISO timestamp beside a sidecar without one does not "
+                    "crash the step (got rc %s)" % rc,
+                    rc == 1 and "::error::stopped: proxy budget 10 MB exceeded" in out)
     return ok
 
 

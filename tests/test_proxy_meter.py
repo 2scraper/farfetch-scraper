@@ -304,6 +304,36 @@ class CdpEvents(unittest.TestCase):
         self.assertEqual(meter.bytes, 2000)
         self.assertIn(("Network.setBlockedURLs", {"urls": ["*"]}), client.sent)
 
+    def test_pyppeteer_block_from_a_worker_thread(self):
+        """The budget can trip on a thread with no event loop (a concurrent
+        worker): the block is still sent, on the page's own loop."""
+        sent = []
+
+        class Client:
+            def on(self, name, fn):
+                pass
+
+            async def send(self, cmd, params=None):
+                sent.append(cmd)
+
+        async def create():
+            return Client()
+
+        page = argparse.Namespace(target=argparse.Namespace(createCDPSession=create))
+        meter = proxy_meter.ProxyMeter(0.001, active=True)
+
+        async def go():
+            await meter.attach_pyppeteer(page)
+            worker = threading.Thread(target=meter.add, args=(5000,))
+            worker.start()
+            worker.join()
+            for _ in range(5):
+                await asyncio.sleep(0)
+
+        asyncio.run(go())
+        self.assertTrue(meter.exceeded)
+        self.assertIn("Network.setBlockedURLs", sent)
+
 
 class PlaywrightHooks(unittest.TestCase):
     def test_sizes_and_budget_route(self):

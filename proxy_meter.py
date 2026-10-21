@@ -305,8 +305,18 @@ class ProxyMeter:
             client.on(event, lambda params, _event=event: self.feed_cdp(_event, params))
         await client.send("Network.enable", {})
         if self.budget_bytes:
+            # The budget can trip on another thread (a concurrent worker) that
+            # has no event loop: hand the block to this page's own loop.
+            loop = asyncio.get_event_loop()
+
+            async def _send_block():
+                try:
+                    await client.send("Network.setBlockedURLs", {"urls": ["*"]})
+                except Exception:  # noqa: BLE001 - the loop check still stops the run
+                    pass
+
             def _block():
-                asyncio.ensure_future(client.send("Network.setBlockedURLs", {"urls": ["*"]}))
+                loop.call_soon_threadsafe(lambda: asyncio.ensure_future(_send_block()))
             self.on_exceeded(_block)
 
     def attach_selenium(self, driver, *, keep_entries: bool = True) -> None:
