@@ -73,6 +73,7 @@ from proxy_pool import (precheck_proxy, robots_url, precheck_message,
                         ProxyPrecheckError, PROXY_PRECHECK_STOP_REASON,
                         should_block_media, selenium_block_media)
 import env_config
+import proxy_meter
 from arg_types import positive_int, nonneg_float
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
@@ -586,6 +587,9 @@ def build_driver(args) -> webdriver.Chrome:
         parsed = urlparse(args.proxy)
         options.add_argument(f"--proxy-server={_bare_proxy(args.proxy)}")
         logger.info("Using proxy %s", mask_proxy(args.proxy))
+        # Chrome's performance log carries the CDP Network events the
+        # --proxy-budget-mb meter counts.
+        proxy_meter.selenium_logging_prefs(options)
         if parsed.username or parsed.password:
             logger.warning(
                 "The credentials in --proxy were dropped, not sent: Chromium's "
@@ -649,6 +653,8 @@ def build_driver(args) -> webdriver.Chrome:
     driver.execute_cdp_cmd("Page.addScriptToEvaluateOnNewDocument", {
         "source": "Object.defineProperty(navigator, 'webdriver', {get: () => undefined})"
     })
+    if args.proxy:
+        proxy_meter.current().attach_selenium(driver, keep_entries=False)
     driver.media_blocked = False
     if should_block_media(args, proxy_in_use=bool(args.proxy)):
         # By URL pattern: Selenium has no request events, only
@@ -750,6 +756,8 @@ def scrape(args) -> int:
     stop_reason = "completed"
     pages_completed = 0
     final_url = args.url
+    # Meters what goes through a LOCAL proxy and stops at --proxy-budget-mb.
+    proxy_meter.start(getattr(args, "proxy_budget_mb", None), active=bool(args.proxy) and not args.cdp_endpoint)
     if args.proxy and not args.cdp_endpoint:
         # One HEAD for robots.txt BEFORE chromedriver starts — see
         # playwright_scraper.py. Sent exactly as this browser will use the
@@ -790,12 +798,17 @@ def scrape(args) -> int:
     try:
         url = args.url
         for page_num in range(1, args.pages + 1):
+            if proxy_meter.exceeded():
+                break  # --proxy-budget-mb is spent; finish_run names the stop
             logger.info("Fetching page %d/%d: %s", page_num, args.pages, url)
             # Retry a navigation failure rather than ending the run on it —
             # see playwright_scraper.py for why.
             http_status = None
             for attempt in range(1, args.retries + 1):
                 load_failed = False
+                if proxy_meter.exceeded():
+                    load_failed = True
+                    break
                 try:
                     driver.get(url)
                     wait.until(lambda d: d.execute_script("return document.readyState") == "complete")
@@ -826,6 +839,7 @@ def scrape(args) -> int:
                                 "parsing whatever loaded (may be a bot-check/consent page).")
 
             html = driver.page_source
+            proxy_meter.current().poll_selenium(driver)  # --proxy-budget-mb
 
             vendor = detect_bot_challenge(html)
             if vendor:
@@ -922,6 +936,7 @@ def scrape(args) -> int:
         if args.cdp_endpoint:
             driver.close()  # detach this tab only, leave the remote browser running
         else:
+            proxy_meter.current().poll_selenium(driver)  # what the last page still loaded
             driver.quit()
 
     return finish_run(all_products, args.out, args.format, args.allow_empty,
@@ -955,6 +970,7 @@ def parse_args():
                         "(no parser reads them, and a proxy bills per byte); "
                         "never blocked with --cdp-endpoint or with no proxy.")
     p.add_argument("--force-block-media", action="store_true", help=argparse.SUPPRESS)
+    proxy_meter.add_budget_argument(p)
     p.add_argument("--chrome-binary", default=None,
                    help="Path to the Chrome/Chromium binary to launch locally. Only "
                         "needed when it isn't in one of chromedriver's default "

@@ -16,7 +16,12 @@ a promise that every flag and exit code is contractually frozen.
 > files and `<out>.meta.json` are left untouched. (2) Behind a local proxy,
 > the browser no longer downloads images, video/audio or web fonts.
 > `--load-media` restores the old behaviour. Nothing changes with
-> `--cdp-endpoint` or without a proxy.
+> `--cdp-endpoint` or without a proxy. (3) Behind a local proxy a run now
+> stops once about 10 MB have gone through it (`--proxy-budget-mb`, `0` =
+> unlimited): the products read so far are kept and the run exits 6 (5 with
+> none), `stop_reason: proxy_budget_exceeded`. A proxied run that writes no
+> products now writes `<out>.latest_attempt.meta.json` with its outcome and
+> byte count.
 
 ### Added
 
@@ -28,6 +33,19 @@ a promise that every flag and exit code is contractually frozen.
   (`context.route`) and pyppeteer (CDP `Fetch`), and by file extension in
   Selenium (`Network.setBlockedURLs`). `--load-media` opts out on all three.
   Playwright turns off its HTTP cache while a route is installed.
+- Proxy traffic meter (`proxy_meter.py`) in all three engines, active only
+  behind a local proxy: Playwright sums `request.sizes()`, pyppeteer and
+  Selenium read CDP `Network.loadingFinished.encodedDataLength` plus the
+  request sizes, and the pre-check's `HEAD` counts too. It is an estimate of
+  the tunnelled payload (TLS/`CONNECT` overhead not included). The sidecar
+  records `proxy_bytes`, `proxy_budget_bytes` and `proxy_budget_exceeded`, and
+  a proxied run ends with one `Proxy traffic: X.X MB of Y MB budget` line. New
+  flag `--proxy-budget-mb` (default 10) on every engine.
+- CI only: the production-like canary passes `--proxy-budget-mb 10`, writes
+  `**production-like**: proxy traffic X.X MB of 10 MB` to the job summary and
+  fails with `::error::stopped: proxy budget 10 MB exceeded` when the run hit
+  the budget. The engine jobs run the meter against a stub proxy in a real
+  browser.
 
 ### Changed
 

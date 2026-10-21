@@ -251,8 +251,10 @@ jobs:
     # (which proves each requirements file is self-consistent, a thing nothing
     # checked before), and is exactly what the README tells users to do.
     #
-    # Browser BINARIES are still not installed: the offline suite imports the
-    # libraries and never launches one.
+    # Browser BINARIES: the offline suite imports the libraries and never
+    # launches one. The proxy-meter step at the end does launch a real
+    # browser against a stub proxy on 127.0.0.1 (Playwright's own Chromium,
+    # the runner's Chrome for pyppeteer and Selenium).
     strategy:
       fail-fast: false
       matrix:
@@ -326,6 +328,18 @@ jobs:
 
       - name: This engine's CLI answers --help
         run: .venv-${{ matrix.engine }}/bin/python ${{ matrix.engine }}_scraper.py --help
+
+      - name: Install Playwright's Chromium (playwright only)
+        if: matrix.engine == 'playwright'
+        run: .venv-playwright/bin/playwright install --with-deps chromium
+
+      - name: The proxy meter against a stub proxy, in a real browser
+        # tests/test_proxy_meter.py compares this engine's byte count with
+        # what a local stub proxy saw. PROXY_METER_REQUIRE makes a missing
+        # engine or browser a failure here instead of a skip.
+        env:
+          PROXY_METER_REQUIRE: ${{ matrix.library }}
+        run: .venv-${{ matrix.engine }}/bin/python -m unittest -v tests.test_proxy_meter
 
       - name: The console scripts install and resolve
         # A [project.scripts] entry naming a missing target installs happily

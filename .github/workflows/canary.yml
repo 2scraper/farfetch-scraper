@@ -171,8 +171,16 @@ jobs:
           set +e
           python3 playwright_scraper.py \
             --url "https://www.farfetch.com/shopping/kids/girls-clothing-4/items.aspx" \
-            --pages 3 --out canary_run --dump-html canary_run.html
+            --pages 3 --out canary_run --dump-html canary_run.html --proxy-budget-mb 10
           echo "exit_code=$?" >> "$GITHUB_OUTPUT"
+
+      - name: Proxy traffic
+        # What the run sent through FARFETCH_PROXY, read from its sidecar,
+        # into the job summary. Red when the run stopped at the 10 MB budget
+        # (stop_reason proxy_budget_exceeded); a missing sidecar is reported,
+        # not failed — the next step judges the run itself.
+        if: always() && env.HAVE_PROXY == 'true'
+        run: python3 .github/proxy_traffic_summary.py canary_run production-like 10
 
       - name: Interpret the exit code
         if: env.HAVE_PROXY == 'true'
@@ -192,6 +200,7 @@ jobs:
             canary_run.json
             canary_run.csv
             canary_run.meta.json
+            canary_run.latest_attempt.meta.json
             canary_run.html*
             canary_run_page*_debug.*
           if-no-files-found: ignore

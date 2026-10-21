@@ -3695,7 +3695,9 @@ def check_canary_yml_the_exit_code_table_it_prints_must_be(ok: bool) -> bool:
         ok &= check("the canary never puts the proxy credential in argv — it "
                     "goes through the environment env_config.py already "
                     "reads",
-                    not any("--proxy" in ln for ln in _cwf_code)
+                    # --proxy / --proxy-file carry the credential;
+                    # --proxy-budget-mb is a number and may appear.
+                    not any(re.search(r"--proxy(?:[ =]|-file)", ln) for ln in _cwf_code)
                     and "FARFETCH_PROXY: ${{ secrets.FARFETCH_PROXY }}" in _cwf)
         # Reversed on 2026-10-15. It used to SKIP green without the secret,
         # and the no-proxy job was refused on every run, so for a month the
@@ -4534,6 +4536,482 @@ def _engine_args(mod, argv):
         os.environ.update(saved_env)
 
 
+def check_proxy_traffic_meter(ok: bool) -> bool:
+    """proxy traffic meter and --proxy-budget-mb (proxy_meter.py; its byte
+    counts against a stub proxy are in tests/test_proxy_meter.py)"""
+    import asyncio as _asyncio
+    import proxy_meter as _pm
+    import proxy_pool as _pp
+    import output_writer as _ow
+
+    ns = argparse.Namespace
+    listing = "https://www.farfetch.com/shopping/kids/girls-clothing-4/items.aspx"
+    proxy_argv = ["--proxy", "http://" + _UP + "127.0.0.1:1"]  # pre-check: refused, no verdict
+
+    def _page_html(n, empty=False):
+        if empty:
+            return "<html><body><div class='grid'></div></body></html>"
+        return (SAMPLE_LISTING_HTML.replace("29998189", "%d1" % (n + 1000))
+                .replace("item-99999", "item-%d2" % (n + 1000)))
+
+    class _Meter:
+        """What each fake navigation costs through the proxy."""
+        cost = 0
+        gotos = []
+        empty = False
+
+        @classmethod
+        def nav(cls, url):
+            cls.gotos.append(url)
+            _pm.current().add(cls.cost)
+            n = 1
+            if "page=" in url:
+                n = int(url.split("page=")[1].split("&")[0])
+            return _page_html(n, cls.empty)
+
+    # ---- fakes for the three engines --------------------------------------
+    class _PWErr(Exception):
+        pass
+
+    class _PWTimeout(_PWErr):
+        pass
+
+    class _PWPage:
+        def __init__(self):
+            self.url, self._html = "about:blank", ""
+
+        def goto(self, url, **k):
+            self._html, self.url = _Meter.nav(url), url
+            return ns(status=200)
+
+        def content(self):
+            return self._html
+
+        def wait_for_function(self, *a, **k):
+            return None
+
+        def wait_for_timeout(self, *a):
+            return None
+
+        def query_selector(self, *a):
+            return None
+
+        def screenshot(self, **k):
+            return None
+
+        def close(self):
+            return None
+
+    class _PWCtx:
+        def __init__(self):
+            self.routes, self.events = [], []
+
+        def route(self, pattern, handler):
+            self.routes.append(handler)
+
+        def on(self, name, fn):
+            self.events.append(name)
+
+        def add_init_script(self, *a):
+            pass
+
+        def new_page(self):
+            return _PWPage()
+
+    class _PWBrowser:
+        version = "124.0.6367.60"
+
+        def __init__(self):
+            self.contexts = []
+
+        def new_context(self, **k):
+            self.contexts.append(_PWCtx())
+            return self.contexts[-1]
+
+        def close(self):
+            pass
+
+    @contextlib.contextmanager
+    def _sync_playwright():
+        yield ns(chromium=ns(launch=lambda **k: _PWBrowser()))
+
+    class _SelErr(Exception):
+        pass
+
+    class _Wait:
+        def __init__(self, *a, **k):
+            pass
+
+        def until(self, fn):
+            return True
+
+    _sel_fakes = {
+        "selenium": {}, "selenium.webdriver": {"Chrome": None},
+        "selenium.webdriver.chrome": {},
+        "selenium.webdriver.chrome.options": {"Options": None},
+        "selenium.webdriver.chrome.service": {"Service": None},
+        "selenium.webdriver.common": {}, "selenium.webdriver.common.by": {"By": ns(CSS_SELECTOR="css")},
+        "selenium.common": {},
+        "selenium.common.exceptions": {"TimeoutException": _SelErr,
+                                       "NoSuchElementException": _SelErr,
+                                       "WebDriverException": _SelErr},
+        "selenium.webdriver.support": {},
+        "selenium.webdriver.support.ui": {"WebDriverWait": _Wait},
+    }
+
+    class _SelDriver:
+        def __init__(self):
+            self.page_source, self.current_url = "", "about:blank"
+
+        def get(self, url):
+            self.page_source, self.current_url = _Meter.nav(url), url
+
+        def execute_script(self, js, *a):
+            return "complete" if "readyState" in js else 200
+
+        def find_element(self, *a):
+            raise _SelErr()
+
+        def save_screenshot(self, *a):
+            return True
+
+        def quit(self):
+            pass
+
+        def close(self):
+            pass
+
+    class _PPage:
+        def __init__(self):
+            self.url, self._html = "about:blank", ""
+            self.client = ns(sent=[], on=lambda *a: None)
+            self.target = ns(createCDPSession=self._session)
+
+        async def _session(self):
+            async def send(cmd, params=None):
+                self.client.sent.append(cmd)
+            self.client.send = send
+            return self.client
+
+        async def authenticate(self, *a):
+            return None
+
+        async def setUserAgent(self, *a):
+            return None
+
+        async def goto(self, url, *a, **k):
+            self._html, self.url = _Meter.nav(url), url
+            return ns(status=200)
+
+        async def waitForFunction(self, *a, **k):
+            return None
+
+        async def content(self):
+            return self._html
+
+        async def evaluate(self, *a, **k):
+            return None
+
+        async def screenshot(self, *a, **k):
+            return None
+
+        async def close(self):
+            return None
+
+    class _PBrowser:
+        def __init__(self):
+            self.page = _PPage()
+
+        async def pages(self):
+            return [self.page]
+
+        async def version(self):
+            return "HeadlessChrome/124.0.0.0"
+
+        async def close(self):
+            return None
+
+        async def disconnect(self):
+            return None
+
+    async def _pyp_launch(**k):
+        return _PBrowser()
+
+    engines = {
+        "playwright": _load_engine_with_fake_driver("playwright_scraper.py", {
+            "playwright": {},
+            "playwright.sync_api": {"sync_playwright": _sync_playwright,
+                                    "Error": _PWErr, "TimeoutError": _PWTimeout}}),
+        "pyppeteer": _load_engine_with_fake_driver("puppeteer_scraper.py", {
+            "pyppeteer": {"launch": _pyp_launch, "connect": _pyp_launch}}),
+        "selenium": _load_engine_with_fake_driver("selenium_scraper.py", _sel_fakes),
+    }
+    for mod in engines.values():
+        mod.handle_captcha_if_present = (lambda *a, **k: None) if mod is not engines["pyppeteer"] \
+            else _async_none
+    engines["selenium"].build_driver_with_timeout = lambda args: _SelDriver()
+
+    def _run(name, argv, *, cost, empty=False):
+        """(rc, text, data files, meta, attempt) for one scrape() through the fakes."""
+        mod = engines[name]
+        _Meter.cost, _Meter.gotos, _Meter.empty = cost, [], empty
+        with tempfile.TemporaryDirectory() as d:
+            out = os.path.join(d, "run")
+            with open(out + ".json", "w", encoding="utf-8") as f:
+                f.write("[]")  # a previous run's data
+            args = _engine_args(mod, ["--url", listing, "--out", out, "--format", "json",
+                                      "--delay", "0", "--retry-delay", "0"] + argv)
+            try:
+                with _captured_output() as buf:
+                    rc = mod.scrape(args)
+                    if name == "pyppeteer":
+                        rc = _asyncio.run(rc)
+            finally:
+                _pm.start(None, active=False)
+
+            def read(suffix):
+                path = out + suffix
+                return json.load(open(path, encoding="utf-8")) if os.path.exists(path) else None
+            return rc, buf.getvalue(), read(".json"), read(".meta.json"), \
+                read(".latest_attempt.meta.json")
+
+    for name in engines:
+        # 1,000-byte budget, 600 bytes per navigation: over it on page 2.
+        rc, text, data, meta, attempt = _run(name, ["--pages", "4", "--proxy-budget-mb", "0.001"]
+                                             + proxy_argv, cost=600)
+        ok &= check(f"proxy budget ({name}): over the budget on page 2 of 4 -> exit 6 (got {rc}), "
+                    f"no page 3 fetched ({len(_Meter.gotos)} navigations)",
+                    rc == EXIT_PARTIAL and len(_Meter.gotos) == 2)
+        ok &= check(f"proxy budget ({name}): ...the rows of pages 1-2 are kept",
+                    data is not None and len(data) == 4)
+        ok &= check(f"proxy budget ({name}): ...sidecar says partial / proxy_budget_exceeded "
+                    f"with the byte count",
+                    meta is not None and meta["status"] == "partial"
+                    and meta["stop_reason"] == "proxy_budget_exceeded"
+                    and (meta["proxy_bytes"], meta["proxy_budget_bytes"],
+                         meta["proxy_budget_exceeded"]) == (1200, 1000, True))
+        ok &= check(f"proxy budget ({name}): ...and one 'Proxy traffic' line is printed",
+                    text.count("Proxy traffic: 0.0 MB of 0.001 MB budget") == 1)
+
+        rc, text, data, meta, attempt = _run(name, ["--proxy-budget-mb", "0.001"] + proxy_argv,
+                                             cost=5000, empty=True)
+        ok &= check(f"proxy budget ({name}): spent with no row read -> exit 5, not 4 (got {rc})",
+                    rc == EXIT_FETCH_FAILED)
+        ok &= check(f"proxy budget ({name}): ...the previous data stays, no .meta.json, and "
+                    f"<out>.latest_attempt.meta.json records the stop and the bytes",
+                    data == [] and meta is None and attempt is not None
+                    and attempt["stop_reason"] == "proxy_budget_exceeded"
+                    and attempt["proxy_bytes"] == 5000 and attempt["data_updated"] is False)
+
+        rc, text, data, meta, attempt = _run(name, ["--proxy-budget-mb", "0.001"], cost=10 ** 9)
+        ok &= check(f"proxy budget ({name}): no proxy -> nothing metered or stopped "
+                    f"(exit {rc}, proxy_bytes null, no 'Proxy traffic' line)",
+                    rc == 0 and meta["proxy_bytes"] is None
+                    and meta["proxy_budget_exceeded"] is False and "Proxy traffic" not in text)
+        rc, text, data, meta, attempt = _run(name, ["--proxy-budget-mb", "0"] + proxy_argv,
+                                             cost=10 ** 9)
+        ok &= check(f"proxy budget ({name}): --proxy-budget-mb 0 is unlimited (exit {rc})",
+                    rc == 0 and meta["proxy_budget_bytes"] is None
+                    and meta["proxy_bytes"] == 10 ** 9 and meta["proxy_budget_exceeded"] is False)
+        rc, text, data, meta, attempt = _run(name, proxy_argv, cost=1000)
+        ok &= check(f"proxy budget ({name}): under the default 10 MB the run is complete and "
+                    f"records its bytes",
+                    rc == 0 and meta["proxy_bytes"] == 1000
+                    and meta["proxy_budget_bytes"] == 10 ** 7
+                    and "Proxy traffic: 0.0 MB of 10 MB budget" in text)
+
+    rc, text, data, meta, attempt = _run("playwright", ["--pages", "6", "--concurrency", "2",
+                                                        "--proxy-budget-mb", "0.001"]
+                                         + proxy_argv, cost=600)
+    ok &= check(f"proxy budget (playwright --concurrency 2): workers take no page once the "
+                f"budget is spent ({len(_Meter.gotos)} of 6 navigations, exit {rc})",
+                rc == EXIT_PARTIAL and len(_Meter.gotos) <= 3
+                and meta["stop_reason"] == "proxy_budget_exceeded")
+    rc, text, data, meta, attempt = _run("playwright", ["--mode", "detail",
+                                                        "--proxy-budget-mb", "0.001"]
+                                         + proxy_argv, cost=5000)
+    ok &= check(f"proxy budget (playwright --mode detail): spent on the listing -> no product "
+                f"page opened, listing rows not written as size rows (exit {rc})",
+                rc == EXIT_FETCH_FAILED and len(_Meter.gotos) == 1
+                and attempt["stop_reason"] == "proxy_budget_exceeded")
+
+    # ---- finish_run: the budget stop outranks every other outcome ---------
+    for rows, blocked, reason, want in (([Product(sku="1")], True, "blocked_akamai", EXIT_PARTIAL),
+                                        ([], True, "blocked_akamai", EXIT_FETCH_FAILED),
+                                        ([Product(sku="1")], False, "completed", EXIT_PARTIAL),
+                                        ([], False, "completed", EXIT_FETCH_FAILED)):
+        _pm.start(0.001, active=True)
+        _pm.current().add(5000)
+        try:
+            with tempfile.TemporaryDirectory() as d, _captured_output():
+                out = os.path.join(d, "o")
+                rc = finish_run(rows, out, "json", False, blocked=blocked, stop_reason=reason,
+                                pages_requested=2, pages_completed=1, start_url=listing,
+                                final_url=listing)
+                path = out + (".meta.json" if rows else ".latest_attempt.meta.json")
+                meta = json.load(open(path, encoding="utf-8"))
+        finally:
+            _pm.start(None, active=False)
+        ok &= check(f"proxy budget: finish_run with {len(rows)} row(s), blocked={blocked}, "
+                    f"{reason} -> exit {want} (got {rc}), stop_reason proxy_budget_exceeded",
+                    rc == want and meta["stop_reason"] == "proxy_budget_exceeded"
+                    and meta["proxy_budget_exceeded"] is True)
+
+    # ---- the flag on every CLI --------------------------------------------
+    for name, mod in engines.items():
+        args = _engine_args(mod, ["--url", listing])
+        ok &= check(f"proxy budget ({name}): --proxy-budget-mb defaults to 10",
+                    args.proxy_budget_mb == 10)
+        for bad in ("-1", "lots"):
+            with _captured_output() as buf:
+                try:
+                    _engine_args(mod, ["--url", listing, "--proxy-budget-mb", bad])
+                    code = 0
+                except SystemExit as e:
+                    code = e.code
+            ok &= check(f"proxy budget ({name}): --proxy-budget-mb {bad} is a usage error "
+                        f"naming the flag", code == 2 and "--proxy-budget-mb" in buf.getvalue())
+
+    # ---- wiring: only a LOCAL proxy is metered ----------------------------
+    pwm = engines["playwright"]
+    for argv, active, want_events, want_routes in ((proxy_argv, True, True, 2),
+                                                   (proxy_argv + ["--load-media"], True, True, 1),
+                                                   (proxy_argv + ["--proxy-budget-mb", "0"], True, True, 1),
+                                                   ([], False, False, 0)):
+        _args = _engine_args(pwm, ["--url", listing] + argv)
+        _pm.start(_args.proxy_budget_mb, active=active)
+        browser = _PWBrowser()
+        try:
+            with _captured_output():
+                pwm._launch_local(ns(chromium=ns(launch=lambda _b=browser, **k: _b)), _args,
+                                  _pp.from_args(_args))
+        finally:
+            meter = _pm.current()
+            _pm.start(None, active=False)
+        ctx = browser.contexts[0]
+        ok &= check(f"proxy meter (playwright {_label(argv)}): "
+                    f"{'counts requestfinished/requestfailed' if want_events else 'not attached'}, "
+                    f"{want_routes} route(s)",
+                    (sorted(set(ctx.events)) == ["requestfailed", "requestfinished"]) is want_events
+                    and len(ctx.routes) == want_routes
+                    and (want_routes != 2 or ctx.routes[-1] == meter.playwright_budget_route))
+
+    class _Opts:
+        def __init__(self):
+            self.arguments, self.caps = [], {}
+            self.binary_location = None
+
+        def add_argument(self, a):
+            self.arguments.append(a)
+
+        def set_capability(self, k, v):
+            self.caps[k] = v
+
+        def to_capabilities(self):
+            return dict(self.caps)
+
+    class _Drv:
+        def __init__(self, **k):
+            self.capabilities, self.options = {}, k.get("options")
+
+        def execute_cdp_cmd(self, *a):
+            pass
+
+        def get_log(self, kind):
+            return []
+
+    import shutil as _shutil
+    selm = _load_engine_with_fake_driver("selenium_scraper.py", _sel_fakes)
+    selm.Options, selm.Service = _Opts, (lambda **k: ns(**k))
+    selm.webdriver = ns(Chrome=_Drv)
+    for argv, want in ((proxy_argv, True), ([], False)):
+        _args = _engine_args(selm, ["--url", listing, "--chromedriver", sys.executable] + argv)
+        _pm.start(10, active=want)
+        try:
+            with _captured_output():
+                drv = selm.build_driver(_args)
+        finally:
+            _pm.start(None, active=False)
+        for a in drv.options.arguments:
+            if a.startswith("--user-data-dir="):
+                _shutil.rmtree(a.split("=", 1)[1], ignore_errors=True)
+        ok &= check(f"proxy meter (selenium {_label(argv)}): "
+                    f"{'performance log on and teed into the meter' if want else 'not attached'}",
+                    (drv.options.caps.get("goog:loggingPrefs", {}).get("performance") == "ALL"
+                     and hasattr(drv, "_proxy_meter_poll")) is want)
+
+    for argv, want in ((proxy_argv, True), ([], False),
+                       (proxy_argv + ["--cdp-endpoint", "ws://127.0.0.1:1"], False)):
+        ppm = engines["pyppeteer"]
+        browser = _PBrowser()
+
+        async def _give(_b=browser, **k):
+            return _b
+        ppm.launch, ppm.connect = _give, _give
+        ppm._connect_remote = lambda args, _b=browser: _give(_b)
+        _Meter.cost, _Meter.gotos, _Meter.empty = 0, [], False
+        with tempfile.TemporaryDirectory() as d, _captured_output():
+            _args = _engine_args(ppm, ["--url", listing, "--out", os.path.join(d, "o"),
+                                       "--delay", "0"] + argv)
+            try:
+                _asyncio.run(ppm.scrape(_args))
+            finally:
+                _pm.start(None, active=False)
+        ok &= check(f"proxy meter (pyppeteer {_label(argv)}): "
+                    f"{'a counting CDP session (Network.enable)' if want else 'no meter session'}",
+                    ("Network.enable" in browser.page.client.sent) is want)
+
+    # ---- the canary --------------------------------------------------------
+    wf = open(os.path.join(_repo_root, ".github", "workflows", "canary.yml"), encoding="utf-8").read()
+    jobs = wf.split("\n  production-like:", 1)
+    proxied = jobs[1] if len(jobs) == 2 else ""
+    ok &= check("canary: the proxied run passes --proxy-budget-mb 10",
+                "--out canary_run --dump-html canary_run.html --proxy-budget-mb 10" in proxied)
+    step = proxied.split("- name: Proxy traffic", 1)
+    body = step[1].split("- name:", 1)[0] if len(step) == 2 else ""
+    ok &= check("canary: an always-run 'Proxy traffic' step follows the proxied run and calls "
+                ".github/proxy_traffic_summary.py for its output",
+                proxied.index("--proxy-budget-mb 10") < proxied.find("- name: Proxy traffic")
+                and "if: always()" in body
+                and "python3 .github/proxy_traffic_summary.py canary_run production-like 10" in body)
+    script = os.path.join(_repo_root, ".github", "proxy_traffic_summary.py")
+    with tempfile.TemporaryDirectory() as d:
+        summary = os.path.join(d, "summary.md")
+        env = dict(os.environ, GITHUB_STEP_SUMMARY=summary)
+
+        def _summarise(meta=None, attempt=None):
+            for suffix, data in ((".meta.json", meta), (".latest_attempt.meta.json", attempt)):
+                path = os.path.join(d, "canary_run" + suffix)
+                if os.path.exists(path):
+                    os.remove(path)
+                if data is not None:
+                    with open(path, "w", encoding="utf-8") as f:
+                        json.dump(data, f)
+            r = subprocess.run([sys.executable, script, "canary_run", "production-like", "10"],
+                               cwd=d, env=env, capture_output=True, text=True, timeout=60)
+            last = open(summary, encoding="utf-8").read().splitlines()[-1] \
+                if os.path.exists(summary) else ""
+            return r.returncode, r.stdout, last
+        rc, out, last = _summarise({"proxy_bytes": 4_321_000, "proxy_budget_exceeded": False,
+                                    "finished_at": "2026-10-21T00:00:02"})
+        ok &= check("canary summary: '**production-like**: proxy traffic 4.3 MB of 10 MB', green",
+                    rc == 0 and last == "**production-like**: proxy traffic 4.3 MB of 10 MB")
+        rc, out, last = _summarise(None, {"proxy_bytes": 10_200_000, "proxy_budget_exceeded": True,
+                                          "finished_at": "2026-10-21T00:00:03"})
+        ok &= check("canary summary: a run stopped at the budget is red with "
+                    "'::error::stopped: proxy budget 10 MB exceeded'",
+                    rc == 1 and "::error::stopped: proxy budget 10 MB exceeded" in out
+                    and last == "**production-like**: proxy traffic 10.2 MB of 10 MB")
+        rc, out, last = _summarise()
+        ok &= check("canary summary: a missing sidecar is reported, not a crash",
+                    rc == 0 and "not recorded" in last)
+    return ok
+
+
+async def _async_none(*a, **k):
+    return None
+
+
 def check_proxy_traffic_savers(ok: bool) -> bool:
     """proxy pre-check before a browser starts, and media blocking"""
     import asyncio as _asyncio
@@ -4867,6 +5345,12 @@ def check_proxy_traffic_savers(ok: bool) -> bool:
         def add_argument(self, a):
             self.arguments.append(a)
 
+        def set_capability(self, name, value):  # the meter's performance log
+            self.capabilities = {name: value}
+
+        def to_capabilities(self):
+            return dict(getattr(self, "capabilities", {}))
+
     class _SelDriver:
         def __init__(self, **k):
             self.capabilities = {}
@@ -5139,6 +5623,7 @@ def main() -> int:
     ok = check_the_dockerfile_s_copy_list_vs_the_entrypoint_s_i(ok)
     ok = check_audit_2026_10_14_contract_fixes(ok)
     ok = check_proxy_traffic_savers(ok)
+    ok = check_proxy_traffic_meter(ok)
 
     # The report below is only worth something if it reflects what the
     # sections recorded: an engine whose driver library is absent must appear

@@ -46,6 +46,7 @@ from proxy_pool import (redact_url_credentials, describe_cdp_failure,
                         ProxyPrecheckError, PROXY_PRECHECK_STOP_REASON,
                         should_block_media, pyppeteer_block_media)
 import env_config
+import proxy_meter
 from arg_types import positive_int, nonneg_float
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
@@ -214,6 +215,8 @@ async def scrape(args) -> int:
     pages_completed = 0
     final_url = args.url
 
+    # Meters what goes through a LOCAL proxy and stops at --proxy-budget-mb.
+    proxy_meter.start(getattr(args, "proxy_budget_mb", None), active=bool(args.proxy) and not args.cdp_endpoint)
     if args.proxy and not args.cdp_endpoint:
         # One HEAD for robots.txt through the proxy BEFORE the browser
         # starts — see playwright_scraper.py. Only a gateway 407/402 stops.
@@ -264,6 +267,8 @@ async def scrape(args) -> int:
             await page.authenticate({"username": creds.username or "",
                                      "password": creds.password or ""})
             logger.info("Proxy credentials sent over CDP, not via the command line.")
+    if args.proxy and not args.cdp_endpoint:
+        await proxy_meter.current().attach_pyppeteer(page)  # --proxy-budget-mb
     if should_block_media(args, proxy_in_use=bool(args.proxy),
                           over_cdp=bool(args.cdp_endpoint)):
         # CDP Fetch with resource-type patterns: only images, media and fonts
@@ -300,11 +305,16 @@ async def scrape(args) -> int:
     try:
         url = args.url
         for page_num in range(1, args.pages + 1):
+            if proxy_meter.exceeded():
+                break  # --proxy-budget-mb is spent; finish_run names the stop
             logger.info("Fetching page %d/%d: %s", page_num, args.pages, url)
             # Retry a navigation failure rather than ending the run on it —
             # see playwright_scraper.py for why.
             http_status = None
             for attempt in range(1, args.retries + 1):
+                if proxy_meter.exceeded():
+                    load_failed = True
+                    break
                 try:
                     # Keep the document's Response: its status is the one
                     # signal a refusing edge always gives, and without it an
@@ -475,6 +485,7 @@ def parse_args():
                         "(no parser reads them, and a proxy bills per byte); "
                         "never blocked with --cdp-endpoint or with no proxy.")
     p.add_argument("--force-block-media", action="store_true", help=argparse.SUPPRESS)
+    proxy_meter.add_budget_argument(p)
     p.add_argument("--webhook", default=None, metavar="URL",
                    help="POST the run summary (the same fields as the "
                         ".meta.json sidecar, plus the exit code) to this "
