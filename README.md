@@ -1,4 +1,4 @@
-# farfetch-scraper
+# Farfetch Scraper — Product Listings, Prices and Sizes in Python
 
 [![release](https://img.shields.io/github/v/release/2scraper/farfetch-scraper?style=flat-square)](https://github.com/2scraper/farfetch-scraper/releases)
 [![tests](https://github.com/2scraper/farfetch-scraper/actions/workflows/tests.yml/badge.svg)](https://github.com/2scraper/farfetch-scraper/actions/workflows/tests.yml)
@@ -7,6 +7,8 @@
 [![licence](https://img.shields.io/badge/licence-MIT-green?style=flat-square)](LICENSE)
 [![engines](https://img.shields.io/badge/engines-Playwright%20%C2%B7%20Selenium%20%C2%B7%20Puppeteer-orange?style=flat-square)](#engines)
 [![runs without an account](https://img.shields.io/badge/runs%20without-an%20account-brightgreen?style=flat-square)](#do-you-need-a-paid-service-for-this)
+
+**Farfetch scraper** — an open-source (MIT) Python tool that reads farfetch.com category, hub, search and brand listing pages and writes products — brand, price, original price, discount and stock — to JSON or CSV, with one row per size in `--mode detail`. An ordinary local Chromium on a clean residential IP cleared Akamai Bot Manager and returned all 96 products of a category page with no key and no proxy, while a datacentre address gets Akamai's `Access Denied`. Use it for price and discount monitoring, or compare two runs with the included diff tool to see what changed or disappeared.
 
 A working scraper for **farfetch.com** listing pages — category, hub, search and
 brand. Not a client for a hosted API: the code in this repo opens the site,
@@ -1051,3 +1053,20 @@ Scrape responsibly: public catalogue data only, at a rate that does not degrade
 the site. Read Farfetch's terms of service and the law in your jurisdiction
 before running at volume. This project deliberately never submits the
 registration form, and you should not either.
+
+## Guides
+
+- [How to run the 2scraper scrapers: setup, proxies, exit codes and access modes](https://2captcha.com/h/how-to-run-2scraper-open-source-scrapers) — installation, `.env`, `.meta.json` for the whole family.
+
+## Related scrapers
+
+Same CLI conventions, same output contract (one row per item, JSON or CSV, a `.meta.json` sidecar and shared exit codes):
+
+- [Givenchy Beauty scraper](https://github.com/2scraper/givenchy-scraper) — Products, prices and shades across 11 storefront locales
+- [Home Depot scraper](https://github.com/2scraper/homedepot-scraper) — Per-store prices, stock, brands, models and ratings…
+- [Indiegogo scraper](https://github.com/2scraper/indiegogo-scraper) — Project listings, campaign pages and reward tiers
+- [Kohl's scraper](https://github.com/2scraper/kohls-scraper) — Prices, price ranges, sale and clearance labels, ratings…
+- [Maison KOSÉ scraper](https://github.com/2scraper/kose-scraper) — Kosé's Japanese online store (maison.kose.co.jp)
+- [LG scraper](https://github.com/2scraper/lg-scraper) — Every model in an lg.com category
+
+All scrapers: [github.com/2scraper](https://github.com/2scraper) · Need another site? [Open a request](https://github.com/2scraper/.github/issues/new?title=%5BScraper%20request%5D%20)
