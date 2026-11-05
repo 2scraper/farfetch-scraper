@@ -23,6 +23,17 @@ a promise that every flag and exit code is contractually frozen.
 > products now writes `<out>.latest_attempt.meta.json` with its outcome and
 > byte count.
 
+### Documentation
+
+- README, "Do you need a paid service for this?": says which address needs
+  what. A clean residential connection needed no key and no proxy (as
+  measured for 0.2.0); a datacentre address gets Akamai's `Access Denied`
+  (HTTP 403, exit 3, re-measured 2026-11-05); and one run of headless
+  Chromium on a GitHub runner behind a US residential proxy got the same
+  refusal on 2026-11-05.
+  Also describes the canary's two jobs, its weekly schedule, and that the
+  proxy job fails rather than skipping.
+
 ### Added
 
 - Proxy pre-check in `playwright_scraper.py`, `puppeteer_scraper.py` and
