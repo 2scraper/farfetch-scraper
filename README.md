@@ -105,6 +105,30 @@ residential IP cleared Akamai Bot Manager silently and returned all 96 products,
 with no key and no proxy. That is measured, not assumed. Anyone telling you the
 first page is impassable is selling something.
 
+**That answer depends on where the request comes from.** For the listing
+route (a filtered category page), the measurements so far:
+
+| Run from | Result on a filtered category page | Measured |
+|---|---|---|
+| A clean residential connection, local Chromium, no key, no proxy | 96 products | by 2026-09-07 (v0.2.0; a German connection, so EUR prices) |
+| A datacentre address (cloud server, CI runner), no proxy | Akamai `Access Denied`, HTTP 403, ~335 bytes, exit 3 | 2026-11-05 (a Hetzner server; also the weekly canary's free job on a GitHub runner) |
+| A GitHub runner, headless Chromium, behind a US residential proxy | the same `Access Denied`, exit 3 | 2026-11-05 (one run of the canary's proxy job) |
+
+The refusal carries no challenge, so captcha solving cannot get past it; only
+a different exit (or a different client on it) can. So a clean residential
+connection was enough on its own when measured, a server address is not, and
+putting one residential proxy in front of a headless runner was not enough
+either on 2026-11-05.
+
+**The canary badge** at the top runs every Monday at 06:17 UTC and on manual
+dispatch, as two jobs. The free job runs from a GitHub runner with no proxy;
+there the refusal above is expected and reported as a notice, not a failure.
+The production-like job goes through the residential proxy in the
+`FARFETCH_PROXY` repository secret and fails on anything short of real
+products: a block, an empty page, a dead proxy, or a missing secret. It is
+never skipped green, so a red badge means that job did not get the data, and
+the run's annotation says which of those it was.
+
 **At volume, or from a specific country, or when a challenge does appear — yes,
 and the honest list is short.** What a paid service actually buys:
 
