@@ -60,6 +60,8 @@ a promise that every flag and exit code is contractually frozen.
 
 ### Changed
 
+- CI only: the offline-checks job runs on `ubuntu-24.04` instead of `ubuntu-latest`, which moved to Ubuntu 26.04, where `actions/setup-python` has no Python 3.9 build. 3.9 stays the supported floor.
+- Docker: the image installs `libatomic1` before Playwright. Recent Playwright releases' Node driver needs it to run `playwright install` at all, and the slim base image does not ship it, so the image build failed.
 - CI only: the whole canary, free and paid jobs alike, now runs weekly (Mondays 06:17 UTC) and on a manual dispatch; the daily schedule is removed.
 
 ## [0.6.0] — 2026-10-15
